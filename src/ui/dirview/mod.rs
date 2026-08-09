@@ -1,12 +1,36 @@
 //! `DirectoryView` — self-contained per-directory state (the tabs seam):
 //! the app holds `Vec<DirectoryView> + active` (UI shows one for now, see
-//! `main.rs`). This module never navigates itself — clicks, Enter, and
-//! Backspace/Alt+Up all resolve to an [`Event`] the owner decides whether
-//! to act on, so a future tabs feature can open a new view instead of
-//! reusing this one without touching this file.
+//! `main.rs`). This module never navigates itself for a *new* location —
+//! clicks, Enter, Backspace/Alt+Up, and breadcrumb clicks all resolve to
+//! an [`Event`] the owner decides whether to act on, so a future tabs
+//! feature can open a new view instead of reusing this one without
+//! touching this file.
+//!
+//! **Per-view history (Stage 4).** `back`/`forward` are browser-style
+//! stacks of previously-visited [`Location`]s. [`DirectoryView::navigate`]
+//! (the owner's response to `Event::OpenDirectory`) pushes the *old*
+//! location onto `back` and clears `forward` — visiting anywhere new
+//! invalidates the redo stack, same as a browser. `Action::HistoryBack`/
+//! `HistoryForward` are the one exception to "the view never navigates
+//! itself": back/forward within a tab's own history is inherently
+//! per-view, never a "maybe open in a new tab" situation the way
+//! descending into a row is, so [`DirectoryView::go_back`]/`go_forward`
+//! call the private `load()` directly instead of bubbling an `Event`.
+//!
+//! **Header/breadcrumbs (Stage 4).** `ui::header` and `ui::breadcrumbs`
+//! sit outside this module's privacy boundary (like `ui::explorer`) and
+//! only ever construct [`Message`] values — a click on the header's Back
+//! button sends exactly the `Message::Action(Action::HistoryBack)` that
+//! Alt+Left resolves to, so there is one code path per behavior regardless
+//! of input device. `ui::dirview::grid` (the tile presentation) and
+//! `ui::dirview::typeahead` (type-to-select) are the other two Stage 4
+//! additions; both are private submodules with the same field-visibility
+//! access `list.rs`/`selection.rs` already had.
 
+mod grid;
 mod list;
 mod selection;
+mod typeahead;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -18,8 +42,9 @@ use saola_theme::Theme;
 use crate::config::{Config, SortKey, View};
 use crate::core::fs::entry::{EntryKind, FileEntry};
 use crate::core::fs::sort;
-use crate::core::vfs::{Location, VfsError};
+use crate::core::vfs::{Caps, Location, VfsError};
 use crate::keymap::{self, Action};
+use crate::ui::breadcrumbs;
 
 /// Cursor rows a single PageUp/PageDown moves — a fixed placeholder rather
 /// than the real viewport-height/row-height math, which needs a theme
@@ -52,6 +77,23 @@ pub enum Message {
     HeaderClicked(SortKey),
     Scrolled(scrollable::Viewport),
     Keyboard(keyboard::Event),
+    /// A keymap [`Action`] arriving from something other than the keyboard
+    /// subscription — today, only `ui::header`'s buttons (Back/Forward/Up/
+    /// Refresh/the view-mode switcher/the hidden toggle/the breadcrumb
+    /// edit pencil). Deliberately reuses the exact same `Action` vocabulary
+    /// `handle_keyboard` resolves raw key events into, so a mouse click and
+    /// its keyboard equivalent (e.g. the Back button and Alt+Left) drive
+    /// the identical `apply_action` arm — one behavior, two input paths.
+    Action(Action),
+    /// A breadcrumb pill (or the remote-authority pill) was clicked:
+    /// request navigating straight there. Bubbles as `Event::OpenDirectory`
+    /// like every other "go somewhere new" request in this module.
+    BreadcrumbClicked(Location),
+    /// The path/URI editor's `on_input`, while `path_edit` is `Some`.
+    PathInputChanged(String),
+    /// The path/URI editor's `on_submit` (Enter): parse the buffer and
+    /// request navigating there.
+    PathSubmitted,
 }
 
 /// What the owner (the app, via `ui::explorer`) decides to act on. The
@@ -79,10 +121,21 @@ pub struct DirectoryView {
     sort_descending: bool,
     show_hidden: bool,
     view_mode: View,
-    /// Back-stack of previously-visited locations, most recent last.
-    /// Stage 4 builds the actual back/forward navigation UI on top of
-    /// this; Stage 3 only maintains it.
+    /// Back-stack of previously-visited locations, most recent last. See
+    /// the module docs' "Per-view history" section for the full
+    /// back/forward/navigate semantics.
     history: Vec<Location>,
+    /// Redo stack for [`Action::HistoryForward`] — populated only by
+    /// [`Self::go_back`], and cleared by [`Self::navigate`] the moment the
+    /// user goes anywhere new.
+    forward: Vec<Location>,
+    /// `Some(buffer)` while the breadcrumb trail is swapped for an
+    /// editable path/URI field (`Action::EditPath`, Ctrl+L); `None` shows
+    /// the ordinary breadcrumb pills. The buffer is the field's live text,
+    /// updated by `Message::PathInputChanged` on every keystroke.
+    path_edit: Option<String>,
+    /// Type-to-select state — see `typeahead`'s module docs.
+    type_ahead: typeahead::TypeAhead,
     scroll: Option<scrollable::Viewport>,
     loading: bool,
     /// Set when the last `list()`/`open_*` call failed; `view()` renders
@@ -114,6 +167,9 @@ impl DirectoryView {
             show_hidden: config.show_hidden,
             view_mode: config.view,
             history: Vec::new(),
+            forward: Vec::new(),
+            path_edit: None,
+            type_ahead: typeahead::TypeAhead::new(),
             scroll: None,
             loading: false,
             error: None,
@@ -142,6 +198,44 @@ impl DirectoryView {
     /// items selected" readout.
     pub fn selected_count(&self) -> usize {
         self.selection.len()
+    }
+
+    /// Whether `Action::HistoryBack`/the header's Back button would do
+    /// anything right now.
+    pub fn can_go_back(&self) -> bool {
+        !self.history.is_empty()
+    }
+
+    /// Whether `Action::HistoryForward`/the header's Forward button would
+    /// do anything right now.
+    pub fn can_go_forward(&self) -> bool {
+        !self.forward.is_empty()
+    }
+
+    /// Whether dotfiles are currently shown — `ui::header`'s hidden
+    /// toggle reads this to draw its on/off state.
+    pub fn show_hidden(&self) -> bool {
+        self.show_hidden
+    }
+
+    /// The live buffer of the path/URI editor, or `None` when the
+    /// breadcrumb trail (not the editor) is what's shown —
+    /// `ui::breadcrumbs` reads this to decide which to render.
+    pub fn path_edit(&self) -> Option<&str> {
+        self.path_edit.as_deref()
+    }
+
+    /// What the backend serving this view's current location can do.
+    /// `ui::header` reads this to decide whether to show the manual
+    /// refresh button (only when `Caps::WATCH` is unset — a backend that
+    /// can signal changes itself doesn't need one). Resolving a backend is
+    /// cheap (`modules::resolve`'s docs: backends are stateless, built
+    /// fresh per call) so this is a plain accessor, not something cached
+    /// on the view.
+    pub fn caps(&self) -> Caps {
+        crate::modules::resolve(&self.location.scheme)
+            .map(|backend| backend.caps())
+            .unwrap_or(Caps::empty())
     }
 
     /// Resolve a `visible` row index to its `FileEntry`, or `None` if it's
@@ -237,10 +331,53 @@ impl DirectoryView {
     /// Never called from within `update()` itself — see the module docs.
     pub fn navigate(&mut self, location: Location) -> Task<Message> {
         self.history.push(self.location.clone());
+        // Visiting anywhere new invalidates the redo stack — same as a
+        // browser: you can't "forward" into a page you reached by
+        // following a fresh link instead of going back from it.
+        self.forward.clear();
         self.location = location;
         self.selection.clear();
         self.pending_select = None;
         self.error = None;
+        self.path_edit = None;
+        self.type_ahead.clear();
+        self.load()
+    }
+
+    /// `Action::HistoryBack`: pop the most recent `back` entry, push the
+    /// current location onto `forward` so `go_forward` can return to it,
+    /// and load the popped location. A no-op `Task::none()` at the start
+    /// of history (`history` empty) rather than anything the caller has
+    /// to check first — matches every other guarded-index method in this
+    /// file (CLAUDE.md's no-panic rule).
+    fn go_back(&mut self) -> Task<Message> {
+        let Some(target) = self.history.pop() else {
+            return Task::none();
+        };
+        self.forward.push(self.location.clone());
+        self.enter(target)
+    }
+
+    /// The redo side of [`Self::go_back`].
+    fn go_forward(&mut self) -> Task<Message> {
+        let Some(target) = self.forward.pop() else {
+            return Task::none();
+        };
+        self.history.push(self.location.clone());
+        self.enter(target)
+    }
+
+    /// Shared tail of `go_back`/`go_forward`: point this view at `target`
+    /// and reload, without touching either history stack (the caller
+    /// already did that) — unlike `navigate`, which is the "went somewhere
+    /// new" path and always clears `forward`.
+    fn enter(&mut self, target: Location) -> Task<Message> {
+        self.location = target;
+        self.selection.clear();
+        self.pending_select = None;
+        self.error = None;
+        self.path_edit = None;
+        self.type_ahead.clear();
         self.load()
     }
 
@@ -325,11 +462,36 @@ impl DirectoryView {
                 (Task::none(), None)
             }
             Message::Keyboard(event) => self.handle_keyboard(event),
+            Message::Action(action) => self.apply_action(action),
+            Message::BreadcrumbClicked(location) => {
+                self.path_edit = None;
+                (Task::none(), Some(Event::OpenDirectory(location)))
+            }
+            Message::PathInputChanged(value) => {
+                self.path_edit = Some(value);
+                (Task::none(), None)
+            }
+            Message::PathSubmitted => {
+                let Some(buffer) = self.path_edit.take() else {
+                    return (Task::none(), None);
+                };
+                let trimmed = buffer.trim();
+                if trimmed.is_empty() {
+                    return (Task::none(), None);
+                }
+                (
+                    Task::none(),
+                    Some(Event::OpenDirectory(parse_typed_location(trimmed))),
+                )
+            }
         }
     }
 
     pub fn view<'a>(&'a self, theme: &'a Theme) -> Element<'a, Message> {
-        list::view(self, theme)
+        match self.view_mode {
+            View::List => list::view(self, theme),
+            View::Grid => grid::view(self, theme),
+        }
     }
 
     // ── keyboard/action handling ────────────────────────────────────────
@@ -337,9 +499,29 @@ impl DirectoryView {
     fn handle_keyboard(&mut self, event: keyboard::Event) -> (Task<Message>, Option<Event>) {
         match event {
             keyboard::Event::KeyPressed { key, modifiers, .. } => {
+                // While the path/URI editor is open, the global keyboard
+                // subscription must not *also* drive row cursor/selection
+                // actions from the same keystrokes the text_input is
+                // already consuming for typing (arrow keys, Ctrl+A, ...).
+                // Escape is the one thing this module still owns while
+                // editing; everything else is the text_input's job via
+                // `Message::PathInputChanged`/`PathSubmitted`.
+                if self.path_edit.is_some() {
+                    if matches!(
+                        key,
+                        iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)
+                    ) && modifiers.is_empty()
+                    {
+                        self.path_edit = None;
+                    }
+                    return (Task::none(), None);
+                }
                 match keymap::resolve(&key, modifiers) {
                     Some(action) => self.apply_action(action),
-                    None => (Task::none(), None),
+                    None => {
+                        self.try_type_ahead(&key, modifiers);
+                        (Task::none(), None)
+                    }
                 }
             }
             keyboard::Event::ModifiersChanged(modifiers) => {
@@ -350,17 +532,61 @@ impl DirectoryView {
         }
     }
 
+    /// A key `keymap::resolve` doesn't own: if it's an unmodified printable
+    /// character, feed it to type-ahead and jump the cursor to whatever it
+    /// matches. Ctrl/Alt/Logo combinations are left alone here (they're
+    /// either already an `Action`, or genuinely not this module's
+    /// business — e.g. a future global shortcut).
+    fn try_type_ahead(&mut self, key: &iced::keyboard::Key, modifiers: keyboard::Modifiers) {
+        if modifiers.control() || modifiers.alt() || modifiers.logo() {
+            return;
+        }
+        let iced::keyboard::Key::Character(text) = key else {
+            return;
+        };
+        let Some(ch) = text.as_str().chars().next() else {
+            return;
+        };
+        if !ch.is_alphanumeric() {
+            return;
+        }
+
+        let names = self
+            .visible
+            .iter()
+            .filter_map(|&i| self.entries.get(i).map(|entry| entry.name.as_os_str()));
+        let Some(index) = self.type_ahead.feed(ch, std::time::Instant::now(), names) else {
+            return;
+        };
+        if let Some(name) = self.entry_at(index).map(|entry| entry.name.clone()) {
+            self.selection.click(index, name);
+        }
+    }
+
     fn apply_action(&mut self, action: Action) -> (Task<Message>, Option<Event>) {
         match action {
             Action::MoveCursorUp => {
-                self.move_cursor(-1);
+                self.move_cursor(-self.row_step());
                 (Task::none(), None)
             }
             Action::MoveCursorDown => {
-                self.move_cursor(1);
+                self.move_cursor(self.row_step());
                 (Task::none(), None)
             }
-            Action::MoveCursorLeft | Action::MoveCursorRight => (Task::none(), None),
+            // A no-op in list view (there is no "column"); grid view steps
+            // one tile left/right within the current row.
+            Action::MoveCursorLeft => {
+                if self.view_mode == View::Grid {
+                    self.move_cursor(-1);
+                }
+                (Task::none(), None)
+            }
+            Action::MoveCursorRight => {
+                if self.view_mode == View::Grid {
+                    self.move_cursor(1);
+                }
+                (Task::none(), None)
+            }
             Action::MoveCursorHome => {
                 self.move_cursor_to(0);
                 (Task::none(), None)
@@ -370,22 +596,33 @@ impl DirectoryView {
                 (Task::none(), None)
             }
             Action::MoveCursorPageUp => {
-                self.move_cursor(-PAGE_ROWS);
+                self.move_cursor(-PAGE_ROWS * self.row_step());
                 (Task::none(), None)
             }
             Action::MoveCursorPageDown => {
-                self.move_cursor(PAGE_ROWS);
+                self.move_cursor(PAGE_ROWS * self.row_step());
                 (Task::none(), None)
             }
             Action::ExtendSelectionUp => {
-                self.extend_cursor(-1);
+                self.extend_cursor(-self.row_step());
                 (Task::none(), None)
             }
             Action::ExtendSelectionDown => {
-                self.extend_cursor(1);
+                self.extend_cursor(self.row_step());
                 (Task::none(), None)
             }
-            Action::ExtendSelectionLeft | Action::ExtendSelectionRight => (Task::none(), None),
+            Action::ExtendSelectionLeft => {
+                if self.view_mode == View::Grid {
+                    self.extend_cursor(-1);
+                }
+                (Task::none(), None)
+            }
+            Action::ExtendSelectionRight => {
+                if self.view_mode == View::Grid {
+                    self.extend_cursor(1);
+                }
+                (Task::none(), None)
+            }
             Action::ExtendSelectionHome => {
                 self.extend_to(0);
                 (Task::none(), None)
@@ -395,11 +632,11 @@ impl DirectoryView {
                 (Task::none(), None)
             }
             Action::ExtendSelectionPageUp => {
-                self.extend_cursor(-PAGE_ROWS);
+                self.extend_cursor(-PAGE_ROWS * self.row_step());
                 (Task::none(), None)
             }
             Action::ExtendSelectionPageDown => {
-                self.extend_cursor(PAGE_ROWS);
+                self.extend_cursor(PAGE_ROWS * self.row_step());
                 (Task::none(), None)
             }
             Action::ToggleCursorSelected => {
@@ -429,6 +666,41 @@ impl DirectoryView {
                 self.recompute_visible();
                 (Task::none(), None)
             }
+            Action::HistoryBack => (self.go_back(), None),
+            Action::HistoryForward => (self.go_forward(), None),
+            Action::Refresh => (self.load(), None),
+            Action::SetViewList => {
+                self.view_mode = View::List;
+                (Task::none(), None)
+            }
+            Action::SetViewGrid => {
+                self.view_mode = View::Grid;
+                (Task::none(), None)
+            }
+            Action::EditPath => {
+                self.path_edit = Some(self.location.to_string());
+                self.type_ahead.clear();
+                (
+                    Task::batch([
+                        iced::widget::operation::focus(breadcrumbs::PATH_INPUT_ID),
+                        iced::widget::operation::select_all(breadcrumbs::PATH_INPUT_ID),
+                    ]),
+                    None,
+                )
+            }
+        }
+    }
+
+    /// How many `visible` positions one Up/Down/PageUp/PageDown step
+    /// covers: one item in list view, one full tile-row (`grid::
+    /// GRID_COLUMNS` items) in grid view — so "Down" always means "the
+    /// next thing spatially below", not "the next name alphabetically",
+    /// regardless of presentation. Left/Right (grid-only) always step by
+    /// exactly one, independent of this.
+    fn row_step(&self) -> isize {
+        match self.view_mode {
+            View::List => 1,
+            View::Grid => grid::GRID_COLUMNS as isize,
         }
     }
 
@@ -443,15 +715,28 @@ impl DirectoryView {
     }
 
     /// The cursor's current position for movement math, as if it sat one
-    /// row *before* the first when nothing is selected/cursored yet —
-    /// not `0`, which would make the very first `MoveCursorDown` land on
-    /// row 1 (skipping row 0) instead of selecting row 0.
-    fn current_cursor_or_before_start(&self) -> isize {
-        self.selection.cursor().map_or(-1, |c| c as isize)
+    /// *step* before the first when nothing is selected/cursored yet — not
+    /// `0`, which would make the very first `MoveCursorDown` land one step
+    /// past row 0 (skipping it) instead of landing on it.
+    ///
+    /// Parametrized by `step` (the magnitude of the delta about to be
+    /// applied) rather than hardcoded to `-1`: in list view a "step" is
+    /// one item, so the sentinel `-1` plus a `+1` delta lands on `0` — the
+    /// original Stage 3 behavior. In grid view a vertical "step" is a
+    /// whole `row_step()`-sized row; using the same `-1` sentinel there
+    /// would land the very first `MoveCursorDown` on row *index*
+    /// `row_step() - 1` instead of `0` (verified against
+    /// `grid_view_steps_the_cursor_by_a_full_row`'s first assertion,
+    /// which is what caught this). Using `-step` generalizes both: the
+    /// first step in *either* direction always resolves to `0` (a
+    /// negative starting point clamps there regardless of which way it
+    /// was pushed).
+    fn current_cursor_or_before_start(&self, step: isize) -> isize {
+        self.selection.cursor().map_or(-step, |c| c as isize)
     }
 
     fn move_cursor(&mut self, delta: isize) {
-        self.move_cursor_to_signed(self.current_cursor_or_before_start() + delta);
+        self.move_cursor_to_signed(self.current_cursor_or_before_start(delta.abs()) + delta);
     }
 
     fn move_cursor_to(&mut self, index: usize) {
@@ -469,7 +754,7 @@ impl DirectoryView {
     }
 
     fn extend_cursor(&mut self, delta: isize) {
-        self.extend_to_signed(self.current_cursor_or_before_start() + delta);
+        self.extend_to_signed(self.current_cursor_or_before_start(delta.abs()) + delta);
     }
 
     fn extend_to(&mut self, index: usize) {
@@ -613,6 +898,41 @@ async fn list_with_fallback(fallback: &Location) -> Result<Vec<FileEntry>, VfsEr
         None => Err(VfsError::Other {
             message: format!("no backend for scheme \"{}\"", fallback.scheme),
         }),
+    }
+}
+
+/// Parses the breadcrumb path/URI editor's submitted text into a
+/// [`Location`]. Anything containing `"://"` is treated as
+/// `scheme://[authority]/path` (a remote location typed by hand — a
+/// scheme nothing recognizes surfaces as an ordinary "no backend"
+/// `VfsError` at load time via `modules::resolve`, not a parse error
+/// here); everything else is a bare local path. Mirrors `Location`'s own
+/// `Display` impl (`core::vfs`), so round-tripping "edit, don't change
+/// anything, submit" reproduces the same location.
+fn parse_typed_location(input: &str) -> Location {
+    let Some((scheme, rest)) = input.split_once("://") else {
+        return Location::local(PathBuf::from(input));
+    };
+    if scheme.is_empty() {
+        return Location::local(PathBuf::from(input));
+    }
+    match rest.find('/') {
+        Some(path_start) => {
+            let authority = &rest[..path_start];
+            let path = &rest[path_start..];
+            Location {
+                scheme: scheme.to_owned(),
+                authority: (!authority.is_empty()).then(|| authority.to_owned()),
+                path: PathBuf::from(path),
+            }
+        }
+        // No `/` at all after the scheme — the whole remainder is the
+        // authority, with an implied root path.
+        None => Location {
+            scheme: scheme.to_owned(),
+            authority: (!rest.is_empty()).then(|| rest.to_owned()),
+            path: PathBuf::from("/"),
+        },
     }
 }
 
@@ -846,6 +1166,186 @@ mod tests {
         let backend = FakeBackend::new().with_dir("/home", vec![file("a")]);
         let result = futures::executor::block_on(backend.list(&Location::local("/home"))).unwrap();
         assert_eq!(result, vec![file("a")]);
+    }
+
+    // ── Stage 4: history ────────────────────────────────────────────────
+
+    #[test]
+    fn navigate_pushes_back_and_clears_forward() {
+        let mut view = listed_view(vec![]);
+        assert!(!view.can_go_back());
+        let _ = view.navigate(Location::local("/elsewhere"));
+        assert!(view.can_go_back());
+        assert!(!view.can_go_forward());
+        assert_eq!(view.location(), &Location::local("/elsewhere"));
+    }
+
+    #[test]
+    fn history_back_then_forward_round_trips() {
+        let mut view = listed_view(vec![]); // starts at /home
+        let _ = view.navigate(Location::local("/a"));
+        let _ = view.navigate(Location::local("/b"));
+        assert_eq!(view.location(), &Location::local("/b"));
+
+        let _ = view.apply_action_for_test(Action::HistoryBack);
+        assert_eq!(view.location(), &Location::local("/a"));
+        assert!(view.can_go_forward());
+
+        let _ = view.apply_action_for_test(Action::HistoryBack);
+        assert_eq!(view.location(), &Location::local("/home"));
+        assert!(!view.can_go_back());
+
+        let _ = view.apply_action_for_test(Action::HistoryForward);
+        assert_eq!(view.location(), &Location::local("/a"));
+        let _ = view.apply_action_for_test(Action::HistoryForward);
+        assert_eq!(view.location(), &Location::local("/b"));
+        assert!(!view.can_go_forward());
+    }
+
+    #[test]
+    fn history_back_at_the_start_is_a_no_op() {
+        let mut view = listed_view(vec![]);
+        let start = view.location().clone();
+        let _ = view.apply_action_for_test(Action::HistoryBack);
+        assert_eq!(view.location(), &start);
+    }
+
+    #[test]
+    fn a_fresh_navigate_after_going_back_drops_the_old_forward_branch() {
+        let mut view = listed_view(vec![]); // /home
+        let _ = view.navigate(Location::local("/a"));
+        let _ = view.apply_action_for_test(Action::HistoryBack); // back to /home, /a on forward
+        assert!(view.can_go_forward());
+
+        // Going somewhere new (not via forward) invalidates that redo path.
+        let _ = view.navigate(Location::local("/c"));
+        assert!(!view.can_go_forward());
+    }
+
+    // ── Stage 4: header-driven actions ──────────────────────────────────
+
+    #[test]
+    fn refresh_action_reloads_the_current_location() {
+        let mut view = listed_view(vec![file("a")]);
+        assert!(!view.is_loading());
+        let _ = view.apply_action_for_test(Action::Refresh);
+        assert!(view.is_loading());
+    }
+
+    #[test]
+    fn set_view_actions_switch_presentation() {
+        let mut view = listed_view(vec![]);
+        assert_eq!(view.view_mode(), View::List);
+        let _ = view.apply_action_for_test(Action::SetViewGrid);
+        assert_eq!(view.view_mode(), View::Grid);
+        let _ = view.apply_action_for_test(Action::SetViewList);
+        assert_eq!(view.view_mode(), View::List);
+    }
+
+    #[test]
+    fn caps_reflects_the_local_backend_and_lacks_watch() {
+        let view = listed_view(vec![]);
+        let caps = view.caps();
+        assert!(caps.contains(crate::core::vfs::Caps::LOCAL_PATH));
+        assert!(!caps.contains(crate::core::vfs::Caps::WATCH));
+    }
+
+    // ── Stage 4: grid cursor stepping ───────────────────────────────────
+
+    #[test]
+    fn grid_view_steps_the_cursor_by_a_full_row() {
+        let mut cfg = config();
+        cfg.view = View::Grid;
+        let mut view = DirectoryView::new(Location::local("/home"), &cfg);
+        let names: Vec<_> = (0..(grid::GRID_COLUMNS * 2))
+            .map(|i| file(&format!("f{i:02}")))
+            .collect();
+        let _ = view.update(Message::Listed(Location::local("/home"), Ok(names)));
+
+        let _ = view.apply_action_for_test(Action::MoveCursorDown);
+        assert_eq!(view.selection.cursor(), Some(0));
+        let _ = view.apply_action_for_test(Action::MoveCursorDown);
+        assert_eq!(view.selection.cursor(), Some(grid::GRID_COLUMNS));
+
+        let _ = view.apply_action_for_test(Action::MoveCursorRight);
+        assert_eq!(view.selection.cursor(), Some(grid::GRID_COLUMNS + 1));
+    }
+
+    #[test]
+    fn list_view_left_right_are_still_no_ops() {
+        let mut view = listed_view(vec![file("a"), file("b")]);
+        let _ = view.apply_action_for_test(Action::MoveCursorDown);
+        assert_eq!(view.selection.cursor(), Some(0));
+        let _ = view.apply_action_for_test(Action::MoveCursorRight);
+        assert_eq!(view.selection.cursor(), Some(0));
+    }
+
+    // ── Stage 4: breadcrumb/path editing ────────────────────────────────
+
+    #[test]
+    fn edit_path_action_seeds_the_buffer_from_the_current_location() {
+        let mut view = listed_view(vec![]);
+        assert_eq!(view.path_edit(), None);
+        let _ = view.apply_action_for_test(Action::EditPath);
+        assert_eq!(view.path_edit(), Some("/home"));
+    }
+
+    #[test]
+    fn path_submitted_requests_navigation_and_closes_the_editor() {
+        let mut view = listed_view(vec![]);
+        let _ = view.apply_action_for_test(Action::EditPath);
+        let _ = view.update(Message::PathInputChanged("/etc".to_owned()));
+        let (_, event) = view.update(Message::PathSubmitted);
+        assert_eq!(view.path_edit(), None);
+        match event {
+            Some(Event::OpenDirectory(location)) => {
+                assert_eq!(location, Location::local("/etc"));
+            }
+            other => panic!("expected OpenDirectory, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submitting_a_blank_path_is_a_no_op() {
+        let mut view = listed_view(vec![]);
+        let _ = view.apply_action_for_test(Action::EditPath);
+        let _ = view.update(Message::PathInputChanged("   ".to_owned()));
+        let (_, event) = view.update(Message::PathSubmitted);
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn breadcrumb_clicked_requests_navigation() {
+        let mut view = listed_view(vec![]);
+        let (_, event) = view.update(Message::BreadcrumbClicked(Location::local("/")));
+        match event {
+            Some(Event::OpenDirectory(location)) => assert_eq!(location, Location::local("/")),
+            other => panic!("expected OpenDirectory, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_typed_location_handles_local_and_remote_forms() {
+        assert_eq!(
+            parse_typed_location("/home/jordan"),
+            Location::local("/home/jordan")
+        );
+        assert_eq!(
+            parse_typed_location("sftp://jordan@host/srv"),
+            Location {
+                scheme: "sftp".to_owned(),
+                authority: Some("jordan@host".to_owned()),
+                path: PathBuf::from("/srv"),
+            }
+        );
+        assert_eq!(
+            parse_typed_location("sftp://jordan@host"),
+            Location {
+                scheme: "sftp".to_owned(),
+                authority: Some("jordan@host".to_owned()),
+                path: PathBuf::from("/"),
+            }
+        );
     }
 
     impl DirectoryView {

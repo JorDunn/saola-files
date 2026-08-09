@@ -1,29 +1,42 @@
-//! The portal seam: composes the active directory view behind one
-//! function, free of app-window concerns (no header, no close button —
-//! that's `ui::window`'s job). This is the surface a future saola-portal
-//! embeds directly as the file picker.
+//! The portal seam: composes the navigation toolbar (`ui::header`, which
+//! itself renders `ui::breadcrumbs`) above the active directory view
+//! behind one function, free of app-window concerns (no window title bar,
+//! no close button — that's `ui::window`'s job). This is the surface a
+//! future saola-portal embeds directly as the file picker.
 //!
-//! Sidebar (Stage 7) and breadcrumbs (Stage 4) aren't built yet; this
-//! stage renders only the active `DirectoryView`, leaving the layout room
-//! those stages fill in (a places sidebar to the left, a breadcrumb bar
-//! above the list).
+//! A places sidebar (Stage 7) still isn't built; this stage fills in the
+//! breadcrumb bar the Stage 3 module docs left room for.
 //!
 //! State ownership stays on the app (`main.rs` holds `Vec<DirectoryView> +
 //! active` — the tabs seam), not here: this module is deliberately
 //! stateless so a portal embedding it doesn't inherit tab bookkeeping it
-//! doesn't want.
+//! doesn't want. `ui::header`/`ui::breadcrumbs` are equally stateless —
+//! everything they need (history stacks, the path-edit buffer, view mode)
+//! lives on the `DirectoryView` they're passed.
 
-use iced::Element;
+use iced::widget::column;
+use iced::{Element, Fill};
 use saola_theme::Theme;
 
 use crate::ui::dirview::{self, DirectoryView};
+use crate::ui::header;
 
-/// Render `active` (the app's currently-shown `DirectoryView`), lifting
-/// its messages into the caller's `M` via `map`.
+/// Render `active` (the app's currently-shown `DirectoryView`) with its
+/// toolbar, lifting messages into the caller's `M` via `map`.
+///
+/// Built as one `Element<'a, dirview::Message>` tree first and mapped
+/// exactly once at the end, rather than calling `.map(map)` on the header
+/// and body separately — `map` is `impl Fn(...) -> M`, not required to be
+/// `Copy`, so it can only be consumed once.
 pub fn view<'a, M: 'a>(
     theme: &'a Theme,
     active: &'a DirectoryView,
     map: impl Fn(dirview::Message) -> M + 'a,
 ) -> Element<'a, M> {
-    active.view(theme).map(map)
+    let content: Element<'a, dirview::Message> =
+        column![header::view(theme, active), active.view(theme)]
+            .width(Fill)
+            .height(Fill)
+            .into();
+    content.map(map)
 }

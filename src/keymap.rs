@@ -16,8 +16,8 @@ use iced::keyboard::{Key, Modifiers};
 pub enum Action {
     MoveCursorUp,
     MoveCursorDown,
-    /// Reserved for grid view's column stepping (Stage 4); a no-op in the
-    /// list view this stage renders.
+    /// Grid view's column stepping (Stage 4: `ui::dirview::grid`); a no-op
+    /// in list view, which has no notion of "the next column over".
     MoveCursorLeft,
     MoveCursorRight,
     MoveCursorHome,
@@ -46,6 +46,26 @@ pub enum Action {
     /// Alt+Up or Backspace: navigate to the parent directory.
     Ascend,
     ToggleHidden,
+    /// Alt+Left: step back through this view's own history — the
+    /// browser-style back button (`DirectoryView`'s back/forward stacks,
+    /// Stage 4). Handled entirely inside the view (unlike `Ascend`, which
+    /// bubbles an `Event::OpenDirectory` for the owner to act on): back/
+    /// forward is inherently per-view, never a "maybe open in a new tab"
+    /// situation the way descending into a row is.
+    HistoryBack,
+    /// Alt+Right: the redo side of [`Action::HistoryBack`].
+    HistoryForward,
+    /// Ctrl+L: swap the breadcrumb trail for an editable path/URI
+    /// `text_input`, focused with its text selected.
+    EditPath,
+    /// Ctrl+1: switch this view to the list presentation.
+    SetViewList,
+    /// Ctrl+2: switch this view to the grid presentation.
+    SetViewGrid,
+    /// F5: re-list the current directory — the manual fallback for
+    /// backends that can't signal changes themselves (`Caps::WATCH`
+    /// unset).
+    Refresh,
 }
 
 /// Resolve one key press into an [`Action`], or `None` if this module
@@ -62,6 +82,9 @@ pub fn resolve(key: &Key, modifiers: Modifiers) -> Option<Action> {
             match c.as_str() {
                 "a" => return Some(Action::SelectAll),
                 "h" => return Some(Action::ToggleHidden),
+                "l" => return Some(Action::EditPath),
+                "1" => return Some(Action::SetViewList),
+                "2" => return Some(Action::SetViewGrid),
                 _ => {}
             }
         }
@@ -71,9 +94,16 @@ pub fn resolve(key: &Key, modifiers: Modifiers) -> Option<Action> {
         return None;
     }
 
-    // Alt+Up: ascend. Plain Backspace (handled below) does too.
-    if alt && !ctrl && !shift && matches!(key, Key::Named(Named::ArrowUp)) {
-        return Some(Action::Ascend);
+    // Alt+<arrow>, no other modifier riding along: browser-style history
+    // navigation, plus the pre-existing Alt+Up ascend synonym for plain
+    // Backspace (handled below).
+    if alt && !ctrl && !shift {
+        return match key {
+            Key::Named(Named::ArrowUp) => Some(Action::Ascend),
+            Key::Named(Named::ArrowLeft) => Some(Action::HistoryBack),
+            Key::Named(Named::ArrowRight) => Some(Action::HistoryForward),
+            _ => None,
+        };
     }
 
     // Every remaining action is a named key with at most Shift held.
@@ -102,6 +132,7 @@ pub fn resolve(key: &Key, modifiers: Modifiers) -> Option<Action> {
         (Named::PageDown, true) => Some(Action::ExtendSelectionPageDown),
         (Named::Enter, false) => Some(Action::Descend),
         (Named::Backspace, false) => Some(Action::Ascend),
+        (Named::F5, false) => Some(Action::Refresh),
         _ => None,
     }
 }
@@ -178,5 +209,51 @@ mod tests {
     fn unmapped_keys_resolve_to_none() {
         assert_eq!(resolve(&named(Named::Tab), Modifiers::empty()), None);
         assert_eq!(resolve(&Key::Character("x".into()), Modifiers::CTRL), None);
+    }
+
+    #[test]
+    fn alt_left_right_step_through_history() {
+        assert_eq!(
+            resolve(&named(Named::ArrowLeft), Modifiers::ALT),
+            Some(Action::HistoryBack)
+        );
+        assert_eq!(
+            resolve(&named(Named::ArrowRight), Modifiers::ALT),
+            Some(Action::HistoryForward)
+        );
+    }
+
+    #[test]
+    fn ctrl_l_edits_the_path_ctrl_1_2_switch_view() {
+        assert_eq!(
+            resolve(&Key::Character("l".into()), Modifiers::CTRL),
+            Some(Action::EditPath)
+        );
+        assert_eq!(
+            resolve(&Key::Character("1".into()), Modifiers::CTRL),
+            Some(Action::SetViewList)
+        );
+        assert_eq!(
+            resolve(&Key::Character("2".into()), Modifiers::CTRL),
+            Some(Action::SetViewGrid)
+        );
+    }
+
+    #[test]
+    fn f5_refreshes() {
+        assert_eq!(
+            resolve(&named(Named::F5), Modifiers::empty()),
+            Some(Action::Refresh)
+        );
+    }
+
+    #[test]
+    fn alt_shift_arrow_is_unmapped() {
+        // The alt-only block above must not swallow Alt+Shift combos —
+        // they fall through to the generic "ctrl || alt => None" guard.
+        assert_eq!(
+            resolve(&named(Named::ArrowLeft), Modifiers::ALT | Modifiers::SHIFT),
+            None
+        );
     }
 }
