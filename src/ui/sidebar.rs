@@ -1,0 +1,331 @@
+//! The places sidebar: a §6-list-row column of "here's a shortcut"
+//! entries, composed into `ui::explorer` beside the header+directory-view
+//! column (portal-seam discipline — CLAUDE.md: `ui::explorer` is "free of
+//! app-window concerns", and this module follows the same rule
+//! `ui::header`/`ui::breadcrumbs` already do: state lives on the value the
+//! caller hands in, no app-window types appear anywhere here).
+//!
+//! Two independent sources feed it, kept apart on purpose:
+//!
+//! - [`crate::core::places::Place`]s — home, XDG user dirs, bookmarks,
+//!   saved servers, trash — computed once at startup (`main.rs::App::new`,
+//!   mirroring how `mime_db`/`apps_db` are built once) and handed to
+//!   [`Sidebar::new`]. Nothing here re-reads the bookmarks/`user-dirs.dirs`
+//!   files; a later "add bookmark" action would re-run
+//!   `core::places::build` and replace `self.places` wholesale, the same
+//!   shape [`Message::MountsUpdated`] already uses for the live side.
+//! - [`crate::core::udisks::Mount`]s — a *live*, D-Bus-fed section
+//!   rendered separately underneath. `Sidebar` owns the running
+//!   `Vec<Mount>`; [`Message::MountsUpdated`] replaces it wholesale each
+//!   time the udisks worker emits a fresh snapshot (see `core::udisks`'s
+//!   module docs on why whole-snapshot-replace, not fine-grained add/
+//!   remove events, is what actually crosses the D-Bus boundary). No
+//!   udisks on the bus, or nothing mounted, both leave this empty and the
+//!   "Removable" section simply doesn't render — CLAUDE.md's degrade-to-
+//!   nothing rule, exercised here exactly the way a backend without
+//!   `Caps::WATCH` degrades the header's refresh affordance.
+
+use iced::widget::{button, column, container, row, scrollable, text};
+use iced::{Center, Element, Fill, Subscription};
+use saola_theme::{ColorExt, Surface, Theme, convert, style};
+
+use crate::core::places::Place;
+use crate::core::udisks::{Mount, MountsSource, UdisksMounts};
+use crate::core::vfs::Location;
+use crate::icons::{self, Icon};
+
+/// The sidebar's fixed column width. Layout-specific to this file
+/// manager's chrome, not a saola-theme design-system size — same
+/// distinction `ui::window`'s `RESIZE_EDGE`/`RESIZE_CORNER` and
+/// `ui::dirview::list`'s `SIZE_COLUMN`/`DATE_COLUMN` draw. **Upstream
+/// gap** (verified against the pinned `saola-theme-v0.5.0` tag): the
+/// Stage 3 handoff already flagged `sizes.window_sidebar` as missing from
+/// saola-theme; this is that same still-open gap, not a new one.
+/// TODO(saola-theme): promote to `sizes.window_sidebar` upstream and
+/// delete this constant once a new tag ships it.
+const SIDEBAR_WIDTH: f32 = 200.0;
+
+#[derive(Debug, Clone)]
+pub enum Message {
+    PlaceClicked(Location),
+    MountClicked(Location),
+    MountsUpdated(Vec<Mount>),
+}
+
+/// What the sidebar asks its owner to do — the same "the view only ever
+/// requests, the owner acts" shape `ui::dirview::Event` uses (see that
+/// module's docs on why the actual navigation happens one layer up).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    OpenDirectory(Location),
+}
+
+/// The sidebar's state: the (rare-to-change) place list plus the
+/// (frequently-updated) live mount list.
+pub struct Sidebar {
+    places: Vec<Place>,
+    mounts: Vec<Mount>,
+}
+
+impl Sidebar {
+    pub fn new(places: Vec<Place>) -> Self {
+        Sidebar {
+            places,
+            mounts: Vec::new(),
+        }
+    }
+
+    /// Read-only access for `main.rs`/tests that want to inspect what a
+    /// `Sidebar` was built with, without reaching into a private field.
+    pub fn places(&self) -> &[Place] {
+        &self.places
+    }
+
+    pub fn mounts(&self) -> &[Mount] {
+        &self.mounts
+    }
+
+    pub fn update(&mut self, message: Message) -> Option<Event> {
+        match message {
+            Message::PlaceClicked(location) | Message::MountClicked(location) => {
+                Some(Event::OpenDirectory(location))
+            }
+            Message::MountsUpdated(mounts) => {
+                self.mounts = mounts;
+                None
+            }
+        }
+    }
+
+    /// `current` is the active `DirectoryView`'s location — the row (place
+    /// or mount) that matches it draws selected, the same terracotta §6
+    /// list-row treatment `ui::dirview::list`'s selected rows use.
+    pub fn view<'a>(&'a self, t: &'a Theme, current: &Location) -> Element<'a, Message> {
+        let mut rows: Vec<Element<'a, Message>> = self
+            .places
+            .iter()
+            .map(|place| place_row(t, place, place.location == *current))
+            .collect();
+
+        if !self.mounts.is_empty() {
+            rows.push(section_label(t, "Removable"));
+            rows.extend(self.mounts.iter().map(|mount| {
+                let location = Location::local(mount.mount_point.clone());
+                mount_row(t, mount, location == *current)
+            }));
+        }
+
+        let content = column(rows).width(Fill);
+
+        container(
+            scrollable(content)
+                .style(style::scrollable::rest(t, Surface::Paper))
+                .width(Fill)
+                .height(Fill),
+        )
+        .width(SIDEBAR_WIDTH)
+        .height(Fill)
+        .into()
+    }
+
+    /// The udisks live feed as an iced subscription — `ui::explorer`/
+    /// `main.rs` batches this beside the active view's own directory
+    /// watch. `Subscription::run` (not `run_with`, unlike a directory
+    /// watch keyed by `Location`): there's exactly one udisks feed for the
+    /// app's whole lifetime, so a bare function pointer is its own stable
+    /// identity across re-renders — see `saola-panel`'s `battery.rs` doc
+    /// comment for the fuller teaching note on why a `fn` pointer alone is
+    /// enough for `Subscription::run`'s identity.
+    pub fn subscription(&self) -> Subscription<Message> {
+        Subscription::run(mounts_stream)
+    }
+}
+
+/// Bridges `core::udisks`'s iced-free `BoxStream` into an
+/// `iced::futures::Stream` of `Message`s — the one place this module
+/// touches `core::udisks` directly; everything above only ever sees
+/// `Message::MountsUpdated`. `UdisksMounts` is always the real
+/// implementation here (there is exactly one udisks feed in the running
+/// app); `core::udisks`'s own tests are what exercise `MountsSource`
+/// through the fake.
+fn mounts_stream() -> impl iced::futures::Stream<Item = Message> {
+    use iced::futures::stream::StreamExt;
+    UdisksMounts.watch().map(Message::MountsUpdated)
+}
+
+fn place_row<'a>(t: &'a Theme, place: &'a Place, selected: bool) -> Element<'a, Message> {
+    row_button(
+        t,
+        Icon::for_place(place.kind),
+        &place.label,
+        selected,
+        Message::PlaceClicked(place.location.clone()),
+    )
+}
+
+fn mount_row<'a>(t: &'a Theme, mount: &'a Mount, selected: bool) -> Element<'a, Message> {
+    row_button(
+        t,
+        Icon::for_mount(mount.removable),
+        &mount.label,
+        selected,
+        Message::MountClicked(Location::local(mount.mount_point.clone())),
+    )
+}
+
+fn row_button<'a>(
+    t: &'a Theme,
+    glyph: Icon,
+    label: &'a str,
+    selected: bool,
+    on_press: Message,
+) -> Element<'a, Message> {
+    // Same fixed-tint reasoning `ui::header::nav_button`'s doc comment
+    // spells out: an `Svg` icon's color closure is set once at build time,
+    // not re-evaluated per `button::Status`, so the selected/unselected
+    // split has to be decided by the caller rather than left to hover
+    // state.
+    let icon_color = if selected {
+        t.palette.paper
+    } else {
+        t.on_paper.primary
+    };
+    let content = row![
+        icons::icon(glyph, t.sizes.icon_row, icon_color.into_iced()),
+        text(label)
+            .size(t.typography.size.body)
+            .font(convert::ui_font(t)),
+    ]
+    .spacing(t.sizes.pill_gap)
+    .align_y(Center);
+
+    button(content)
+        .style(row_style(t, selected))
+        .width(Fill)
+        .height(t.sizes.list_row)
+        .padding([0.0, t.sizes.pill_gap])
+        .on_press(on_press)
+        .into()
+}
+
+fn section_label<'a>(t: &'a Theme, label: &'a str) -> Element<'a, Message> {
+    container(
+        text(label)
+            .size(t.typography.size.label)
+            .font(convert::mono_font_medium(t))
+            .color(t.on_paper.tertiary.into_iced()),
+    )
+    .padding([t.sizes.pill_gap, t.sizes.pill_gap])
+    .into()
+}
+
+/// §6 "List row" (`docs/SAOLA-STYLE-GUIDE.md`): height `sizes.list_row`,
+/// `radii.pill`, transparent at rest, `fill_subtle` on hover, terracotta
+/// when selected with ivory text — identical recipe to
+/// `ui::dirview::list::row_style`, minus that function's keyboard-cursor
+/// focus ring (the sidebar has no keyboard cursor this stage, only mouse
+/// selection-by-current-location).
+///
+/// **Upstream gap** (verified against the pinned `saola-theme-v0.5.0`
+/// tag): there is still no `style::button::list_row` helper — this is the
+/// *third* local derivation of the same recipe (`dirview::list::row_style`,
+/// `dirview::grid::tile_style`, and now this one). TODO(saola-theme):
+/// promote to `style::button::list_row(t, Surface, selected: bool)`
+/// upstream and delete all three call sites' local copies once a new tag
+/// ships it; bump the pinned tag in this crate's `Cargo.toml` in the same
+/// PR that adopts it.
+fn row_style(t: &Theme, selected: bool) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+    let radius = t.radii.pill;
+    let on = t.on_paper;
+    let accent = t.palette.accent;
+    let paper_text = t.palette.paper;
+
+    move |_, status| {
+        let (background, text_color) = if selected {
+            let bg = match status {
+                button::Status::Hovered => on.fill_subtle.over(accent),
+                button::Status::Pressed => on.fill.over(accent),
+                _ => accent,
+            };
+            (Some(bg), paper_text)
+        } else {
+            let bg = match status {
+                button::Status::Hovered => Some(on.fill_subtle),
+                button::Status::Pressed => Some(on.fill),
+                _ => None,
+            };
+            (bg, on.primary)
+        };
+
+        button::Style {
+            background: background.map(|color| iced::Background::Color(color.into_iced())),
+            text_color: text_color.into_iced(),
+            border: iced::Border {
+                color: iced::Color::TRANSPARENT,
+                width: 0.0,
+                radius: radius.into(),
+            },
+            ..button::Style::default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::places::PlaceKind;
+
+    fn place(label: &str, path: &str, kind: PlaceKind) -> Place {
+        Place {
+            label: label.to_owned(),
+            location: Location::local(path),
+            kind,
+        }
+    }
+
+    #[test]
+    fn new_sidebar_starts_with_no_mounts() {
+        let sidebar = Sidebar::new(vec![place("Home", "/home/jordan", PlaceKind::Home)]);
+        assert!(sidebar.mounts().is_empty());
+        assert_eq!(sidebar.places().len(), 1);
+    }
+
+    #[test]
+    fn place_clicked_bubbles_an_open_directory_event() {
+        let mut sidebar = Sidebar::new(vec![place("Home", "/home/jordan", PlaceKind::Home)]);
+        let event = sidebar.update(Message::PlaceClicked(Location::local("/home/jordan")));
+        assert_eq!(
+            event,
+            Some(Event::OpenDirectory(Location::local("/home/jordan")))
+        );
+    }
+
+    #[test]
+    fn mount_clicked_bubbles_an_open_directory_event() {
+        let mut sidebar = Sidebar::new(vec![]);
+        let event = sidebar.update(Message::MountClicked(Location::local("/media/usb")));
+        assert_eq!(
+            event,
+            Some(Event::OpenDirectory(Location::local("/media/usb")))
+        );
+    }
+
+    #[test]
+    fn mounts_updated_replaces_the_running_list_and_bubbles_nothing() {
+        let mut sidebar = Sidebar::new(vec![]);
+        let mount = Mount {
+            label: "USB Drive".to_owned(),
+            mount_point: std::path::PathBuf::from("/media/usb"),
+            removable: true,
+        };
+        let event = sidebar.update(Message::MountsUpdated(vec![mount.clone()]));
+        assert_eq!(event, None);
+        assert_eq!(sidebar.mounts(), &[mount]);
+
+        // A later, smaller snapshot replaces the list wholesale — this is
+        // the "mount removed" half of the live-update contract.
+        let event = sidebar.update(Message::MountsUpdated(vec![]));
+        assert_eq!(event, None);
+        assert!(sidebar.mounts().is_empty());
+    }
+}

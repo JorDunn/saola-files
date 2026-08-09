@@ -1259,38 +1259,13 @@ async fn list_with_fallback(fallback: &Location) -> Result<Vec<FileEntry>, VfsEr
 }
 
 /// Parses the breadcrumb path/URI editor's submitted text into a
-/// [`Location`]. Anything containing `"://"` is treated as
-/// `scheme://[authority]/path` (a remote location typed by hand — a
-/// scheme nothing recognizes surfaces as an ordinary "no backend"
-/// `VfsError` at load time via `modules::resolve`, not a parse error
-/// here); everything else is a bare local path. Mirrors `Location`'s own
-/// `Display` impl (`core::vfs`), so round-tripping "edit, don't change
-/// anything, submit" reproduces the same location.
+/// [`Location`]. A thin wrapper over [`Location::parse`] (Stage 7 lifted
+/// the actual grammar up to `core::vfs` so `core::places`' saved-server
+/// entries can share it too) — kept as a named function here purely so the
+/// call site below reads as "what the user typed", not "the shared URI
+/// grammar".
 fn parse_typed_location(input: &str) -> Location {
-    let Some((scheme, rest)) = input.split_once("://") else {
-        return Location::local(PathBuf::from(input));
-    };
-    if scheme.is_empty() {
-        return Location::local(PathBuf::from(input));
-    }
-    match rest.find('/') {
-        Some(path_start) => {
-            let authority = &rest[..path_start];
-            let path = &rest[path_start..];
-            Location {
-                scheme: scheme.to_owned(),
-                authority: (!authority.is_empty()).then(|| authority.to_owned()),
-                path: PathBuf::from(path),
-            }
-        }
-        // No `/` at all after the scheme — the whole remainder is the
-        // authority, with an implied root path.
-        None => Location {
-            scheme: scheme.to_owned(),
-            authority: (!rest.is_empty()).then(|| rest.to_owned()),
-            path: PathBuf::from("/"),
-        },
-    }
+    Location::parse(input)
 }
 
 #[cfg(test)]

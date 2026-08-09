@@ -130,6 +130,19 @@ inotify = "0.11"
 # small, single-purpose parsing/path crates, not a heavy pull.
 xdg-mime = "0.4"
 
+# `core::udisks` (Stage 7) — UDisks2 mount discovery for the places
+# sidebar, the app's first D-Bus consumer. Surveyed 2026-08-09: `zbus` is
+# the crate every sibling Saola surface already standardizes on (panel,
+# capture, session), so there was no real alternative to weigh — a second
+# D-Bus binding would mean two async D-Bus stacks sharing one process for
+# no benefit. `default-features = false` drops zbus's default `async-io`
+# executor; `tokio` re-enables just the integration that lets it run its
+# socket-reader tasks on the *same* shared runtime iced's own `tokio`
+# feature provides (CLAUDE.md: "one async runtime … never construct a
+# second") — the exact posture the panel's Cargo.toml documents for this
+# same dependency.
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+
 [dev-dependencies]
 # `modules::local`'s unit tests call `LocalBackend` methods directly (not
 # through `iced::Task`), so they need *some* live Tokio runtime for

@@ -5,4 +5,6 @@
 pub mod apps;
 pub mod fs;
 pub mod mime;
+pub mod places;
+pub mod udisks;
 pub mod vfs;

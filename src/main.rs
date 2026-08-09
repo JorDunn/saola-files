@@ -1,9 +1,10 @@
 //! saola-files — the file manager for the Saola desktop environment.
 //!
-//! Current scope (through Stage 3): the application shell (Stage 1), CLI
-//! parsing and `files.toml` loading (Stage 2), and now real directory
-//! browsing — a VFS `Backend` trait, a local backend, and the explorer
-//! (sidebar/breadcrumbs land in Stages 7/4).
+//! Current scope (through Stage 7): the application shell (Stage 1), CLI
+//! parsing and `files.toml` loading (Stage 2), real directory browsing
+//! through a VFS `Backend` trait and a local backend, navigation chrome
+//! and live updates (Stages 4–5), mime/icons/opening (Stage 6), and now
+//! the places sidebar (Stage 7).
 //!
 //! This binary is a thin shell over the `saola_files` library crate
 //! (`src/lib.rs`) — see that file's docs for why the split exists.
@@ -74,7 +75,7 @@ fn main() -> iced::Result {
 #[derive(Debug, Clone)]
 enum Message {
     Window(ui::window::Event),
-    Directory(ui::dirview::Message),
+    Explorer(ui::explorer::Message),
 }
 
 struct App {
@@ -83,6 +84,13 @@ struct App {
     /// active`") — Stage 3 only ever shows one.
     views: Vec<ui::dirview::DirectoryView>,
     active: usize,
+    /// The places sidebar (Stage 7) — its own self-contained state
+    /// (`core::places::Place`s built once at startup, `core::udisks::
+    /// Mount`s updated live), composed beside `views`/`active` by
+    /// `ui::explorer::view` rather than folded into the tabs seam: unlike
+    /// a `DirectoryView`, there is exactly one sidebar for the whole app,
+    /// not one per tab.
+    sidebar: ui::sidebar::Sidebar,
     /// Shared caches (CLAUDE.md: "Shared caches (thumbs, mime, apps, …)
     /// live on the App, never per-view") — built once at startup, since
     /// both walk real filesystem trees (`$XDG_DATA_DIRS/mime`,
@@ -109,6 +117,16 @@ impl App {
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/"));
+
+        // The sidebar's place list (Stage 7): built once, the same
+        // "walk it at startup, never again" posture `mime_db`/`apps_db`
+        // already take below — `core::places::UserDirs::load`/
+        // `load_bookmarks` degrade to empty on a missing/unreadable file,
+        // never fail `App::new` itself.
+        let user_dirs = core::places::UserDirs::load(&home);
+        let bookmarks = core::places::load_bookmarks(&home);
+        let places = core::places::build(&home, &user_dirs, &bookmarks, &config.servers);
+
         let fallback = Location::local(home);
 
         // Most of `config` is consumed entirely here (view/sort/
@@ -132,28 +150,52 @@ impl App {
             theme: Theme::saola(),
             views: vec![view],
             active: 0,
+            sidebar: ui::sidebar::Sidebar::new(places),
             mime_db: core::mime::MimeDb::new(),
             apps_db: core::apps::AppsDb::load(),
             terminal: config.terminal.clone(),
         };
-        (app, task.map(Message::Directory))
+        (
+            app,
+            task.map(|m| Message::Explorer(ui::explorer::Message::Directory(m))),
+        )
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Window(event) => ui::window::update(event),
-            Message::Directory(inner) => {
+            Message::Explorer(ui::explorer::Message::Sidebar(inner)) => {
+                match self.sidebar.update(inner) {
+                    Some(ui::sidebar::Event::OpenDirectory(location)) => {
+                        self.navigate_active(location)
+                    }
+                    None => Task::none(),
+                }
+            }
+            Message::Explorer(ui::explorer::Message::Directory(inner)) => {
                 let Some(view) = self.views.get_mut(self.active) else {
                     return Task::none();
                 };
                 let (task, event) = view.update(inner);
-                let mut tasks = vec![task.map(Message::Directory)];
+                let mut tasks = vec![directory_task(task)];
                 if let Some(event) = event {
                     tasks.push(self.handle_directory_event(event));
                 }
                 Task::batch(tasks)
             }
         }
+    }
+
+    /// Navigates the active `DirectoryView` to `location` — the shared
+    /// tail end of both `ui::sidebar::Event::OpenDirectory` (a places-row
+    /// click) and `ui::dirview::Event::OpenDirectory` (ascend/breadcrumb/
+    /// descend) below, since both ultimately mean the same thing: "show
+    /// this location in the one tab there currently is."
+    fn navigate_active(&mut self, location: Location) -> Task<Message> {
+        let Some(view) = self.views.get_mut(self.active) else {
+            return Task::none();
+        };
+        directory_task(view.navigate(location))
     }
 
     /// The owner's response to a `DirectoryView` `Event` — the view only
@@ -167,12 +209,7 @@ impl App {
     /// posture says should degrade quietly, not take the app down).
     fn handle_directory_event(&mut self, event: ui::dirview::Event) -> Task<Message> {
         match event {
-            ui::dirview::Event::OpenDirectory(location) => {
-                let Some(view) = self.views.get_mut(self.active) else {
-                    return Task::none();
-                };
-                view.navigate(location).map(Message::Directory)
-            }
+            ui::dirview::Event::OpenDirectory(location) => self.navigate_active(location),
             ui::dirview::Event::Activated(locations) => {
                 self.open_with_default_app(&locations);
                 Task::none()
@@ -238,8 +275,11 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let keyboard = iced::keyboard::listen()
-            .map(|event| Message::Directory(ui::dirview::Message::Keyboard(event)));
+        let keyboard = iced::keyboard::listen().map(|event| {
+            Message::Explorer(ui::explorer::Message::Directory(
+                ui::dirview::Message::Keyboard(event),
+            ))
+        });
 
         // Stage 5: the active view's own live-update watch, if its backend
         // has one — `None`/an out-of-range `active` degrades to "no watch
@@ -248,10 +288,18 @@ impl App {
         let watch = self
             .views
             .get(self.active)
-            .map(|view| view.subscription().map(Message::Directory))
+            .map(|view| view.subscription().map(directory_message))
             .unwrap_or_else(Subscription::none);
 
-        Subscription::batch([keyboard, watch])
+        // Stage 7: the places sidebar's own live udisks feed — one for the
+        // app's whole lifetime (`ui::sidebar::Sidebar::subscription`'s doc
+        // comment), batched in beside the keyboard/watch streams above.
+        let mounts = self
+            .sidebar
+            .subscription()
+            .map(|m| Message::Explorer(ui::explorer::Message::Sidebar(m)));
+
+        Subscription::batch([keyboard, watch, mounts])
     }
 
     fn theme(&self) -> iced::Theme {
@@ -269,9 +317,14 @@ impl App {
         let t = &self.theme;
 
         let body = match self.views.get(self.active) {
-            Some(view) => {
-                ui::explorer::view(t, view, &self.mime_db, &self.apps_db, Message::Directory)
-            }
+            Some(view) => ui::explorer::view(
+                t,
+                &self.sidebar,
+                view,
+                &self.mime_db,
+                &self.apps_db,
+                Message::Explorer,
+            ),
             // Degrades to a blank paper surface rather than panicking —
             // `active` should always be in range, but the no-panic rule
             // means "should" isn't good enough.
@@ -280,4 +333,24 @@ impl App {
 
         ui::window::view(t, "Files", body, Message::Window)
     }
+}
+
+/// `ui::dirview::Message -> Message`, as a bare `fn` — used wherever a
+/// `Subscription`'s own identity depends on the mapper being a plain
+/// function pointer rather than a capturing closure (`ui::dirview::watch`'s
+/// module docs explain why `Subscription::run_with`'s builder has the same
+/// constraint). `Message::Explorer(explorer::Message::Directory(inner))` is
+/// itself already `Fn(dirview::Message) -> Message`-shaped via ordinary
+/// tuple-variant construction, but nested two enums deep it isn't
+/// expressible as a single path the way `Message::Directory` used to be —
+/// this free function is that composition, named once.
+fn directory_message(inner: ui::dirview::Message) -> Message {
+    Message::Explorer(ui::explorer::Message::Directory(inner))
+}
+
+/// Wraps a `Task<dirview::Message>` into `Task<Message>` — the same
+/// `directory_message` composition, for the `Task::map` call sites in
+/// `App::update`.
+fn directory_task(task: Task<ui::dirview::Message>) -> Task<Message> {
+    task.map(directory_message)
 }

@@ -225,6 +225,38 @@ impl Icon {
             Category::Unknown => Icon::FileQuestion,
         }
     }
+
+    /// The glyph for one places-sidebar row (Stage 7, `ui::sidebar`).
+    /// `Desktop`/`Documents` share the plain folder glyph — neither has a
+    /// dedicated Lucide icon in this crate's reserved places set (see the
+    /// Stage 6 handoff's inventory), and a shortcut to *a* folder reads
+    /// fine as "a folder" the same way any other directory row does.
+    pub fn for_place(kind: crate::core::places::PlaceKind) -> Icon {
+        use crate::core::places::PlaceKind;
+        match kind {
+            PlaceKind::Home => Icon::House,
+            PlaceKind::Downloads => Icon::Download,
+            PlaceKind::Pictures => Icon::Image,
+            PlaceKind::Music => Icon::Music,
+            PlaceKind::Videos => Icon::Film,
+            PlaceKind::Desktop | PlaceKind::Documents => Icon::Folder,
+            PlaceKind::Bookmark => Icon::Bookmark,
+            PlaceKind::Server => Icon::Server,
+            PlaceKind::Trash => Icon::Trash2,
+        }
+    }
+
+    /// The glyph for one places-sidebar mount row (Stage 7,
+    /// `core::udisks::Mount`) — shape carries removability, never hue
+    /// (style guide §1), the same rule [`Icon::for_entry`] follows for
+    /// mimetype.
+    pub fn for_mount(removable: bool) -> Icon {
+        if removable {
+            Icon::Usb
+        } else {
+            Icon::HardDrive
+        }
+    }
 }
 
 /// Builds a sized, tinted [`Svg`] widget for `icon`.
@@ -393,6 +425,34 @@ mod tests {
             Icon::for_entry(EntryKind::File, false, Category::Unknown),
             Icon::FileQuestion
         );
+    }
+
+    // ── `Icon::for_place`/`for_mount` (Stage 7) ──────────────────────────
+
+    #[test]
+    fn for_place_maps_every_kind_to_a_distinct_reserved_glyph() {
+        use crate::core::places::PlaceKind;
+        assert_eq!(Icon::for_place(PlaceKind::Home), Icon::House);
+        assert_eq!(Icon::for_place(PlaceKind::Downloads), Icon::Download);
+        assert_eq!(Icon::for_place(PlaceKind::Pictures), Icon::Image);
+        assert_eq!(Icon::for_place(PlaceKind::Music), Icon::Music);
+        assert_eq!(Icon::for_place(PlaceKind::Videos), Icon::Film);
+        assert_eq!(Icon::for_place(PlaceKind::Bookmark), Icon::Bookmark);
+        assert_eq!(Icon::for_place(PlaceKind::Server), Icon::Server);
+        assert_eq!(Icon::for_place(PlaceKind::Trash), Icon::Trash2);
+    }
+
+    #[test]
+    fn for_place_falls_back_to_the_folder_glyph_for_desktop_and_documents() {
+        use crate::core::places::PlaceKind;
+        assert_eq!(Icon::for_place(PlaceKind::Desktop), Icon::Folder);
+        assert_eq!(Icon::for_place(PlaceKind::Documents), Icon::Folder);
+    }
+
+    #[test]
+    fn for_mount_differentiates_removable_by_shape_not_hue() {
+        assert_eq!(Icon::for_mount(true), Icon::Usb);
+        assert_eq!(Icon::for_mount(false), Icon::HardDrive);
     }
 
     /// None of these assets are filled shapes — every one still carries a

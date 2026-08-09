@@ -64,6 +64,44 @@ impl Location {
             path: self.path.join(name),
         }
     }
+
+    /// Parses `scheme://[authority]/path` (a remote location typed by hand,
+    /// or read out of a config/bookmarks file) into a [`Location`]. Anything
+    /// without a `"://"` is a bare local path. A scheme nothing recognizes
+    /// still parses fine here — it surfaces as an ordinary "no backend"
+    /// [`VfsError`] at load time via `modules::resolve`, not a parse error.
+    /// Mirrors this type's own `Display` impl, so round-tripping "format,
+    /// then parse" reproduces the same `Location`.
+    ///
+    /// Shared by the breadcrumb path/URI editor (`ui::dirview`) and the
+    /// places sidebar's saved-`[[server]]` entries (`core::places`) — one
+    /// hand-rolled URI grammar, not two copies that could drift.
+    pub fn parse(input: &str) -> Location {
+        let Some((scheme, rest)) = input.split_once("://") else {
+            return Location::local(PathBuf::from(input));
+        };
+        if scheme.is_empty() {
+            return Location::local(PathBuf::from(input));
+        }
+        match rest.find('/') {
+            Some(path_start) => {
+                let authority = &rest[..path_start];
+                let path = &rest[path_start..];
+                Location {
+                    scheme: scheme.to_owned(),
+                    authority: (!authority.is_empty()).then(|| authority.to_owned()),
+                    path: PathBuf::from(path),
+                }
+            }
+            // No `/` at all after the scheme — the whole remainder is the
+            // authority, with an implied root path.
+            None => Location {
+                scheme: scheme.to_owned(),
+                authority: (!rest.is_empty()).then(|| rest.to_owned()),
+                path: PathBuf::from("/"),
+            },
+        }
+    }
 }
 
 impl fmt::Display for Location {
@@ -398,6 +436,31 @@ mod tests {
         assert_eq!(parent, Location::local("/a"));
         assert_eq!(parent.join("b"), location);
         assert_eq!(Location::local("/").parent(), None);
+    }
+
+    #[test]
+    fn parse_handles_local_and_remote_forms() {
+        assert_eq!(
+            Location::parse("/home/jordan"),
+            Location::local("/home/jordan")
+        );
+        assert_eq!(
+            Location::parse("sftp://jordan@host/srv"),
+            Location {
+                scheme: "sftp".to_owned(),
+                authority: Some("jordan@host".to_owned()),
+                path: PathBuf::from("/srv"),
+            }
+        );
+        // No path at all after the authority: implied root.
+        assert_eq!(
+            Location::parse("sftp://jordan@host"),
+            Location {
+                scheme: "sftp".to_owned(),
+                authority: Some("jordan@host".to_owned()),
+                path: PathBuf::from("/"),
+            }
+        );
     }
 
     #[test]
