@@ -354,11 +354,18 @@ impl Backend for LocalBackend {
     }
 
     fn caps(&self) -> Caps {
-        // `WATCH` as of Stage 5 (`watch()` below is real inotify). Still no
-        // `TRASH` (`remove()` is a real permanent delete — claiming trash
-        // here would be a capability lie the UI would word wrong).
-        // `SET_PERMISSIONS` has no backing trait method at all yet.
-        Caps::WATCH | Caps::RENAME_IN_PLACE | Caps::LOCAL_PATH | Caps::THUMBNAILS
+        // `WATCH` as of Stage 5 (`watch()` below is real inotify). `TRASH`
+        // as of Stage 9: `remove()` is still a real permanent delete (the
+        // `Backend` trait has no `trash()` method — see
+        // `core::fs::trash`'s module doc comment on why that stays a
+        // standalone local-only module instead), but the UI's delete
+        // handling (`main.rs`) checks this bit and calls
+        // `core::fs::trash::trash` directly for local locations rather
+        // than going through this trait when it's set, so claiming it here
+        // is honest, not a capability lie the way it would have been
+        // before this stage existed. `SET_PERMISSIONS` has no backing
+        // trait method at all yet.
+        Caps::WATCH | Caps::TRASH | Caps::RENAME_IN_PLACE | Caps::LOCAL_PATH | Caps::THUMBNAILS
     }
 
     async fn list(&self, location: &Location) -> Result<Vec<FileEntry>, VfsError> {
@@ -751,14 +758,16 @@ mod tests {
     }
 
     #[test]
-    fn caps_claim_watch_now_but_still_not_trash() {
-        // Capability-honest: `remove()` really does permanently delete (no
-        // trash dir involved) — claiming that bit would be a lie the UI
-        // would word wrong. `watch()` genuinely can signal changes now
-        // (see the temp-dir tests below), so claiming `WATCH` is not.
+    fn caps_claim_watch_and_trash() {
+        // Capability-honest: `watch()` genuinely can signal changes (see
+        // the temp-dir tests below), and as of Stage 9 the UI's delete
+        // handling genuinely does route local deletes through
+        // `core::fs::trash` when this bit is set — see `caps()`'s own doc
+        // comment for why claiming it is no longer the lie it would have
+        // been before that module existed.
         let caps = backend().caps();
         assert!(caps.contains(Caps::WATCH));
-        assert!(!caps.contains(Caps::TRASH));
+        assert!(caps.contains(Caps::TRASH));
         assert!(caps.contains(Caps::LOCAL_PATH));
     }
 

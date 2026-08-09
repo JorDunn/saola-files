@@ -17,7 +17,7 @@ use saola_theme::{Theme, convert};
 
 use core::fs::ops;
 use core::vfs::Location;
-use saola_files::{cli, config, core, ui};
+use saola_files::{cli, config, core, modules, ui};
 
 fn main() -> iced::Result {
     let invocation = match cli::parse(std::env::args_os().skip(1)) {
@@ -85,6 +85,12 @@ enum Message {
     Progress(ui::dialogs::progress::Message),
     /// The conflict dialog's buttons/checkbox.
     Conflict(ui::dialogs::conflict::Message),
+    /// The Trash browser (Stage 9) — routed here rather than nested inside
+    /// `ui::explorer::Message` the way `sidebar`/`dirview` are, because
+    /// `TrashView` isn't part of that portal seam at all (see
+    /// `ui::trashview`'s module doc comment): it's a separate top-level
+    /// surface `App` swaps in for the explorer body, not a child of it.
+    Trash(ui::trashview::Message),
     /// Swallows a click on the conflict dialog's modal scrim — the dialog
     /// must be answered via one of its three buttons, never dismissed by
     /// clicking outside it (there is no sane default resolution to assume).
@@ -147,6 +153,23 @@ struct App {
     /// `App`'s half of the capacity-1 reply-channel pattern (CLAUDE.md; see
     /// `core::fs::ops`'s module docs).
     pending_conflict: Option<PendingConflict>,
+    /// The Trash browser (Stage 9) — always constructed, like `sidebar`
+    /// (not `Option`), so its list survives being switched away from and
+    /// back to without reloading from scratch mid-transition. `files.
+    /// toml`'s `confirm-empty-trash` knob is baked into it at construction,
+    /// the same "config knob becomes fixed per-surface state" posture
+    /// `DirectoryView::new` already takes for its own config-derived
+    /// fields.
+    trash_view: ui::trashview::TrashView,
+    /// Whether the Trash browser is what's currently showing in place of
+    /// the ordinary explorer body — set by `navigate_active` the moment
+    /// the sidebar's Trash place (`core::places::trash_location()`) is
+    /// clicked, cleared the moment any other place/mount is. `views`/
+    /// `active` (the tabs seam) are untouched either way: switching into
+    /// Trash doesn't navigate the hidden `DirectoryView` anywhere, it's
+    /// still pointed at whatever it was showing before, and switching back
+    /// out shows exactly that again.
+    trash_active: bool,
 }
 
 /// See `App::pending_conflict`'s doc comment.
@@ -211,6 +234,8 @@ impl App {
             active_op: None,
             active_op_progress: None,
             pending_conflict: None,
+            trash_view: ui::trashview::TrashView::new(config.confirm_empty_trash),
+            trash_active: false,
         };
         (
             app,
@@ -258,6 +283,7 @@ impl App {
                 Task::none()
             }
             Message::Noop => Task::none(),
+            Message::Trash(inner) => trash_task(self.trash_view.update(inner)),
         }
     }
 
@@ -376,7 +402,25 @@ impl App {
     /// click) and `ui::dirview::Event::OpenDirectory` (ascend/breadcrumb/
     /// descend) below, since both ultimately mean the same thing: "show
     /// this location in the one tab there currently is."
+    ///
+    /// **Stage 9's one exception:** the sidebar's Trash place navigates to
+    /// `core::places::trash_location()`, a sentinel no backend actually
+    /// serves (see that function's doc comment) — caught here, before it
+    /// ever reaches a `DirectoryView`, and swapped for switching
+    /// `trash_active` on and loading `trash_view` instead. `ui::dirview`'s
+    /// own `Event::OpenDirectory` (breadcrumbs/ascend/descend) can never
+    /// actually produce this sentinel — a directory view only ever joins
+    /// child names onto its *own* location, which is never the trash
+    /// scheme — so this check is cheap and never fires from that path in
+    /// practice; it's here because both callers share this one function,
+    /// not because both need it.
     fn navigate_active(&mut self, location: Location) -> Task<Message> {
+        if location == core::places::trash_location() {
+            self.trash_active = true;
+            return trash_task(self.trash_view.load());
+        }
+        self.trash_active = false;
+
         let Some(view) = self.views.get_mut(self.active) else {
             return Task::none();
         };
@@ -440,7 +484,53 @@ impl App {
                 Task::none()
             }
             ui::dirview::Event::PasteRequested(dest_dir) => self.start_paste(dest_dir),
+            ui::dirview::Event::DeleteRequested(locations, mode) => {
+                self.start_delete(locations, mode)
+            }
         }
+    }
+
+    /// `Event::DeleteRequested`'s handling (Stage 9): trash where the
+    /// backend supports it and `mode` allows it, permanent delete
+    /// otherwise — capability-honest per `Caps::TRASH`, see
+    /// `ui::dirview::DeleteMode`'s doc comment for what decides which.
+    /// Fire-and-forget, like every other `handle_directory_event` arm that
+    /// isn't Copy/Cut/Paste: each item's trash-move (or permanent delete)
+    /// is one fast rename/recursive-remove syscall, not a streamed op, so
+    /// there's nothing here for `core::fs::ops`'s progress strip to drive
+    /// — see the Stage 9 handoff for the full reasoning. This deliberately
+    /// does **not** wait for a result to remove the row from the view:
+    /// the local backend's `Caps::WATCH` inotify stream already reports
+    /// the resulting `DirEvent::Removed`/`Renamed` (a cross-directory
+    /// `rename(2)` into the trash surfaces as a `MOVED_FROM` with no
+    /// paired `MOVED_TO`, which `modules::local`'s own watch bridge already
+    /// turns into `Removed` once its pairing window closes — see that
+    /// module's docs), so `ui::dirview::DirectoryView::apply_watch_events`
+    /// updates the row on its own, the same "the view never optimistically
+    /// edits itself for something the backend will tell it about anyway"
+    /// posture watch-driven changes already have everywhere else. Errors
+    /// are worded to stderr (no error-toast surface exists yet, the same
+    /// posture every other spawn/backend failure in this function already
+    /// takes) — a row that fails to delete simply stays put, or reappears
+    /// on the next watch/F5 refresh.
+    fn start_delete(
+        &mut self,
+        locations: Vec<Location>,
+        mode: ui::dirview::DeleteMode,
+    ) -> Task<Message> {
+        let force_permanent = mode == ui::dirview::DeleteMode::Permanent;
+        let tasks: Vec<Task<Message>> = locations
+            .into_iter()
+            .map(|location| {
+                Task::perform(delete_one(location, force_permanent), |result| {
+                    if let Err((location, err)) = result {
+                        eprintln!("saola-files: couldn't delete {location}: {err}");
+                    }
+                    Message::Noop
+                })
+            })
+            .collect();
+        Task::batch(tasks)
     }
 
     /// `Event::Activated`'s handling: resolve each location's default app
@@ -469,11 +559,27 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let keyboard = iced::keyboard::listen().map(|event| {
-            Message::Explorer(ui::explorer::Message::Directory(
-                ui::dirview::Message::Keyboard(event),
-            ))
-        });
+        // Stage 9: while the Trash browser is showing, the hidden
+        // background `DirectoryView` must not receive keyboard input at
+        // all — `Message::Keyboard` mutating its (invisible) cursor/
+        // selection would be merely odd on its own, but reaching Delete/
+        // Shift+Delete through it would silently trash/permanently-delete
+        // files in whatever directory the user last browsed, with no
+        // visual feedback in the Trash view showing it happened. Cutting
+        // the subscription off here — rather than trying to filter
+        // individual `Action`s downstream — is the same "one surface owns
+        // the keyboard at a time" posture `DirectoryView::handle_keyboard`
+        // already takes for its own path-editor/rename/menu guards, just
+        // one level up.
+        let keyboard = if self.trash_active {
+            Subscription::none()
+        } else {
+            iced::keyboard::listen().map(|event| {
+                Message::Explorer(ui::explorer::Message::Directory(
+                    ui::dirview::Message::Keyboard(event),
+                ))
+            })
+        };
 
         // Stage 5: the active view's own live-update watch, if its backend
         // has one — `None`/an out-of-range `active` degrades to "no watch
@@ -521,20 +627,38 @@ impl App {
     fn view(&self) -> Element<'_, Message> {
         let t = &self.theme;
 
-        let body: Element<'_, Message> = match self.views.get(self.active) {
-            Some(view) => ui::explorer::view(
-                t,
-                &self.sidebar,
-                view,
-                &self.mime_db,
-                &self.apps_db,
-                !self.clipboard.is_empty(),
-                Message::Explorer,
-            ),
-            // Degrades to a blank paper surface rather than panicking —
-            // `active` should always be in range, but the no-panic rule
-            // means "should" isn't good enough.
-            None => iced::widget::Space::new().into(),
+        // Stage 9: the Trash browser swaps in for the ordinary
+        // sidebar+directory-view composition wholesale, but still shows
+        // the same sidebar beside it (`ui::trashview` isn't part of
+        // `ui::explorer`'s portal seam — see that module's doc comment —
+        // so this is composed directly here rather than by threading a
+        // "what's on the right" enum through `ui::explorer::view`).
+        let body: Element<'_, Message> = if self.trash_active {
+            let sidebar_view: Element<'_, Message> = self
+                .sidebar
+                .view(t, &core::places::trash_location())
+                .map(|m| Message::Explorer(ui::explorer::Message::Sidebar(m)));
+            let trash_column: Element<'_, Message> = self.trash_view.view(t).map(Message::Trash);
+            iced::widget::row![sidebar_view, trash_column]
+                .width(Fill)
+                .height(Fill)
+                .into()
+        } else {
+            match self.views.get(self.active) {
+                Some(view) => ui::explorer::view(
+                    t,
+                    &self.sidebar,
+                    view,
+                    &self.mime_db,
+                    &self.apps_db,
+                    !self.clipboard.is_empty(),
+                    Message::Explorer,
+                ),
+                // Degrades to a blank paper surface rather than panicking —
+                // `active` should always be in range, but the no-panic
+                // rule means "should" isn't good enough.
+                None => iced::widget::Space::new().into(),
+            }
         };
 
         // Stage 8: the ops strip, stacked below the explorer body (a
@@ -594,4 +718,46 @@ fn directory_message(inner: ui::dirview::Message) -> Message {
 /// `App::update`.
 fn directory_task(task: Task<ui::dirview::Message>) -> Task<Message> {
     task.map(directory_message)
+}
+
+/// `Task<ui::trashview::Message> -> Task<Message>`, the `ui::trashview`
+/// counterpart to `directory_task` above.
+fn trash_task(task: Task<ui::trashview::Message>) -> Task<Message> {
+    task.map(Message::Trash)
+}
+
+/// One location's half of `App::start_delete`: trashes it when its
+/// backend claims `Caps::TRASH` and `force_permanent` wasn't requested
+/// (Shift+Delete), permanently deletes it otherwise. Local-only for now on
+/// both branches — `core::fs::trash` is local-only by nature (see its
+/// module doc comment), and the non-local permanent-delete branch below
+/// falls back to a single non-recursive `Backend::remove`, which is a
+/// stated gap for a future non-local backend without `Caps::TRASH` (SFTP,
+/// Stage 13): deleting a non-empty remote directory that way would fail
+/// rather than recurse. No such backend exists yet, so this isn't
+/// reachable today — flagged here for whichever stage adds one.
+async fn delete_one(location: Location, force_permanent: bool) -> Result<(), (Location, String)> {
+    let Some(backend) = modules::resolve(&location.scheme) else {
+        return Err((
+            location.clone(),
+            format!("no backend for scheme \"{}\"", location.scheme),
+        ));
+    };
+    let caps = backend.caps();
+
+    if location.is_local() && !force_permanent && caps.contains(core::vfs::Caps::TRASH) {
+        let path = location.path.clone();
+        return core::fs::trash::trash(&path)
+            .map(|_id| ())
+            .map_err(|err| (location.clone(), err.to_string()));
+    }
+    if location.is_local() {
+        let path = location.path.clone();
+        return core::fs::trash::delete_permanently(&path)
+            .map_err(|err| (location.clone(), err.to_string()));
+    }
+    backend
+        .remove(&location)
+        .await
+        .map_err(|err| (location.clone(), err.to_string()))
 }

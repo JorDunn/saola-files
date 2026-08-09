@@ -80,6 +80,16 @@ pub enum Action {
     Rename,
     /// Ctrl+Shift+N: create a new folder in the current directory.
     NewFolder,
+
+    // ── Stage 9: trash / permanent delete ───────────────────────────────
+    /// Delete: trash the selection where the backend supports it
+    /// (`Caps::TRASH`), permanent delete worded as such otherwise —
+    /// `DirectoryView`/`App` decide which, not this module (see
+    /// `core::fs::trash`).
+    Delete,
+    /// Shift+Delete: always a permanent delete, regardless of
+    /// `Caps::TRASH`.
+    PermanentDelete,
 }
 
 /// Resolve one key press into an [`Action`], or `None` if this module
@@ -164,6 +174,8 @@ pub fn resolve(key: &Key, modifiers: Modifiers) -> Option<Action> {
         (Named::Backspace, false) => Some(Action::Ascend),
         (Named::F5, false) => Some(Action::Refresh),
         (Named::F2, false) => Some(Action::Rename),
+        (Named::Delete, false) => Some(Action::Delete),
+        (Named::Delete, true) => Some(Action::PermanentDelete),
         _ => None,
     }
 }
@@ -343,6 +355,20 @@ mod tests {
                 Modifiers::CTRL | Modifiers::SHIFT
             ),
             None
+        );
+    }
+
+    // ── Stage 9: trash / permanent delete ────────────────────────────────
+
+    #[test]
+    fn delete_trashes_shift_delete_is_permanent() {
+        assert_eq!(
+            resolve(&named(Named::Delete), Modifiers::empty()),
+            Some(Action::Delete)
+        );
+        assert_eq!(
+            resolve(&named(Named::Delete), Modifiers::SHIFT),
+            Some(Action::PermanentDelete)
         );
     }
 }

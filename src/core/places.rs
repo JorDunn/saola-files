@@ -236,7 +236,12 @@ pub fn format_bookmarks(bookmarks: &[Bookmark]) -> String {
 /// non-hex `%` escape near the end keeps the `%` literally rather than
 /// panicking on an out-of-range slice — a malformed bookmark line should
 /// degrade to a slightly wrong label, never crash the sidebar.
-fn decode_percent(input: &str) -> Vec<u8> {
+///
+/// `pub(crate)` (Stage 9): `core::fs::trash` reuses this for `.trashinfo`
+/// `Path=` values, which the freedesktop Trash spec percent-encodes the
+/// same way a bookmarks URI does — one escaping scheme, not two hand-
+/// rolled copies.
+pub(crate) fn decode_percent(input: &str) -> Vec<u8> {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -270,7 +275,10 @@ fn hex_value(byte: u8) -> Option<u8> {
 /// a `%XX` escape. Not a general RFC 3986 encoder (same documented
 /// simplification `core::apps::file_uri` already takes for `Exec=` field
 /// codes): good enough for round-tripping what [`decode_percent`] produces.
-fn encode_percent(bytes: &[u8]) -> String {
+///
+/// `pub(crate)`: see [`decode_percent`]'s doc comment — `core::fs::trash`
+/// is the second caller, encoding `.trashinfo` `Path=` values.
+pub(crate) fn encode_percent(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len());
     for &byte in bytes {
         match byte {
@@ -283,15 +291,20 @@ fn encode_percent(bytes: &[u8]) -> String {
     out
 }
 
-/// The location the sidebar's Trash entry navigates to. No backend
-/// implements the `trash` scheme yet (Stage 9) — `modules::resolve`
-/// already degrades an unrecognized scheme to an ordinary "no backend"
-/// `VfsError` at load time (the same fallback `Location::parse`'s own doc
-/// comment describes for a hand-typed unrecognized scheme), so this is
-/// safe to list now: clicking it today surfaces a worded empty state, and
-/// Stage 9 wiring up `modules::trash` is the only change needed to make it
-/// work, not a change here.
-fn trash_location() -> Location {
+/// The location the sidebar's Trash entry navigates to. **Stage 9 update:**
+/// no backend actually implements the `trash` scheme (there is no
+/// `modules::trash` — see `core::fs::trash`'s module doc comment on why
+/// trash stays a standalone local-only module rather than a `Backend`
+/// impl). Instead, `main.rs::App::navigate_active` special-cases this exact
+/// `scheme == "trash"` sentinel to swap in `ui::trashview::TrashView`
+/// instead of navigating a `DirectoryView` — `pub` (not `pub(crate)`: the
+/// binary crate `main.rs` lives in is a separate crate from this library,
+/// per `lib.rs`'s doc comment on the split, so `main.rs` needs the same
+/// visibility any other external consumer of this crate's public API
+/// would) so `main.rs` can recognize the same value this function hands
+/// the sidebar, without a second hand-written copy of the sentinel
+/// drifting out of sync with it.
+pub fn trash_location() -> Location {
     Location {
         scheme: "trash".to_owned(),
         authority: None,

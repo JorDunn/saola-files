@@ -24,9 +24,17 @@
 //! (`clipboard_has_contents`, threaded in at render time the same way
 //! `mime_db`/`apps_db` already are — CLAUDE.md's capability-honest
 //! posture: an always-enabled Paste that silently does nothing would be a
-//! fake affordance). **Delete still isn't here** — it waits on trash
-//! (Stage 9); adding a permanent-delete-only row before that stage decides
-//! how deletion should be worded would be presuming its answer.
+//! fake affordance).
+//!
+//! **Scope, updated Stage 9:** Delete joined the menu, worded per
+//! `Caps::TRASH` ("Move to Trash" when the backend can, "Delete" — and
+//! nothing else, no extra parenthetical — when it can't, since the row
+//! itself is the only place that wording needs to live). There is
+//! deliberately no second "Delete Permanently" row here: Shift+Delete
+//! covers that already, and a menu offering *two* delete rows next to each
+//! other reads as more dangerous, not more honest — the capability-honest
+//! posture is about not hiding what a control does, not about surfacing
+//! every possible variant of it in the menu.
 //!
 //! **Anchoring is simplified too:** a precise "grow from the trigger
 //! button" popover (style guide §6) needs the trigger's on-screen rect,
@@ -43,6 +51,7 @@ use crate::config::CustomAction;
 use crate::core::apps::{AppsDb, DesktopEntry};
 use crate::core::fs::entry::{EntryKind, FileEntry};
 use crate::core::mime::MimeDb;
+use crate::core::vfs::Caps;
 use crate::icons::{self, Icon};
 
 use super::dirview::{DirectoryView, Message};
@@ -145,6 +154,20 @@ fn context_menu<'a>(
             Icon::Pencil,
             "Rename…",
             Message::MenuRenameRequested,
+        ));
+    }
+    // ── Stage 9: delete / trash ──────────────────────────────────────────
+    if !selected.is_empty() {
+        let label = if state.caps().contains(Caps::TRASH) {
+            "Move to Trash"
+        } else {
+            "Delete"
+        };
+        items.push(menu_row(
+            t,
+            Icon::Trash2,
+            label,
+            Message::MenuDeleteRequested,
         ));
     }
     items.push(menu_row(

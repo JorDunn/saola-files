@@ -168,6 +168,11 @@ pub enum Message {
     MenuRenameRequested,
     MenuNewFolderRequested,
     MenuNewFileRequested,
+    /// "Delete"/"Move to Trash" in the context menu (Stage 9) — always
+    /// `DeleteMode::ToTrash`; the menu never offers a permanent-delete row
+    /// of its own, that's Shift+Delete's job (see `ui::menus`'s doc
+    /// comment on why one capability-honestly-worded row is enough).
+    MenuDeleteRequested,
     /// The inline rename field's `on_input`, while `self.rename` is `Some`.
     RenameChanged(String),
     /// Enter: commit the inline rename.
@@ -225,6 +230,30 @@ pub enum Event {
     /// into `location` (always this view's current directory — there is no
     /// "paste into a specific selected folder" this stage).
     PasteRequested(Location),
+    /// Delete / Shift+Delete / the context menu's Delete row (Stage 9):
+    /// mirrors `CopyRequested`/`CutRequested`'s shape exactly, per the
+    /// Stage 8 handoff's own suggestion. `App` decides trash-vs-permanent
+    /// per location (`Caps::TRASH`), except when `mode` is
+    /// `DeleteMode::Permanent`, which always skips the trash regardless of
+    /// capability — see [`DeleteMode`]'s doc comment.
+    DeleteRequested(Vec<Location>, DeleteMode),
+}
+
+/// Whether a `DeleteRequested` should try the trash first, or always skip
+/// it. This view never itself decides *whether* a location's backend can
+/// actually trash something (`Caps::TRASH` lives on the backend, resolved
+/// by `App`, mirroring how this module never resolves a `Backend` for
+/// anything but its own `load`/rename/create calls) — it only distinguishes
+/// "the Delete key/menu row was used" from "Shift+Delete was used", which
+/// is the one thing genuinely decided at the keyboard/menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteMode {
+    /// Delete key, or the context menu's Delete row: trash where the
+    /// backend can (`Caps::TRASH`), permanent delete worded as such
+    /// otherwise.
+    ToTrash,
+    /// Shift+Delete: always permanent, regardless of `Caps::TRASH`.
+    Permanent,
 }
 
 pub struct DirectoryView {
@@ -892,6 +921,17 @@ impl DirectoryView {
                 self.menu_open = false;
                 (self.create_new(NewKind::File), None)
             }
+            Message::MenuDeleteRequested => {
+                self.menu_open = false;
+                let targets = self.selection_targets();
+                if targets.is_empty() {
+                    return (Task::none(), None);
+                }
+                (
+                    Task::none(),
+                    Some(Event::DeleteRequested(targets, DeleteMode::ToTrash)),
+                )
+            }
             Message::RenameChanged(value) => {
                 if let Some(state) = self.rename.as_mut() {
                     state.buffer = value;
@@ -1226,6 +1266,28 @@ impl DirectoryView {
                 }
             }
             Action::NewFolder => (self.create_new(NewKind::Folder), None),
+
+            // ── Stage 9: trash / permanent delete ─────────────────────────
+            Action::Delete => {
+                let targets = self.selection_targets();
+                if targets.is_empty() {
+                    return (Task::none(), None);
+                }
+                (
+                    Task::none(),
+                    Some(Event::DeleteRequested(targets, DeleteMode::ToTrash)),
+                )
+            }
+            Action::PermanentDelete => {
+                let targets = self.selection_targets();
+                if targets.is_empty() {
+                    return (Task::none(), None);
+                }
+                (
+                    Task::none(),
+                    Some(Event::DeleteRequested(targets, DeleteMode::Permanent)),
+                )
+            }
         }
     }
 

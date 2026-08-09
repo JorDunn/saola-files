@@ -12,4 +12,5 @@ pub mod explorer;
 pub mod header;
 pub mod menus;
 pub mod sidebar;
+pub mod trashview;
 pub mod window;
