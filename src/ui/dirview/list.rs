@@ -16,8 +16,10 @@ use saola_theme::{ColorExt, Surface, Theme, convert, style};
 
 use crate::config::SortKey;
 use crate::core::fs::entry::{EntryKind, FileEntry};
+use crate::core::mime::MimeDb;
+use crate::icons::{self, Icon};
 
-use super::{DirectoryView, Message};
+use super::{DirectoryView, Message, row_icon};
 
 /// Extra rows rendered above/below the on-screen slice so a fast scroll
 /// flick doesn't show a blank frame before the next `Scrolled` message
@@ -35,7 +37,11 @@ const INITIAL_ROWS: usize = 64;
 const SIZE_COLUMN: f32 = 84.0;
 const DATE_COLUMN: f32 = 168.0;
 
-pub(super) fn view<'a>(state: &'a DirectoryView, t: &'a Theme) -> Element<'a, Message> {
+pub(super) fn view<'a>(
+    state: &'a DirectoryView,
+    t: &'a Theme,
+    mime_db: &'a MimeDb,
+) -> Element<'a, Message> {
     if let Some(err) = &state.error {
         // `err.to_string()` is owned, so `empty_state` gets a `String` it
         // can consume into a `text` widget directly — a `&str` borrowing
@@ -69,7 +75,7 @@ pub(super) fn view<'a>(state: &'a DirectoryView, t: &'a Theme) -> Element<'a, Me
             state
                 .entries
                 .get(entry_index)
-                .map(|entry| entry_row(state, t, first + offset, entry))
+                .map(|entry| entry_row(state, t, mime_db, first + offset, entry))
         });
 
     let body_column = column(
@@ -136,49 +142,69 @@ fn header_cell<'a>(
     state: &DirectoryView,
     width: Length,
 ) -> Element<'a, Message> {
-    // Placeholder direction glyphs — Lucide chevrons land in Stage 6 (see
-    // `window.rs`'s "✕" close-button placeholder for the same deferral).
-    let indicator = if state.sort == key {
-        if state.sort_descending {
-            " ▾"
+    let name = text(label)
+        .size(t.typography.size.label)
+        .font(convert::mono_font_medium(t));
+
+    // `arrow-down-a-z`/`arrow-up-a-z` (style guide's sort-direction pair)
+    // stand in for direction on every sortable column, not just Name —
+    // the shape (ascending vs descending), not the literal "A-Z" reading,
+    // is what a Size/Date column borrows from them.
+    let content: Element<'a, Message> = if state.sort == key {
+        let glyph = if state.sort_descending {
+            Icon::ArrowDownAZ
         } else {
-            " ▴"
-        }
+            Icon::ArrowUpAZ
+        };
+        row![
+            name,
+            icons::icon(glyph, t.sizes.icon_row, t.on_paper.secondary.into_iced()),
+        ]
+        .spacing(4.0)
+        .align_y(iced::Center)
+        .into()
     } else {
-        ""
+        name.into()
     };
-    button(
-        text(format!("{label}{indicator}"))
-            .size(t.typography.size.label)
-            .font(convert::mono_font_medium(t)),
-    )
-    .style(style::button::bare(t, Surface::Paper))
-    .on_press(Message::HeaderClicked(key))
-    .width(width)
-    .into()
+
+    button(content)
+        .style(style::button::bare(t, Surface::Paper))
+        .on_press(Message::HeaderClicked(key))
+        .width(width)
+        .into()
 }
 
 fn entry_row<'a>(
     state: &'a DirectoryView,
     t: &'a Theme,
+    mime_db: &'a MimeDb,
     visible_index: usize,
     entry: &'a FileEntry,
 ) -> Element<'a, Message> {
     let selected = state.selection.is_selected(&entry.name);
     let has_cursor = state.selection.cursor() == Some(visible_index);
 
-    // Placeholder type marker — Lucide glyph icons (folder/file/symlink)
-    // land in Stage 6; glyph shape, never hue, per the style guide's
-    // mimetype-differentiation rule.
-    let marker = match entry.kind {
-        EntryKind::Directory => "▸ ",
-        _ if entry.is_symlink => "→ ",
-        _ => "",
+    // Glyph shape carries type, never hue (style guide §1) — the icon's
+    // tint only ever follows selected/not-selected (the same two-value
+    // split `row_style` below draws the row background/text from); unlike
+    // the row's own button chrome it can't also brighten on hover, since
+    // an `svg::Style` closure is fixed at build time, not re-evaluated
+    // per `button::Status`.
+    let glyph = row_icon(entry, mime_db);
+    let icon_color = if selected {
+        t.palette.paper
+    } else {
+        t.on_paper.primary
     };
+    let icon = icons::icon(glyph, t.sizes.icon_row, icon_color.into_iced());
 
-    let name = text(format!("{marker}{}", entry.display_name()))
+    let name = text(entry.display_name().into_owned())
         .size(t.typography.size.body)
         .font(convert::ui_font(t));
+
+    let name_row = row![icon, name]
+        .spacing(t.sizes.pill_gap)
+        .align_y(iced::Center);
 
     let size = text(size_text(entry))
         .size(t.typography.size.secondary)
@@ -189,7 +215,7 @@ fn entry_row<'a>(
         .font(convert::mono_font(t));
 
     let content = row![
-        container(name).width(Fill),
+        container(name_row).width(Fill),
         container(size)
             .width(Length::Fixed(SIZE_COLUMN))
             .align_x(iced::alignment::Horizontal::Right),

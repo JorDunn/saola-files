@@ -12,9 +12,10 @@ use std::path::{Component, PathBuf};
 
 use iced::widget::{button, container, row, text, text_input};
 use iced::{Center, Element, Fill};
-use saola_theme::{Surface, Theme, convert, style};
+use saola_theme::{ColorExt, Surface, Theme, convert, style};
 
 use crate::core::vfs::Location;
+use crate::icons::{self, Icon};
 use crate::keymap::Action;
 use crate::ui::dirview::{self, DirectoryView};
 
@@ -107,11 +108,11 @@ fn pills<'a>(t: &'a Theme, location: &'a Location) -> Element<'a, dirview::Messa
     // The edit-pencil gives a mouse-only path into `Action::EditPath` —
     // Ctrl+L is the primary trigger, this is parity for anyone not
     // driving the keyboard.
-    let edit = button(
-        text("✎")
-            .size(t.typography.size.label)
-            .font(convert::ui_font(t)),
-    )
+    let edit = button(icons::icon(
+        Icon::Pencil,
+        t.sizes.icon_row,
+        t.on_paper.primary.into_iced(),
+    ))
     .style(style::button::bare(t, Surface::Paper))
     .padding([4.0, 10.0])
     .on_press(dirview::Message::Action(Action::EditPath));

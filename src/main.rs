@@ -83,6 +83,21 @@ struct App {
     /// active`") — Stage 3 only ever shows one.
     views: Vec<ui::dirview::DirectoryView>,
     active: usize,
+    /// Shared caches (CLAUDE.md: "Shared caches (thumbs, mime, apps, …)
+    /// live on the App, never per-view") — built once at startup, since
+    /// both walk real filesystem trees (`$XDG_DATA_DIRS/mime`,
+    /// `$XDG_DATA_DIRS/applications`) that don't change while the app is
+    /// running.
+    mime_db: core::mime::MimeDb,
+    apps_db: core::apps::AppsDb,
+    /// `files.toml`'s `terminal` knob, the one piece of `Config` this app
+    /// still needs after startup (every other knob is baked into the
+    /// first `DirectoryView` at construction and never read back — see
+    /// `Self::new`'s comment on `config`). Resolved the rest of the way
+    /// (`$TERMINAL`, then `alacritty`) at the point of use via
+    /// `core::apps::resolve_terminal_from_env`, not cached here — it's a
+    /// cheap env read, not worth a second cache.
+    terminal: Option<String>,
 }
 
 impl App {
@@ -96,11 +111,15 @@ impl App {
             .unwrap_or_else(|| PathBuf::from("/"));
         let fallback = Location::local(home);
 
-        // `config` is consumed entirely here (view/sort/show-hidden
-        // defaults baked into the first `DirectoryView`); nothing later
-        // reads it back, so `App` doesn't carry it as a field. A future
-        // "new tab" action that needs the same defaults would resolve
-        // `Config::load` again or thread a clone through at that point.
+        // Most of `config` is consumed entirely here (view/sort/
+        // show-hidden/actions defaults baked into the first
+        // `DirectoryView` at construction, custom actions cloned onto it
+        // too); `App` only keeps `terminal` back out as its own field
+        // (Stage 6 — resolving "open in terminal"/`Terminal=true` apps
+        // needs it after startup, not just at construction). A future
+        // "new tab" action that needs the rest of these defaults would
+        // resolve `Config::load` again or thread a clone through at that
+        // point.
         let (view, task) = if let Some(select) = args.select {
             ui::dirview::DirectoryView::open_select(select, fallback, &config)
         } else if let Some(target) = args.target {
@@ -113,6 +132,9 @@ impl App {
             theme: Theme::saola(),
             views: vec![view],
             active: 0,
+            mime_db: core::mime::MimeDb::new(),
+            apps_db: core::apps::AppsDb::load(),
+            terminal: config.terminal.clone(),
         };
         (app, task.map(Message::Directory))
     }
@@ -135,8 +157,14 @@ impl App {
     }
 
     /// The owner's response to a `DirectoryView` `Event` — the view only
-    /// ever requests a navigation, never applies one itself (see
-    /// `ui::dirview`'s module docs).
+    /// ever requests a navigation or an open/spawn, never performs one
+    /// itself (see `ui::dirview`'s module docs). Every branch here is a
+    /// synchronous `Command::spawn` (a detached process launch returns
+    /// immediately — there's nothing to `.await`), so none of these need
+    /// an `iced::Task`; a spawn failure is worded to stderr rather than
+    /// surfaced in the UI (no error-dialog surface exists yet, and a
+    /// failed launch is exactly the kind of thing CLAUDE.md's no-panic
+    /// posture says should degrade quietly, not take the app down).
     fn handle_directory_event(&mut self, event: ui::dirview::Event) -> Task<Message> {
         match event {
             ui::dirview::Event::OpenDirectory(location) => {
@@ -145,10 +173,67 @@ impl App {
                 };
                 view.navigate(location).map(Message::Directory)
             }
-            // Opening non-directory entries (xdg-open-equivalent app
-            // resolution) lands in Stage 6; nothing to do yet, and never
-            // a panic on an event this stage doesn't act on.
-            ui::dirview::Event::Activated(_locations) => Task::none(),
+            ui::dirview::Event::Activated(locations) => {
+                self.open_with_default_app(&locations);
+                Task::none()
+            }
+            ui::dirview::Event::OpenWith(locations, desktop_id) => {
+                let Some(entry) = self.apps_db.entry(&desktop_id).cloned() else {
+                    eprintln!("saola-files: {desktop_id} is no longer installed");
+                    return Task::none();
+                };
+                let terminal = core::apps::resolve_terminal_from_env(self.terminal.as_deref());
+                let paths: Vec<PathBuf> = locations.iter().map(|l| l.path.clone()).collect();
+                if let Err(err) = core::apps::open(&entry, &paths, &terminal) {
+                    eprintln!("saola-files: could not open with {}: {err}", entry.name);
+                }
+                Task::none()
+            }
+            ui::dirview::Event::OpenTerminal(location, is_dir) => {
+                let terminal = core::apps::resolve_terminal_from_env(self.terminal.as_deref());
+                if let Err(err) = core::apps::open_terminal_here(&terminal, is_dir, &location.path)
+                {
+                    eprintln!("saola-files: could not open a terminal at {location}: {err}");
+                }
+                Task::none()
+            }
+            ui::dirview::Event::RunCustomAction(exec, locations) => {
+                let paths: Vec<PathBuf> = locations.iter().map(|l| l.path.clone()).collect();
+                for argv in core::apps::build_argv(&exec, &paths) {
+                    let Some((program, args)) = argv.split_first() else {
+                        continue;
+                    };
+                    if let Err(err) = core::apps::spawn_argv(program, args) {
+                        eprintln!("saola-files: custom action \"{exec}\" failed: {err}");
+                    }
+                }
+                Task::none()
+            }
+        }
+    }
+
+    /// `Event::Activated`'s handling: resolve each location's default app
+    /// from its name-guessed mimetype and open it — the "files open in
+    /// the right app" done criterion. A location with no name, no
+    /// resolvable mimetype association, or an association naming an app
+    /// this database never found all degrade to a worded `eprintln!`
+    /// rather than silently doing nothing or panicking.
+    fn open_with_default_app(&self, locations: &[Location]) {
+        for location in locations {
+            let Some(name) = location.path.file_name() else {
+                continue;
+            };
+            let mimetype = self.mime_db.guess(name, None);
+            let Some(entry) = self.apps_db.default_for(&mimetype) else {
+                eprintln!("saola-files: no app is associated with {mimetype} for {location}");
+                continue;
+            };
+            let terminal = core::apps::resolve_terminal_from_env(self.terminal.as_deref());
+            if let Err(err) =
+                core::apps::open(entry, std::slice::from_ref(&location.path), &terminal)
+            {
+                eprintln!("saola-files: could not open {location}: {err}");
+            }
         }
     }
 
@@ -184,7 +269,9 @@ impl App {
         let t = &self.theme;
 
         let body = match self.views.get(self.active) {
-            Some(view) => ui::explorer::view(t, view, Message::Directory),
+            Some(view) => {
+                ui::explorer::view(t, view, &self.mime_db, &self.apps_db, Message::Directory)
+            }
             // Degrades to a blank paper surface rather than panicking —
             // `active` should always be in range, but the no-panic rule
             // means "should" isn't good enough.

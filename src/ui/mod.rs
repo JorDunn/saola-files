@@ -9,4 +9,5 @@ pub mod breadcrumbs;
 pub mod dirview;
 pub mod explorer;
 pub mod header;
+pub mod menus;
 pub mod window;

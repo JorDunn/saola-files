@@ -59,12 +59,15 @@ use iced::widget::scrollable;
 use iced::{Element, Subscription, Task, keyboard};
 use saola_theme::Theme;
 
-use crate::config::{Config, SortKey, View};
+use crate::config::{Config, CustomAction, SortKey, View};
+use crate::core::apps::AppsDb;
 use crate::core::fs::entry::{EntryKind, FileEntry};
 use crate::core::fs::sort;
+use crate::core::mime::MimeDb;
 use crate::core::vfs::{Caps, DirEvent, Location, VfsError};
 use crate::keymap::{self, Action};
 use crate::ui::breadcrumbs;
+use crate::ui::menus;
 
 /// Cursor rows a single PageUp/PageDown moves — a fixed placeholder rather
 /// than the real viewport-height/row-height math, which needs a theme
@@ -129,6 +132,26 @@ pub enum Message {
     /// completed (a create-then-immediate-delete race) — not an error
     /// worth surfacing, just skip inserting it.
     WatchRefreshed(Location, Vec<(OsString, Option<FileEntry>)>),
+
+    // ── Stage 6: context menu / Open-with popover (`ui::menus`) ─────────
+    /// The header's overflow button: opens the context menu.
+    OpenMenu,
+    /// The scrim, Escape, or a menu item that finished its job: closes
+    /// whichever of the context menu/Open-with popover is open.
+    CloseMenu,
+    /// "Open" inside the context menu — the same activation
+    /// double-click/Enter already drive, reached from the menu instead.
+    MenuOpenSelected,
+    /// "Open with…" inside the context menu: swaps it for the Open-with
+    /// popover.
+    MenuOpenWithRequested,
+    /// "Open in terminal" inside the context menu.
+    MenuOpenTerminalRequested,
+    /// A config-defined `[[action]]` clicked in the context menu, by its
+    /// index into `DirectoryView::actions`.
+    MenuCustomActionRequested(usize),
+    /// An app chosen in the Open-with popover, by its desktop-id.
+    OpenWithChosen(String),
 }
 
 /// What the owner (the app, via `ui::explorer`) decides to act on. The
@@ -139,9 +162,23 @@ pub enum Event {
     /// decides whether this reuses the current view or opens a new tab
     /// (a future stage); Stage 3's `explorer.rs` always reuses it.
     OpenDirectory(Location),
-    /// Enter/double-click on non-directory entries: open them. Stage 6
-    /// wires this to `xdg-open`-equivalent app resolution.
+    /// Enter/double-click on non-directory entries: open them (Stage 6:
+    /// the owner resolves each `Location`'s default app via `MimeDb`/
+    /// `AppsDb` and spawns it — the "files open in the right app" done
+    /// criterion).
     Activated(Vec<Location>),
+    /// The Open-with popover's choice: open every `Location` with this
+    /// desktop-id specifically, bypassing the resolved default.
+    OpenWith(Vec<Location>, String),
+    /// "Open in terminal": `location` is where the terminal's `cwd` should
+    /// land — already resolved to "the directory itself" (`is_dir`) or
+    /// "its parent" (a file was targeted) by the view, per the stage's own
+    /// wording ("a file opens the terminal in its parent dir").
+    OpenTerminal(Location, bool),
+    /// A config-defined `[[action]]` was invoked: its raw `exec` string
+    /// (field-code expansion is the owner's job, same as `Activated`) and
+    /// the targets it should run against.
+    RunCustomAction(String, Vec<Location>),
 }
 
 pub struct DirectoryView {
@@ -185,6 +222,20 @@ pub struct DirectoryView {
     /// message carries no modifier state of its own, so row clicks read
     /// this to tell a plain click from Ctrl/Shift+click.
     modifiers: keyboard::Modifiers,
+    /// Config-defined `[[action]]`s, cloned once at construction —
+    /// `ui::menus`'s context menu filters/renders these by index
+    /// (`Message::MenuCustomActionRequested`). Small and static for the
+    /// life of the view, unlike `MimeDb`/`AppsDb` (real per-App caches —
+    /// see `Self::view`'s parameters), so a per-view clone is fine.
+    actions: Vec<CustomAction>,
+    /// Whether the header overflow button's context menu is open —
+    /// `ui::menus::overlay` reads this to decide whether to stack it over
+    /// the ordinary content.
+    menu_open: bool,
+    /// Whether the Open-with popover is open, in place of the context
+    /// menu (never both — `apply_action`-style mutual exclusion is
+    /// enforced at every transition site, not by construction).
+    open_with_open: bool,
 }
 
 impl DirectoryView {
@@ -210,6 +261,9 @@ impl DirectoryView {
             error: None,
             pending_select: None,
             modifiers: keyboard::Modifiers::empty(),
+            actions: config.actions.clone(),
+            menu_open: false,
+            open_with_open: false,
         }
     }
 
@@ -282,6 +336,35 @@ impl DirectoryView {
     /// `Message::Watch` off of it.
     pub fn subscription(&self) -> Subscription<Message> {
         watch::subscription(&self.location)
+    }
+
+    /// Whether the context menu is open — `ui::menus::overlay` reads this.
+    pub fn menu_open(&self) -> bool {
+        self.menu_open
+    }
+
+    /// Whether the Open-with popover is open — `ui::menus::overlay` reads
+    /// this.
+    pub fn open_with_open(&self) -> bool {
+        self.open_with_open
+    }
+
+    /// The config-defined `[[action]]`s — `ui::menus` filters/renders
+    /// these by index.
+    pub fn actions(&self) -> &[CustomAction] {
+        &self.actions
+    }
+
+    /// The currently-selected entries, resolved from names back to
+    /// `FileEntry`s — what the context menu/Open-with popover act on.
+    /// Empty when nothing is selected (`ui::menus` falls back to
+    /// "act on the current directory" for the entries that make sense
+    /// without a selection, e.g. "Open in terminal").
+    pub fn selected_entries(&self) -> Vec<&FileEntry> {
+        self.selection
+            .selected_names()
+            .filter_map(|name| self.entries.iter().find(|entry| &entry.name == name))
+            .collect()
     }
 
     /// Resolve a `visible` row index to its `FileEntry`, or `None` if it's
@@ -387,6 +470,8 @@ impl DirectoryView {
         self.error = None;
         self.path_edit = None;
         self.type_ahead.clear();
+        self.menu_open = false;
+        self.open_with_open = false;
         self.load()
     }
 
@@ -424,6 +509,8 @@ impl DirectoryView {
         self.error = None;
         self.path_edit = None;
         self.type_ahead.clear();
+        self.menu_open = false;
+        self.open_with_open = false;
         self.load()
     }
 
@@ -644,14 +731,67 @@ impl DirectoryView {
                 self.recompute_visible();
                 (Task::none(), None)
             }
+
+            // ── Stage 6: context menu / Open-with popover ───────────────
+            Message::OpenMenu => {
+                self.menu_open = true;
+                self.open_with_open = false;
+                (Task::none(), None)
+            }
+            Message::CloseMenu => {
+                self.menu_open = false;
+                self.open_with_open = false;
+                (Task::none(), None)
+            }
+            Message::MenuOpenSelected => {
+                self.menu_open = false;
+                (Task::none(), self.activate_selection())
+            }
+            Message::MenuOpenWithRequested => {
+                self.menu_open = false;
+                self.open_with_open = true;
+                (Task::none(), None)
+            }
+            Message::MenuOpenTerminalRequested => {
+                self.menu_open = false;
+                (Task::none(), Some(self.terminal_target()))
+            }
+            Message::MenuCustomActionRequested(index) => {
+                self.menu_open = false;
+                let Some(action) = self.actions.get(index) else {
+                    return (Task::none(), None);
+                };
+                let targets = self.selection_targets();
+                if targets.is_empty() {
+                    return (Task::none(), None);
+                }
+                (
+                    Task::none(),
+                    Some(Event::RunCustomAction(action.exec.clone(), targets)),
+                )
+            }
+            Message::OpenWithChosen(desktop_id) => {
+                self.open_with_open = false;
+                let targets = self.selection_targets();
+                if targets.is_empty() {
+                    return (Task::none(), None);
+                }
+                (Task::none(), Some(Event::OpenWith(targets, desktop_id)))
+            }
         }
     }
 
-    pub fn view<'a>(&'a self, theme: &'a Theme) -> Element<'a, Message> {
-        match self.view_mode {
-            View::List => list::view(self, theme),
-            View::Grid => grid::view(self, theme),
-        }
+    pub fn view<'a>(
+        &'a self,
+        theme: &'a Theme,
+        mime_db: &'a MimeDb,
+        apps_db: &'a AppsDb,
+    ) -> Element<'a, Message> {
+        let content = match self.view_mode {
+            View::List => list::view(self, theme, mime_db),
+            View::Grid => grid::view(self, theme, mime_db),
+        };
+        menus::overlay(theme, self, mime_db, apps_db, content)
     }
 
     // ── keyboard/action handling ────────────────────────────────────────
@@ -659,6 +799,23 @@ impl DirectoryView {
     fn handle_keyboard(&mut self, event: keyboard::Event) -> (Task<Message>, Option<Event>) {
         match event {
             keyboard::Event::KeyPressed { key, modifiers, .. } => {
+                // While the context menu/Open-with popover is open, the
+                // global keyboard subscription must not also drive row
+                // cursor/selection actions underneath it — same posture as
+                // the path/URI editor guard just below, and for the same
+                // reason (one input surface owns the keyboard at a time).
+                // Escape is the one thing this guard itself handles.
+                if self.menu_open || self.open_with_open {
+                    if matches!(
+                        key,
+                        iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)
+                    ) && modifiers.is_empty()
+                    {
+                        self.menu_open = false;
+                        self.open_with_open = false;
+                    }
+                    return (Task::none(), None);
+                }
                 // While the path/URI editor is open, the global keyboard
                 // subscription must not *also* drive row cursor/selection
                 // actions from the same keystrokes the text_input is
@@ -973,6 +1130,30 @@ impl DirectoryView {
         Some(Event::Activated(locations))
     }
 
+    /// The current selection's locations, in whatever order `Selection`
+    /// happens to iterate them — the targets for a context-menu action
+    /// (`RunCustomAction`, `OpenWith`). Empty when nothing is selected.
+    fn selection_targets(&self) -> Vec<Location> {
+        self.selection
+            .selected_names()
+            .map(|name| self.location.join(name))
+            .collect()
+    }
+
+    /// `Event::OpenTerminal`'s target for "Open in terminal": exactly one
+    /// selected entry targets that entry itself (a directory opens *in*
+    /// itself, a file opens in its parent — CLAUDE.md's stated behavior);
+    /// zero or multiple selected entries fall back to the current
+    /// directory, which has no such ambiguity.
+    fn terminal_target(&self) -> Event {
+        let selected = self.selected_entries();
+        if let [entry] = selected.as_slice() {
+            let is_dir = entry.kind == EntryKind::Directory;
+            return Event::OpenTerminal(self.location.join(&entry.name), is_dir);
+        }
+        Event::OpenTerminal(self.location.clone(), true)
+    }
+
     /// If `pending_select` names an entry in the just-loaded listing,
     /// select it and put the cursor there; otherwise leave the selection
     /// as-is (a `--select` target that vanished before we got here is not
@@ -1039,6 +1220,22 @@ impl DirectoryView {
             });
         self.selection.set_cursor(new_cursor);
     }
+}
+
+/// The glyph for one row/tile — shared by `list.rs`/`grid.rs` so both
+/// presentations pick the same icon for the same entry. Directories skip
+/// the `MimeDb` call entirely (`inode/directory` is a fixed, free
+/// classification — no glob lookup needed); everything else resolves a
+/// mimetype from the name alone (no content sniff — see `core::mime`'s
+/// module docs for why that's the right tradeoff for a per-frame,
+/// per-row call).
+pub(super) fn row_icon(entry: &FileEntry, mime_db: &MimeDb) -> crate::icons::Icon {
+    let category = if entry.kind == EntryKind::Directory {
+        crate::core::mime::Category::Directory
+    } else {
+        crate::core::mime::category(&mime_db.guess(&entry.name, None))
+    };
+    crate::icons::Icon::for_entry(entry.kind, entry.is_symlink, category)
 }
 
 /// `entries[i].name` starts with a dot — the one place `DirectoryView`

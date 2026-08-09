@@ -17,9 +17,11 @@ use iced::widget::{Space, button, column, container, mouse_area, row, scrollable
 use iced::{Center, Element, Fill, Length};
 use saola_theme::{ColorExt, Surface, Theme, convert, style};
 
-use crate::core::fs::entry::{EntryKind, FileEntry};
+use crate::core::fs::entry::FileEntry;
+use crate::core::mime::MimeDb;
+use crate::icons;
 
-use super::{DirectoryView, Message};
+use super::{DirectoryView, Message, row_icon};
 
 /// Tiles per row. See the module docs — this is a placeholder, not a
 /// layout measurement. `pub(super)` so `DirectoryView::row_step` (the
@@ -54,7 +56,11 @@ const OVERSCAN_ROWS: usize = 2;
 /// Tile-rows rendered before the first `Scrolled` event arrives.
 const INITIAL_ROWS: usize = 6;
 
-pub(super) fn view<'a>(state: &'a DirectoryView, t: &'a Theme) -> Element<'a, Message> {
+pub(super) fn view<'a>(
+    state: &'a DirectoryView,
+    t: &'a Theme,
+    mime_db: &'a MimeDb,
+) -> Element<'a, Message> {
     if let Some(err) = &state.error {
         return empty_state_owned(t, err.to_string());
     }
@@ -88,7 +94,7 @@ pub(super) fn view<'a>(state: &'a DirectoryView, t: &'a Theme) -> Element<'a, Me
                 state
                     .entries
                     .get(entry_index)
-                    .map(|entry| tile(state, t, start + offset, entry))
+                    .map(|entry| tile(state, t, mime_db, start + offset, entry))
             });
         row(tiles).spacing(GRID_GAP).into()
     });
@@ -133,24 +139,26 @@ fn visible_row_range(state: &DirectoryView, row_height: f32, total_rows: usize) 
 fn tile<'a>(
     state: &'a DirectoryView,
     t: &'a Theme,
+    mime_db: &'a MimeDb,
     visible_index: usize,
     entry: &'a FileEntry,
 ) -> Element<'a, Message> {
     let selected = state.selection.is_selected(&entry.name);
     let has_cursor = state.selection.cursor() == Some(visible_index);
 
-    // Placeholder type marker — see `list.rs`'s identical note: Lucide
-    // folder/file/symlink glyphs land in Stage 6. Glyph shape, never hue,
-    // per the style guide's mimetype-differentiation rule.
-    let marker = match entry.kind {
-        EntryKind::Directory => "▸",
-        _ if entry.is_symlink => "→",
-        _ => "▪",
+    // Glyph shape carries type, never hue (style guide §1) — see
+    // `list.rs`'s identical note on why the tint only follows selected/
+    // not-selected, never hover, at this call site.
+    let icon_color = if selected {
+        t.palette.paper
+    } else {
+        t.on_paper.primary
     };
-
-    let glyph = text(marker)
-        .size(t.typography.size.section_heading)
-        .font(convert::ui_font(t));
+    let glyph = icons::icon(
+        row_icon(entry, mime_db),
+        t.sizes.icon_bare,
+        icon_color.into_iced(),
+    );
 
     let name = text(entry.display_name().into_owned())
         .size(t.typography.size.secondary)

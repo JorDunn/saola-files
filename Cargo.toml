@@ -111,6 +111,25 @@ futures = "0.3"
 # for `AsyncFd` — no second runtime, per CLAUDE.md's "one async runtime").
 inotify = "0.11"
 
+# `core::mime::MimeDb` (Stage 6, src/core/mime.rs) — mimetype resolution for
+# icon selection and default-app lookup. Surveyed 2026-08-09 per PLAN.md's
+# stated choice ("use the `xdg-mime` crate if its license passes the
+# survey-essay check, else hand-parse `/usr/share/mime/globs2` plus a 4 KiB
+# sniff"): `xdg-mime` (ebassi/xdg-mime-rs) is Apache-2.0, which is fully
+# compatible with this crate's `MIT OR Apache-2.0` — the license passes
+# outright, so hand-rolling glob2 weighting, magic-byte offset/mask
+# matching, and the alias/subclass tables (~2000 lines in the real crate)
+# would just be reinventing what a compatibly-licensed, actively-maintained
+# crate (last pushed 2025-08-11) already gets right. It walks
+# `$XDG_DATA_HOME/mime`/`$XDG_DATA_DIRS/mime` itself at construction time —
+# the one place `core::mime` touches the filesystem, and it's a system
+# database load (same category as `config.rs` reading `files.toml`), not
+# "file access" in the VFS sense CLAUDE.md's "all file access goes through a
+# `Backend`" rule is about. No feature flags to trim (the crate has none);
+# its transitive deps (`glob`, `mime`, `nom`, `dirs-next`, `unicase`) are
+# small, single-purpose parsing/path crates, not a heavy pull.
+xdg-mime = "0.4"
+
 [dev-dependencies]
 # `modules::local`'s unit tests call `LocalBackend` methods directly (not
 # through `iced::Task`), so they need *some* live Tokio runtime for

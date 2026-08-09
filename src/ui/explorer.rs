@@ -18,11 +18,19 @@ use iced::widget::column;
 use iced::{Element, Fill};
 use saola_theme::Theme;
 
+use crate::core::apps::AppsDb;
+use crate::core::mime::MimeDb;
 use crate::ui::dirview::{self, DirectoryView};
 use crate::ui::header;
 
 /// Render `active` (the app's currently-shown `DirectoryView`) with its
 /// toolbar, lifting messages into the caller's `M` via `map`.
+///
+/// `mime_db`/`apps_db` are the App-level shared caches (CLAUDE.md: "Shared
+/// caches (thumbs, mime, apps, …) live on the App, never per-view") this
+/// stage introduces — threaded straight through to `active.view` for row
+/// glyph selection and the context menu/Open-with popover, never built or
+/// cached here.
 ///
 /// Built as one `Element<'a, dirview::Message>` tree first and mapped
 /// exactly once at the end, rather than calling `.map(map)` on the header
@@ -31,12 +39,16 @@ use crate::ui::header;
 pub fn view<'a, M: 'a>(
     theme: &'a Theme,
     active: &'a DirectoryView,
+    mime_db: &'a MimeDb,
+    apps_db: &'a AppsDb,
     map: impl Fn(dirview::Message) -> M + 'a,
 ) -> Element<'a, M> {
-    let content: Element<'a, dirview::Message> =
-        column![header::view(theme, active), active.view(theme)]
-            .width(Fill)
-            .height(Fill)
-            .into();
+    let content: Element<'a, dirview::Message> = column![
+        header::view(theme, active),
+        active.view(theme, mime_db, apps_db)
+    ]
+    .width(Fill)
+    .height(Fill)
+    .into();
     content.map(map)
 }

@@ -19,7 +19,9 @@
 
 use iced::widget::{Space, button, column, container, mouse_area, row, text};
 use iced::{Element, Fill, Task, mouse, window};
-use saola_theme::{Surface, Theme, convert, style};
+use saola_theme::{ColorExt, Surface, Theme, convert, style};
+
+use crate::icons::{self, Icon};
 
 /// Thickness of the invisible resize strips along each window edge.
 ///
@@ -82,11 +84,14 @@ pub fn view<'a, M: Clone + 'a>(
     // inside the drag mouse_area, but buttons capture their own presses, so
     // clicking it closes rather than dragging.
     //
-    // "✕" is a placeholder glyph until the Lucide icon set lands (Stage 6).
-    let close = button(text("✕").size(t.typography.size.body))
-        .style(style::button::bare(t, Surface::Paper))
-        .padding([6, 12])
-        .on_press(map(Event::Close));
+    let close = button(icons::icon(
+        Icon::X,
+        t.sizes.icon_row,
+        t.on_paper.primary.into_iced(),
+    ))
+    .style(style::button::bare(t, Surface::Paper))
+    .padding([6, 12])
+    .on_press(map(Event::Close));
 
     let header_row = row![
         text(title)
