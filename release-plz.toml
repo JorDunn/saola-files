@@ -1,0 +1,47 @@
+# release-plz — semver bumps, changelog, tags, and GitHub releases, all
+# derived from Conventional Commits. Docs: https://release-plz.dev
+# Copied from saola-panel's config (same reasoning applies verbatim).
+
+[workspace]
+# Not published to crates.io.
+publish = false
+# Pre-1.0, `feat:` bumps the minor (0.1 -> 0.2), not the patch — matches
+# the other Saola repos so a feature release reads the same everywhere.
+features_always_increment_minor = true
+# NOTE: release-plz's default version detection asks crates.io for the current
+# released version — for an unpublished crate that can never bump past the
+# first release. saola-theme's `git_only = true` fix runs `cargo package` at
+# the last tag, which fails here: the saola-theme *git* dependency can't be
+# packaged while saola-theme is unpublished. Instead, the release-pr CI job
+# checks out the latest tag and passes it as `--registry-manifest-path`
+# (see .github/workflows/release-plz.yml).
+semver_check = false
+git_release_enable = true
+# For a single-crate repo release-plz would default to plain `v{version}`
+# tags; pin the workspace-style name so tags read the same across the Saola
+# repos (saola-theme-v0.2.0, saola-files-v0.1.0, …) — and the release-pr CI
+# job's `git describe --match 'saola-files-v*'` baseline lookup depends on it.
+git_tag_name = "{{ package }}-v{{ version }}"
+changelog_update = true
+
+[changelog]
+header = """
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+"""
+# Map conventional commit types onto Keep a Changelog's categories.
+# Order matters: first match wins.
+commit_parsers = [
+  { message = "^security|^fix\\(security\\)", group = "Security" },
+  { message = "^remove", group = "Removed" },
+  { message = "^deprecate", group = "Deprecated" },
+  { message = "^\\w+(\\(.*\\))?!", group = "Changed" }, # breaking changes (`feat!:` etc.)
+  { message = "^feat", group = "Added" },
+  { message = "^fix", group = "Fixed" },
+  { message = "^perf|^refactor", group = "Changed" },
+  { message = "^docs|^chore|^ci|^style|^test|^build", skip = true },
+]

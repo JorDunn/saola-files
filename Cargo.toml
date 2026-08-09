@@ -1,0 +1,50 @@
+[package]
+name = "saola-files"
+version = "0.1.0"
+edition = "2024"
+description = "The file manager for the Saola desktop environment"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/JorDunn/saola-files"
+
+[features]
+# Protocol backends are feature-gated modules in `src/modules/` — users
+# building from source pick their set (`--no-default-features` for a
+# local-only binary). The release/AUR build ships the defaults. Each
+# feature's optional dependencies land in the same PR as its module.
+#
+# "sftp" is reserved here from day one so the CI feature matrix
+# (`--all-features` / `--no-default-features`) exercises both build shapes
+# before the module exists; its `dep:` entries arrive with `modules/sftp.rs`.
+default = ["sftp"]
+sftp = []
+
+[dependencies]
+# GUI toolkit. Surveyed 2026-08-08: iced is the only toolkit the Saola
+# ecosystem targets (saola-theme is an iced style crate; panel, capture and
+# lockscreen are all iced 0.14), so there was no real alternative to weigh —
+# GTK/Qt would orphan the design system. Unlike the panel/capture this app is
+# an ordinary toplevel window, not a layer-shell surface, so there is no
+# iced_layershell here and never should be. Features, following capture's
+# posture of default renderer features plus what the app needs:
+# `tokio` (one shared async runtime — zbus joins it in a later stage),
+# `svg` (Lucide icons, Stage 6), `image` (thumbnails, Stage 11).
+iced = { version = "0.14", features = ["tokio", "svg", "image"] }
+
+# The Saola design system: tokens (colors, typography, radii, sizes) and
+# iced style helpers. `tag` and `version` must move together — cargo errors
+# if they disagree, which is the guard against drifting off a released tag.
+# Never point this at `branch = "main"`; bumping the tag is a deliberate,
+# reviewed change (see CLAUDE.md "Design language").
+# Pinned 2026-08-08 at the same tag the panel and capture use.
+saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.5.0", version = "0.5.0" }
+
+# Dependency debt is cheap to take on and expensive to shed; every addition
+# below this line needs a dated survey comment like the ones above
+# (alternatives considered, why they lost) — the panel's Cargo.toml is the
+# reference for the format.
+
+[profile.dev.package."*"]
+# Dependencies at full optimization even in dev builds (capture precedent):
+# iced's software/GPU rendering stack is unusably slow at opt-level 0, and
+# dependencies rarely change, so the cost is one long first build.
+opt-level = 3

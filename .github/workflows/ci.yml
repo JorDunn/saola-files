@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # System libraries the build links against: xkbcommon + wayland come in via
+  # iced's winit/smithay client stack. The set grows as stages land native
+  # deps (Cargo.lock's `-sys` crates, minus other-platform and pure-FFI ones).
+  APT_BUILD_DEPS: libxkbcommon-dev libwayland-dev
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $APT_BUILD_DEPS
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $APT_BUILD_DEPS
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-features
+
+  # Both ends of the feature matrix: the everything build and the
+  # local-filesystem-only build. Protocol modules are feature-gated, so
+  # either end can rot without the other noticing — this is the guard.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $APT_BUILD_DEPS
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --all-features
+      - run: cargo build --no-default-features
