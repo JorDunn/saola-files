@@ -38,6 +38,15 @@ iced = { version = "0.14", features = ["tokio", "svg", "image"] }
 # Pinned 2026-08-08 at the same tag the panel and capture use.
 saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.5.0", version = "0.5.0" }
 
+# Config parsing. Surveyed 2026-08-08: the family standard is hand-walked
+# parsing over a real parser's loose document type. capture (the newest
+# precedent, migrated from KDL 2026-08-08) uses `toml`'s `Table` for this;
+# `toml_edit` adds format-preserving round-tripping we don't need (we never
+# write the config), and serde-derive on the config struct is banned by the
+# resilience rules (one bad knob must degrade alone, with its own warning).
+# serde comes along transitively as toml's data model; we don't derive on it.
+toml = "0.9"
+
 # Dependency debt is cheap to take on and expensive to shed; every addition
 # below this line needs a dated survey comment like the ones above
 # (alternatives considered, why they lost) — the panel's Cargo.toml is the

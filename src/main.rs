@@ -1,10 +1,12 @@
 //! saola-files — the file manager for the Saola desktop environment.
 //!
-//! Stage 1 scope: the application shell only — a transparent, undecorated
-//! toplevel window drawing its own rounded `paper_window` chrome and 46 px
-//! header, with working move/resize/close/maximise against niri. Directory
-//! browsing arrives with the VFS layer in Stage 3.
+//! Current scope (through Stage 2): the application shell — a transparent,
+//! undecorated toplevel window drawing its own rounded `paper_window`
+//! chrome and 46 px header — plus CLI parsing and `files.toml` loading.
+//! Directory browsing arrives with the VFS layer in Stage 3.
 
+mod cli;
+mod config;
 mod ui;
 
 use iced::widget::{column, container, text};
@@ -12,31 +14,57 @@ use iced::{Element, Fill, Size, Task, window};
 use saola_theme::{Theme, convert};
 
 fn main() -> iced::Result {
+    let invocation = match cli::parse(std::env::args_os().skip(1)) {
+        Ok(invocation) => invocation,
+        Err(message) => {
+            eprintln!("saola-files: {message}\n\n{}", cli::USAGE);
+            std::process::exit(2);
+        }
+    };
+    let args = match invocation {
+        cli::Invocation::Version => {
+            println!("saola-files {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        cli::Invocation::Help => {
+            println!("{}", cli::USAGE);
+            return Ok(());
+        }
+        cli::Invocation::Run(args) => args,
+    };
+
+    let config_path = config::Config::resolve_path(args.config_dir.as_deref());
+    let config = config::Config::load(config_path.as_deref());
+
     // `default_font` wants an owned `Font` up front, before any `App`
     // exists, so build a throwaway theme just for the font lookup. (The
     // `Box::leak` this implies is saola-theme's documented, once-per-load
     // exception — see saola-theme's convert.rs.)
     let ui_font = convert::ui_font(&Theme::saola());
 
-    iced::application(App::new, App::update, App::view)
-        .theme(App::theme)
-        // Transparent app background: without this, iced clears the surface
-        // to the theme's ink background before drawing, and the window's
-        // rounded corners render as square ink wedges (capture learned this
-        // live — see ui/window.rs's module docs).
-        .style(App::style)
-        .title("Files")
-        .default_font(ui_font)
-        .window(window::Settings {
-            // niri draws no decorations and Saola windows draw their own
-            // header; there is no taskbar, so minimise must not exist.
-            decorations: false,
-            transparent: true,
-            minimizable: false,
-            ..window::Settings::default()
-        })
-        .window_size(Size::new(1100.0, 720.0))
-        .run()
+    iced::application(
+        move || App::new(config.clone(), args.clone()),
+        App::update,
+        App::view,
+    )
+    .theme(App::theme)
+    // Transparent app background: without this, iced clears the surface
+    // to the theme's ink background before drawing, and the window's
+    // rounded corners render as square ink wedges (capture learned this
+    // live — see ui/window.rs's module docs).
+    .style(App::style)
+    .title("Files")
+    .default_font(ui_font)
+    .window(window::Settings {
+        // niri draws no decorations and Saola windows draw their own
+        // header; there is no taskbar, so minimise must not exist.
+        decorations: false,
+        transparent: true,
+        minimizable: false,
+        ..window::Settings::default()
+    })
+    .window_size(Size::new(1100.0, 720.0))
+    .run()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -46,12 +74,23 @@ enum Message {
 
 struct App {
     theme: Theme,
+    /// Loaded `files.toml`. Read from Stage 3 on (view/sort defaults for
+    /// new directory views); `#[expect]` makes the compiler flag the
+    /// attribute for removal the moment that lands.
+    #[expect(dead_code)]
+    config: config::Config,
+    /// The CLI's target/select, consumed when the VFS opens the initial
+    /// location in Stage 3.
+    #[expect(dead_code)]
+    args: cli::Cli,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(config: config::Config, args: cli::Cli) -> Self {
         Self {
             theme: Theme::saola(),
+            config,
+            args,
         }
     }
 
