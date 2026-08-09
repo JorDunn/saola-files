@@ -11,17 +11,52 @@
 //! docs — do not follow a symlink, matching the no-panic, never-follow
 //! rule.
 //!
-//! `watch()` returns `None` in this stage; inotify lands in Stage 5.
+//! **`watch()` (Stage 5).** Real inotify, via the `inotify` crate's async
+//! `stream` feature (see the dated survey comment in `Cargo.toml`) — no
+//! polling, per CLAUDE.md's "signal, never poll" rule. [`watch`] itself
+//! stays synchronous (`Inotify::init`/`Watches::add` are fast syscalls; a
+//! failure there — e.g. the directory doesn't exist, or the process is out
+//! of inotify watches — degrades to `None`, same as a backend that never
+//! had `Caps::WATCH`), and spawns [`process_watch_stream`] onto the shared
+//! tokio runtime to translate raw kernel events into [`DirEvent`]s and
+//! `try_send` them across a bounded `futures::channel::mpsc` — the exact
+//! same type `iced::futures::channel::mpsc` names (this crate's `core`/
+//! `modules` layers stay iced-free by depending on the `futures` crate
+//! directly rather than through `iced`; see `core::vfs`'s `ReadStream`/
+//! `WriteSink` for the same pattern already established there — `Cargo.lock`
+//! only ever resolves one `futures` in the graph, so the types are
+//! identical either way `use` names them).
+//!
+//! Two inotify gotchas this stage handles explicitly (verified against the
+//! `inotify` crate's own docs, see `EventMask`):
+//! - **Renames split across two raw events** (`IN_MOVED_FROM`/
+//!   `IN_MOVED_TO`, correlated by a shared `cookie`) that aren't guaranteed
+//!   to arrive back-to-back — [`process_watch_stream`] holds a
+//!   `MOVED_FROM` pending for up to [`RENAME_PAIR_WINDOW`] waiting for its
+//!   `MOVED_TO` partner; if no partner shows up in time (the file was
+//!   moved *out* of the watched directory), the pending half is emitted as
+//!   a plain [`DirEvent::Removed`] instead of holding it forever. A bare
+//!   `MOVED_TO` with no pending partner (moved *in* from elsewhere) is
+//!   emitted immediately as [`DirEvent::Created`] — there's nothing to
+//!   wait for.
+//! - **Queue overflow** (`EventMask::Q_OVERFLOW`, or this backend's own
+//!   bridge channel filling up because the consumer fell behind) means the
+//!   backend can no longer promise it reported every change — see
+//!   [`DirEvent::Overflow`]'s docs for why the recovery is a full re-list,
+//!   not an attempt to reconcile.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use futures::SinkExt;
 use futures::channel::mpsc;
 use futures::stream::{BoxStream, StreamExt};
+use inotify::{EventMask, EventStream, Inotify, WatchMask};
+use tokio::time::Instant as TokioInstant;
 
 use crate::core::fs::entry::{EntryKind, FileEntry};
 use crate::core::vfs::{Backend, Caps, DirEvent, Location, ReadStream, VfsError, WriteSink};
@@ -35,6 +70,28 @@ const CHUNK_SIZE: usize = 64 * 1024;
 /// blocks — bounded, per CLAUDE.md's async-bridging rule (never an
 /// unbounded channel).
 const CHANNEL_CAPACITY: usize = 4;
+
+/// Raw inotify read buffer size, in bytes — comfortably more than one
+/// `inotify_event` plus a `NAME_MAX`-length filename, so an ordinary burst
+/// doesn't force multiple syscalls to drain a single wakeup. (The crate's
+/// own docs warn a `Vec::with_capacity` alone is wrong here — it has
+/// reserved capacity but length `0` — so this is built with `vec![0u8; N]`
+/// everywhere it's used.)
+const WATCH_BUFFER_BYTES: usize = 4096;
+
+/// How many translated [`DirEvent`]s may sit in [`LocalBackend::watch`]'s
+/// bridge channel before `try_send` starts failing (CLAUDE.md: bounded,
+/// `try_send`, never blocking) — past this, [`process_watch_stream`] stops
+/// trying to deliver individual events and waits for room to deliver one
+/// [`DirEvent::Overflow`] instead (see the module docs' "queue overflow"
+/// gotcha).
+const WATCH_CHANNEL_CAPACITY: usize = 64;
+
+/// How long a `MOVED_FROM` may sit unpaired before [`process_watch_stream`]
+/// gives up waiting for its `MOVED_TO` and emits a plain
+/// [`DirEvent::Removed`] instead (see the module docs' rename-pairing
+/// gotcha).
+const RENAME_PAIR_WINDOW: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Default)]
 pub struct LocalBackend;
@@ -199,11 +256,11 @@ impl Backend for LocalBackend {
     }
 
     fn caps(&self) -> Caps {
-        // No `WATCH` (inotify lands Stage 5) and no `TRASH` (`remove()` is
-        // a real permanent delete — claiming trash here would be a
-        // capability lie the UI would word wrong). `SET_PERMISSIONS` has
-        // no backing trait method at all yet.
-        Caps::RENAME_IN_PLACE | Caps::LOCAL_PATH | Caps::THUMBNAILS
+        // `WATCH` as of Stage 5 (`watch()` below is real inotify). Still no
+        // `TRASH` (`remove()` is a real permanent delete — claiming trash
+        // here would be a capability lie the UI would word wrong).
+        // `SET_PERMISSIONS` has no backing trait method at all yet.
+        Caps::WATCH | Caps::RENAME_IN_PLACE | Caps::LOCAL_PATH | Caps::THUMBNAILS
     }
 
     async fn list(&self, location: &Location) -> Result<Vec<FileEntry>, VfsError> {
@@ -306,8 +363,189 @@ impl Backend for LocalBackend {
         .await
     }
 
-    fn watch(&self, _location: &Location) -> Option<BoxStream<'static, DirEvent>> {
-        None
+    fn watch(&self, location: &Location) -> Option<BoxStream<'static, DirEvent>> {
+        let inotify = match Inotify::init() {
+            Ok(inotify) => inotify,
+            Err(err) => {
+                eprintln!("saola-files: could not start watching {location}: {err}");
+                return None;
+            }
+        };
+
+        // `MODIFY`/`ATTRIB`/`CLOSE_WRITE` all fold into `DirEvent::Changed`
+        // downstream (`process_watch_stream`) — kept as separate mask bits
+        // here only because that's how inotify itself reports them.
+        let mask = WatchMask::CREATE
+            | WatchMask::DELETE
+            | WatchMask::MOVED_FROM
+            | WatchMask::MOVED_TO
+            | WatchMask::MODIFY
+            | WatchMask::ATTRIB
+            | WatchMask::CLOSE_WRITE
+            | WatchMask::DELETE_SELF
+            | WatchMask::MOVE_SELF;
+        if let Err(err) = inotify.watches().add(&location.path, mask) {
+            eprintln!("saola-files: could not watch {location}: {err}");
+            return None;
+        }
+
+        let stream = match inotify.into_event_stream(vec![0u8; WATCH_BUFFER_BYTES]) {
+            Ok(stream) => stream,
+            Err(err) => {
+                eprintln!("saola-files: could not start an inotify stream for {location}: {err}");
+                return None;
+            }
+        };
+
+        let (tx, rx) = mpsc::channel::<DirEvent>(WATCH_CHANNEL_CAPACITY);
+        // Detached, like `read`/`write`'s spawned work above: the returned
+        // `rx` (boxed below) is what governs how long this runs — dropping
+        // it (the view navigated away, or the whole app shut down) makes
+        // every subsequent `try_send` below fail, which
+        // `process_watch_stream` treats as "nobody's listening anymore"
+        // and exits on. Uses `tokio::spawn` (not `spawn_blocking`, unlike
+        // this file's other backend calls): the inotify `EventStream` is
+        // genuinely non-blocking async I/O against the shared runtime's
+        // `AsyncFd`, not a blocking syscall wrapped for the blocking pool.
+        tokio::spawn(process_watch_stream(stream, tx));
+
+        Some(rx.boxed())
+    }
+}
+
+/// Translate one directory's raw inotify events into [`DirEvent`]s and
+/// `try_send` them into `tx` — the async task [`LocalBackend::watch`]
+/// spawns. See the module docs for the rename-pairing and queue-overflow
+/// gotchas this implements.
+async fn process_watch_stream(mut events: EventStream<Vec<u8>>, mut tx: mpsc::Sender<DirEvent>) {
+    // `MOVED_FROM` names waiting for a same-`cookie` `MOVED_TO`, each with
+    // the absolute instant it should be given up on and re-emitted as a
+    // plain `Removed` instead (see `RENAME_PAIR_WINDOW`'s docs). Keyed by
+    // cookie because that's the only thing that correlates the pair;
+    // multiple renames can be in flight at once (e.g. a multi-select move),
+    // each with its own independent deadline.
+    let mut pending_moves: HashMap<u32, (OsString, TokioInstant)> = HashMap::new();
+    // Set once a send has failed (channel full — the consumer fell
+    // behind). While set, ordinary events are discarded instead of
+    // attempted (there's no point queueing more when the one thing that
+    // actually matters, "tell the consumer to re-list", hasn't gotten
+    // through yet) — cleared the moment an `Overflow` notice is
+    // successfully delivered.
+    let mut overflowed = false;
+
+    loop {
+        let next_deadline = pending_moves.values().map(|&(_, at)| at).min();
+
+        let next = match next_deadline {
+            None => events.next().await,
+            Some(deadline) => match tokio::time::timeout_at(deadline, events.next()).await {
+                Ok(next) => next,
+                Err(_elapsed) => {
+                    // At least one pending `MOVED_FROM`'s window closed
+                    // with no `MOVED_TO` partner. Only the ones actually
+                    // past their deadline are flushed — a different
+                    // pending rename with a later deadline keeps waiting.
+                    let now = TokioInstant::now();
+                    let expired: Vec<OsString> = pending_moves
+                        .iter()
+                        .filter(|&(_, &(_, at))| at <= now)
+                        .map(|(_, (name, _))| name.clone())
+                        .collect();
+                    pending_moves.retain(|_, &mut (_, at)| at > now);
+                    for name in expired {
+                        send_or_mark_overflow(&mut tx, &mut overflowed, DirEvent::Removed(name));
+                    }
+                    continue;
+                }
+            },
+        };
+
+        let Some(result) = next else {
+            // The underlying fd closed (the watch was torn down, or the
+            // `Inotify` instance was dropped) — nothing more will arrive.
+            break;
+        };
+
+        let event = match result {
+            Ok(event) => event,
+            Err(err) => {
+                eprintln!("saola-files: inotify read error: {err}");
+                continue;
+            }
+        };
+
+        if event.mask.contains(EventMask::Q_OVERFLOW) {
+            // The kernel dropped events we can't identify — any rename
+            // we're mid-pairing on is now unrecoverable too.
+            pending_moves.clear();
+            send_or_mark_overflow(&mut tx, &mut overflowed, DirEvent::Overflow);
+            continue;
+        }
+        if event.mask.contains(EventMask::IGNORED) {
+            // The watch itself is gone (directory deleted, filesystem
+            // unmounted) — no further events will arrive for it.
+            break;
+        }
+
+        // Events on the watched directory itself (self-moved, attrib
+        // change on the dir) carry no `name` and aren't a row in this
+        // directory's listing — nothing for the view to apply.
+        let Some(name) = event.name else {
+            continue;
+        };
+
+        if event.mask.contains(EventMask::MOVED_FROM) {
+            pending_moves.insert(
+                event.cookie,
+                (name, TokioInstant::now() + RENAME_PAIR_WINDOW),
+            );
+            continue;
+        }
+        if event.mask.contains(EventMask::MOVED_TO) {
+            let dir_event = match pending_moves.remove(&event.cookie) {
+                Some((from, _)) => DirEvent::Renamed { from, to: name },
+                // No pending `MOVED_FROM` with this cookie — moved in from
+                // outside the watched directory, so there's nothing to
+                // pair with; it's a plain creation.
+                None => DirEvent::Created(name),
+            };
+            send_or_mark_overflow(&mut tx, &mut overflowed, dir_event);
+            continue;
+        }
+        if event.mask.contains(EventMask::CREATE) {
+            send_or_mark_overflow(&mut tx, &mut overflowed, DirEvent::Created(name));
+            continue;
+        }
+        if event.mask.contains(EventMask::DELETE) {
+            send_or_mark_overflow(&mut tx, &mut overflowed, DirEvent::Removed(name));
+            continue;
+        }
+        if event
+            .mask
+            .intersects(EventMask::MODIFY | EventMask::ATTRIB | EventMask::CLOSE_WRITE)
+        {
+            send_or_mark_overflow(&mut tx, &mut overflowed, DirEvent::Changed(name));
+        }
+    }
+}
+
+/// `try_send`s `event`, per CLAUDE.md's async-bridging rule (bounded
+/// channel, never a blocking send inside a message-producing path). A
+/// full channel means the consumer fell behind; rather than buffering
+/// unboundedly or silently dropping the specific change forever, this
+/// escalates to `overflowed = true` so the *next* successful send is a
+/// single [`DirEvent::Overflow`] instead of `event` — the view will do a
+/// full re-list off that, which supersedes whatever this one event would
+/// have told it anyway.
+fn send_or_mark_overflow(tx: &mut mpsc::Sender<DirEvent>, overflowed: &mut bool, event: DirEvent) {
+    if *overflowed {
+        if tx.try_send(DirEvent::Overflow).is_ok() {
+            *overflowed = false;
+        }
+        return;
+    }
+    if tx.try_send(event).is_err() {
+        *overflowed = true;
     }
 }
 
@@ -404,21 +642,121 @@ mod tests {
         cleanup(dir);
     }
 
-    #[test]
-    fn watch_returns_none_until_stage_5() {
-        assert!(backend().watch(&Location::local("/")).is_none());
+    #[tokio::test]
+    async fn watch_on_a_missing_directory_returns_none() {
+        // `Watches::add` fails fast (ENOENT) rather than handing back a
+        // stream that would just sit there never producing anything —
+        // same "degrade to None" posture as any other unavailable
+        // capability.
+        let missing = Location::local("/nonexistent/saola-files-test-dir");
+        assert!(backend().watch(&missing).is_none());
     }
 
     #[test]
-    fn caps_do_not_claim_watch_or_trash() {
-        // Capability-honest: `watch()` really does return `None` above,
-        // and `remove()` really does permanently delete (no trash dir
-        // involved) — claiming either bit here would be a lie the UI
-        // would word wrong.
+    fn caps_claim_watch_now_but_still_not_trash() {
+        // Capability-honest: `remove()` really does permanently delete (no
+        // trash dir involved) — claiming that bit would be a lie the UI
+        // would word wrong. `watch()` genuinely can signal changes now
+        // (see the temp-dir tests below), so claiming `WATCH` is not.
         let caps = backend().caps();
-        assert!(!caps.contains(Caps::WATCH));
+        assert!(caps.contains(Caps::WATCH));
         assert!(!caps.contains(Caps::TRASH));
         assert!(caps.contains(Caps::LOCAL_PATH));
+    }
+
+    // ── Stage 5: inotify watch ───────────────────────────────────────────
+    //
+    // Every test below performs a *real* filesystem mutation on a temp
+    // directory and asserts the resulting `DirEvent` appears on the
+    // returned stream — the "external create/rm/mv appears" integration
+    // test the stage calls for, run directly against `LocalBackend::watch`
+    // (the layer that actually owns inotify) rather than through the full
+    // UI subscription stack, which needs a live iced runtime to drive.
+
+    /// Bounded wait for the stream's next item. A real inotify event
+    /// should land in well under this on any sane system (the stage's
+    /// manual "≤100ms" criterion is checked live, not by this timeout) —
+    /// a genuine hang here is a bug, not flakiness to paper over with a
+    /// longer wait.
+    async fn next_event(stream: &mut BoxStream<'static, DirEvent>) -> DirEvent {
+        tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("timed out waiting for a watch event")
+            .expect("watch stream ended unexpectedly")
+    }
+
+    #[tokio::test]
+    async fn watch_reports_an_external_create() {
+        let dir = tempdir();
+        let mut stream = backend().watch(&Location::local(&dir)).unwrap();
+
+        std::fs::write(dir.join("new.txt"), b"hi").unwrap();
+
+        assert_eq!(
+            next_event(&mut stream).await,
+            DirEvent::Created(OsString::from("new.txt"))
+        );
+
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn watch_reports_an_external_remove() {
+        let dir = tempdir();
+        std::fs::write(dir.join("gone.txt"), b"hi").unwrap();
+        let mut stream = backend().watch(&Location::local(&dir)).unwrap();
+
+        std::fs::remove_file(dir.join("gone.txt")).unwrap();
+
+        assert_eq!(
+            next_event(&mut stream).await,
+            DirEvent::Removed(OsString::from("gone.txt"))
+        );
+
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn watch_reports_an_external_rename_as_one_paired_event() {
+        let dir = tempdir();
+        std::fs::write(dir.join("old.txt"), b"hi").unwrap();
+        let mut stream = backend().watch(&Location::local(&dir)).unwrap();
+
+        std::fs::rename(dir.join("old.txt"), dir.join("new.txt")).unwrap();
+
+        assert_eq!(
+            next_event(&mut stream).await,
+            DirEvent::Renamed {
+                from: OsString::from("old.txt"),
+                to: OsString::from("new.txt"),
+            }
+        );
+
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn watch_reports_a_move_out_as_a_removal_once_the_pairing_window_closes() {
+        let dir = tempdir();
+        let outside = tempdir();
+        std::fs::write(dir.join("leaving.txt"), b"hi").unwrap();
+        let mut stream = backend().watch(&Location::local(&dir)).unwrap();
+
+        // Moves to a directory we don't watch — `dir`'s watch only ever
+        // sees the `MOVED_FROM` half, never a matching `MOVED_TO`.
+        std::fs::rename(dir.join("leaving.txt"), outside.join("leaving.txt")).unwrap();
+
+        // Give `RENAME_PAIR_WINDOW` (50ms) room to close before falling
+        // back to the plain-`Removed` gotcha this test exists to prove —
+        // still well inside the 2s bound `next_event` otherwise uses.
+        let event = tokio::time::timeout(std::time::Duration::from_secs(3), stream.next())
+            .await
+            .expect("timed out waiting for the pairing window to close")
+            .expect("watch stream ended unexpectedly");
+        assert_eq!(event, DirEvent::Removed(OsString::from("leaving.txt")));
+
+        cleanup(dir);
+        cleanup(outside);
     }
 
     #[tokio::test]

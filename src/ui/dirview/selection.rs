@@ -107,6 +107,27 @@ impl Selection {
     pub fn set_cursor(&mut self, cursor: Option<usize>) {
         self.cursor = cursor;
     }
+
+    /// Drops `name` from the selection if it's there — a no-op otherwise.
+    /// Used when a watched removal (or the "from" half of a watched
+    /// rename) takes an entry out from under the user (Stage 5:
+    /// `DirectoryView::apply_watch_events`). Deliberately narrower than
+    /// [`Self::clear`]: one entry disappearing shouldn't touch anything
+    /// else that's still selected, or the anchor a Shift-range is tracking.
+    pub fn forget(&mut self, name: &OsStr) {
+        self.selected.remove(name);
+    }
+
+    /// A watched rename: if `from` was selected, `to` becomes selected in
+    /// its place. This is the whole point of keying `selected` by name
+    /// instead of by row index — a rename firing mid-burst doesn't have to
+    /// know or care where either name currently sits in `visible` for the
+    /// selection to survive it.
+    pub fn rename(&mut self, from: &OsStr, to: OsString) {
+        if self.selected.remove(from) {
+            self.selected.insert(to);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -195,5 +216,46 @@ mod tests {
         selection.set_cursor(Some(5));
         assert_eq!(selection.cursor(), Some(5));
         assert!(selection.is_selected(&name("a")));
+    }
+
+    // ── Stage 5: watch events ───────────────────────────────────────────
+
+    #[test]
+    fn forget_drops_only_the_named_entry() {
+        let mut selection = Selection::new();
+        selection.select_all([name("a"), name("b")]);
+        selection.forget(&name("a"));
+        assert!(!selection.is_selected(&name("a")));
+        assert!(selection.is_selected(&name("b")));
+        assert_eq!(selection.len(), 1);
+    }
+
+    #[test]
+    fn forgetting_an_unselected_name_is_a_no_op() {
+        let mut selection = Selection::new();
+        selection.click(0, name("a"));
+        selection.forget(&name("z"));
+        assert!(selection.is_selected(&name("a")));
+        assert_eq!(selection.len(), 1);
+    }
+
+    #[test]
+    fn rename_moves_a_selected_name_to_its_new_name() {
+        let mut selection = Selection::new();
+        selection.select_all([name("a"), name("b")]);
+        selection.rename(&name("a"), name("a-renamed"));
+        assert!(!selection.is_selected(&name("a")));
+        assert!(selection.is_selected(&name("a-renamed")));
+        assert!(selection.is_selected(&name("b")));
+        assert_eq!(selection.len(), 2);
+    }
+
+    #[test]
+    fn renaming_an_unselected_name_does_not_select_the_new_name() {
+        let mut selection = Selection::new();
+        selection.click(0, name("a"));
+        selection.rename(&name("untouched"), name("still-untouched"));
+        assert!(!selection.is_selected(&name("still-untouched")));
+        assert_eq!(selection.len(), 1);
     }
 }

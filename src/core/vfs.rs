@@ -161,15 +161,28 @@ impl fmt::Display for VfsError {
 
 impl std::error::Error for VfsError {}
 
-/// A single change reported by [`Backend::watch`]. Stage 5 (inotify) is
-/// the first backend to actually emit these; the type exists now so the
-/// trait signature doesn't change under Stage 5.
+/// A single change reported by [`Backend::watch`]. `modules::local` (Stage
+/// 5, inotify) is the first backend to actually emit these.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DirEvent {
     Created(OsString),
     Removed(OsString),
-    Renamed { from: OsString, to: OsString },
+    Renamed {
+        from: OsString,
+        to: OsString,
+    },
     Changed(OsString),
+    /// The backend can no longer guarantee it reported every change since
+    /// the last event — either the kernel's own inotify queue overflowed
+    /// (`IN_Q_OVERFLOW`, a documented inotify(7) gotcha: the reader didn't
+    /// drain fast enough and the kernel dropped events rather than block),
+    /// or this backend's own bounded bridge channel filled up because the
+    /// UI-side consumer fell behind (CLAUDE.md's `try_send`-never-blocks
+    /// rule means that channel drops rather than backs up the watcher).
+    /// Either way, trying to reconcile from a possibly-incomplete event
+    /// history would risk silently diverging from disk; the only correct
+    /// recovery is a full re-list, same as a manual F5.
+    Overflow,
 }
 
 /// A chunk stream from [`Backend::read`]. Chunks are plain `Vec<u8>` (no
@@ -450,9 +463,10 @@ mod tests {
 
     #[test]
     fn dir_event_variants_are_plain_data() {
-        // `watch()` returns `None` everywhere until Stage 5's inotify
-        // backend; this is the type-level proof the variants themselves
-        // are sound (constructible, comparable) ahead of a real producer.
+        // `FakeBackend::watch()` always returns `None` (only `modules::
+        // local`'s real inotify backend produces these); this is the
+        // type-level proof the variants themselves are sound
+        // (constructible, comparable) independent of a real producer.
         let created = DirEvent::Created(OsString::from("a"));
         let removed = DirEvent::Removed(OsString::from("a"));
         let changed = DirEvent::Changed(OsString::from("a"));
@@ -462,7 +476,9 @@ mod tests {
         };
         assert_ne!(created, renamed);
         assert_ne!(removed, changed);
+        assert_ne!(changed, DirEvent::Overflow);
         assert_eq!(created, DirEvent::Created(OsString::from("a")));
+        assert_eq!(DirEvent::Overflow, DirEvent::Overflow);
     }
 
     #[test]

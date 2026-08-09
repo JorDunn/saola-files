@@ -153,8 +153,20 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        iced::keyboard::listen()
-            .map(|event| Message::Directory(ui::dirview::Message::Keyboard(event)))
+        let keyboard = iced::keyboard::listen()
+            .map(|event| Message::Directory(ui::dirview::Message::Keyboard(event)));
+
+        // Stage 5: the active view's own live-update watch, if its backend
+        // has one — `None`/an out-of-range `active` degrades to "no watch
+        // subscription" rather than a panic, same posture as `App::view`'s
+        // own `views.get(self.active)` guard.
+        let watch = self
+            .views
+            .get(self.active)
+            .map(|view| view.subscription().map(Message::Directory))
+            .unwrap_or_else(Subscription::none);
+
+        Subscription::batch([keyboard, watch])
     }
 
     fn theme(&self) -> iced::Theme {

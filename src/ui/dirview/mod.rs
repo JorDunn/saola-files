@@ -26,23 +26,43 @@
 //! `ui::dirview::typeahead` (type-to-select) are the other two Stage 4
 //! additions; both are private submodules with the same field-visibility
 //! access `list.rs`/`selection.rs` already had.
+//!
+//! **Live updates (Stage 5).** [`Self::subscription`] wraps `watch.rs`,
+//! which resolves the current `Location`'s backend and — if it can signal
+//! (`Backend::watch` returns `Some`) — debounces its raw `DirEvent` stream
+//! into `Vec<DirEvent>` batches delivered as `Message::Watch`.
+//! [`Self::apply_watch_events`] applies a batch incrementally: removals
+//! and the "from" half of a rename mutate `entries` synchronously (no
+//! network/disk round trip needed to delete a row), while creations,
+//! changes, and the "to" half of a rename need one `Backend::metadata`
+//! call each (a watch event only carries a name, not size/kind/mtime) —
+//! that fetch comes back as `Message::WatchRefreshed`, guarded against
+//! staleness exactly like `Message::Listed`. Either way, `recompute_visible`
+//! runs at most twice per batch (once for the synchronous half, once for
+//! the async one) rather than once per event — the "debounced re-sort" the
+//! stage calls for. `selection` is name-keyed (`selection::Selection`)
+//! specifically so it survives all of this: `Selection::forget`/`rename`
+//! keep a selected entry selected across a rename, or drop it cleanly if
+//! it was deleted, without either method needing to know the entry's
+//! *position* at the time.
 
 mod grid;
 mod list;
 mod selection;
 mod typeahead;
+mod watch;
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
 use iced::widget::scrollable;
-use iced::{Element, Task, keyboard};
+use iced::{Element, Subscription, Task, keyboard};
 use saola_theme::Theme;
 
 use crate::config::{Config, SortKey, View};
 use crate::core::fs::entry::{EntryKind, FileEntry};
 use crate::core::fs::sort;
-use crate::core::vfs::{Caps, Location, VfsError};
+use crate::core::vfs::{Caps, DirEvent, Location, VfsError};
 use crate::keymap::{self, Action};
 use crate::ui::breadcrumbs;
 
@@ -94,6 +114,21 @@ pub enum Message {
     /// The path/URI editor's `on_submit` (Enter): parse the buffer and
     /// request navigating there.
     PathSubmitted,
+    /// A debounced batch of raw watch events for the current location
+    /// (`watch.rs`) — see the module docs' "Live updates" section.
+    /// Delivered even for a location whose backend can't watch (an empty
+    /// stream just never produces this), so `update` never needs to guard
+    /// on `Caps::WATCH` itself.
+    Watch(Vec<DirEvent>),
+    /// The `Backend::metadata` refetch `apply_watch_events` kicks off for
+    /// each name a `Watch` batch's creations/changes/rename-destinations
+    /// touched. `location` is guarded against staleness exactly like
+    /// `Message::Listed`'s: a result for a location that's no longer
+    /// `self.location` (a navigation raced ahead of the fetch) is dropped.
+    /// `None` per-name means the entry vanished again before the fetch
+    /// completed (a create-then-immediate-delete race) — not an error
+    /// worth surfacing, just skip inserting it.
+    WatchRefreshed(Location, Vec<(OsString, Option<FileEntry>)>),
 }
 
 /// What the owner (the app, via `ui::explorer`) decides to act on. The
@@ -236,6 +271,17 @@ impl DirectoryView {
         crate::modules::resolve(&self.location.scheme)
             .map(|backend| backend.caps())
             .unwrap_or(Caps::empty())
+    }
+
+    /// This view's live-update subscription (Stage 5) — the app batches
+    /// this alongside its own keyboard subscription (`main.rs`). Identified
+    /// by `self.location` (see `watch::subscription`'s docs), so iced tears
+    /// down and rebuilds the underlying watch the moment `navigate`/
+    /// `go_back`/`go_forward` points this view somewhere else; a backend
+    /// that can't watch (`Caps::WATCH` unset) just never produces a
+    /// `Message::Watch` off of it.
+    pub fn subscription(&self) -> Subscription<Message> {
+        watch::subscription(&self.location)
     }
 
     /// Resolve a `visible` row index to its `FileEntry`, or `None` if it's
@@ -400,6 +446,101 @@ impl DirectoryView {
         )
     }
 
+    /// Applies one debounced batch of watch events (Stage 5) — see the
+    /// module docs' "Live updates" section for the split between what
+    /// happens synchronously here vs. in `Message::WatchRefreshed`.
+    fn apply_watch_events(&mut self, events: Vec<DirEvent>) -> Task<Message> {
+        // Any `Overflow` in the batch means the backend can no longer
+        // promise it reported every change (see `DirEvent::Overflow`'s
+        // docs) — the rest of the batch is superseded by a full re-list,
+        // not worth applying first.
+        if events
+            .iter()
+            .any(|event| matches!(event, DirEvent::Overflow))
+        {
+            return self.load();
+        }
+
+        // Deduplicated: a rapid create-then-modify (e.g. `touch`, or a
+        // download landing) can produce two events for the same name
+        // within one batch, and there's no reason to fetch its metadata
+        // twice.
+        let mut to_fetch: std::collections::HashSet<OsString> = std::collections::HashSet::new();
+        for event in events {
+            match event {
+                DirEvent::Created(name) | DirEvent::Changed(name) => {
+                    to_fetch.insert(name);
+                }
+                DirEvent::Removed(name) => {
+                    self.remove_entry_by_name(&name);
+                    self.selection.forget(&name);
+                }
+                DirEvent::Renamed { from, to } => {
+                    self.selection.rename(&from, to.clone());
+                    self.remove_entry_by_name(&from);
+                    to_fetch.insert(to);
+                }
+                // Already handled by the early return above, which scans
+                // the same `events` this loop was built from — a no-op
+                // here rather than `unreachable!()`, per CLAUDE.md's
+                // no-panic rule: if that invariant is ever wrong, silently
+                // skipping one event is a far better failure mode than
+                // taking the app down.
+                DirEvent::Overflow => {}
+            }
+        }
+        // One resort for every synchronous removal/rename in the batch,
+        // not one per event — the "debounced re-sort" the stage calls
+        // for. `Message::WatchRefreshed` below does the second (and last)
+        // one, for whatever this call kicks off fetching.
+        self.recompute_visible();
+
+        if to_fetch.is_empty() {
+            return Task::none();
+        }
+
+        let location = self.location.clone();
+        let message_location = self.location.clone();
+        Task::perform(
+            async move {
+                let backend = crate::modules::resolve(&location.scheme);
+                let mut results = Vec::with_capacity(to_fetch.len());
+                for name in to_fetch {
+                    let entry = match &backend {
+                        Some(backend) => backend.metadata(&location.join(&name)).await.ok(),
+                        None => None,
+                    };
+                    results.push((name, entry));
+                }
+                results
+            },
+            move |results| Message::WatchRefreshed(message_location.clone(), results),
+        )
+    }
+
+    /// Removes `name` from `entries` if present — the synchronous half of
+    /// applying a `DirEvent::Removed`/rename's "from" half. A name that
+    /// isn't there (already removed, or never listed) is a no-op, not an
+    /// error: watch events and the in-flight listing they're layered on
+    /// top of can race harmlessly.
+    fn remove_entry_by_name(&mut self, name: &OsStr) {
+        self.entries.retain(|entry| entry.name.as_os_str() != name);
+    }
+
+    /// Inserts `entry`, or overwrites the existing row with the same name
+    /// — the shared tail of applying a `DirEvent::Created`/`Changed`/
+    /// rename's "to" half once its metadata has come back.
+    fn upsert_entry(&mut self, entry: FileEntry) {
+        match self
+            .entries
+            .iter_mut()
+            .find(|existing| existing.name == entry.name)
+        {
+            Some(existing) => *existing = entry,
+            None => self.entries.push(entry),
+        }
+    }
+
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Event>) {
         match message {
             Message::Listed(location, result) => {
@@ -483,6 +624,25 @@ impl DirectoryView {
                     Task::none(),
                     Some(Event::OpenDirectory(parse_typed_location(trimmed))),
                 )
+            }
+            Message::Watch(events) => (self.apply_watch_events(events), None),
+            Message::WatchRefreshed(location, results) => {
+                if location != self.location {
+                    // A later navigation raced ahead of this fetch.
+                    return (Task::none(), None);
+                }
+                for (name, entry) in results {
+                    match entry {
+                        Some(entry) => self.upsert_entry(entry),
+                        // Vanished again before the fetch completed (a
+                        // create-then-immediate-delete race) — nothing to
+                        // insert, and any watched `Removed` for it either
+                        // already ran or is still in flight and will.
+                        None => self.remove_entry_by_name(&name),
+                    }
+                }
+                self.recompute_visible();
+                (Task::none(), None)
             }
         }
     }
@@ -1243,11 +1403,11 @@ mod tests {
     }
 
     #[test]
-    fn caps_reflects_the_local_backend_and_lacks_watch() {
+    fn caps_reflects_the_local_backend_including_watch_as_of_stage_5() {
         let view = listed_view(vec![]);
         let caps = view.caps();
         assert!(caps.contains(crate::core::vfs::Caps::LOCAL_PATH));
-        assert!(!caps.contains(crate::core::vfs::Caps::WATCH));
+        assert!(caps.contains(crate::core::vfs::Caps::WATCH));
     }
 
     // ── Stage 4: grid cursor stepping ───────────────────────────────────
@@ -1348,12 +1508,131 @@ mod tests {
         );
     }
 
+    // ── Stage 5: watch events ────────────────────────────────────────────
+
+    #[test]
+    fn watch_created_is_applied_only_once_metadata_comes_back() {
+        let mut view = listed_view(vec![file("a")]);
+        let _ = view.apply_watch_events_for_test(vec![DirEvent::Created(OsString::from("b"))]);
+        // The name alone isn't enough to add a row — `entries` is
+        // untouched until `WatchRefreshed` supplies the metadata.
+        assert_eq!(view.entries, vec![file("a")]);
+
+        let (_, event) = view.update(Message::WatchRefreshed(
+            Location::local("/home"),
+            vec![(OsString::from("b"), Some(file("b")))],
+        ));
+        assert!(event.is_none());
+        assert!(view.entries.contains(&file("b")));
+    }
+
+    #[test]
+    fn watch_removed_drops_the_entry_and_its_selection_immediately() {
+        let mut view = listed_view(vec![file("a"), file("b")]);
+        view.selection.click(0, OsString::from("a"));
+        assert!(view.selection.is_selected(OsStr::new("a")));
+
+        let _ = view.apply_watch_events_for_test(vec![DirEvent::Removed(OsString::from("a"))]);
+
+        assert!(!view.entries.iter().any(|e| e.name == "a"));
+        assert!(!view.selection.is_selected(OsStr::new("a")));
+        assert!(view.entries.contains(&file("b")));
+    }
+
+    #[test]
+    fn watch_rename_keeps_the_renamed_entry_selected() {
+        let mut view = listed_view(vec![file("old.txt")]);
+        view.selection.click(0, OsString::from("old.txt"));
+
+        let _ = view.apply_watch_events_for_test(vec![DirEvent::Renamed {
+            from: OsString::from("old.txt"),
+            to: OsString::from("new.txt"),
+        }]);
+        // The "from" half is gone immediately; the "to" half isn't a row
+        // yet (still awaiting its metadata fetch) but is already selected
+        // — `Selection` is name-keyed, so this holds true even before the
+        // row exists.
+        assert!(!view.entries.iter().any(|e| e.name == "old.txt"));
+        assert!(!view.selection.is_selected(OsStr::new("old.txt")));
+        assert!(view.selection.is_selected(OsStr::new("new.txt")));
+
+        let (_, event) = view.update(Message::WatchRefreshed(
+            Location::local("/home"),
+            vec![(OsString::from("new.txt"), Some(file("new.txt")))],
+        ));
+        assert!(event.is_none());
+        assert!(view.entries.contains(&file("new.txt")));
+        assert!(view.selection.is_selected(OsStr::new("new.txt")));
+    }
+
+    #[test]
+    fn watch_changed_refreshes_an_existing_entrys_metadata() {
+        let mut view = listed_view(vec![file("a")]);
+        let mut updated = file("a");
+        updated.size = 999;
+
+        let _ = view.apply_watch_events_for_test(vec![DirEvent::Changed(OsString::from("a"))]);
+        let (_, event) = view.update(Message::WatchRefreshed(
+            Location::local("/home"),
+            vec![(OsString::from("a"), Some(updated.clone()))],
+        ));
+        assert!(event.is_none());
+        assert_eq!(view.entries, vec![updated]);
+    }
+
+    #[test]
+    fn watch_overflow_falls_back_to_a_full_reload_and_drops_the_rest_of_the_batch() {
+        let mut view = listed_view(vec![file("a")]);
+        assert!(!view.is_loading());
+
+        let _ = view.apply_watch_events_for_test(vec![
+            DirEvent::Created(OsString::from("b")),
+            DirEvent::Overflow,
+        ]);
+        // `load()` sets `loading` synchronously, before its `Task` resolves
+        // — the same signal `Action::Refresh`'s own test checks.
+        assert!(view.is_loading());
+    }
+
+    #[test]
+    fn watch_refreshed_for_a_stale_location_is_dropped() {
+        let mut view = listed_view(vec![file("a")]);
+        let _ = view.navigate(Location::local("/elsewhere"));
+
+        let (_, event) = view.update(Message::WatchRefreshed(
+            Location::local("/home"),
+            vec![(OsString::from("stale"), Some(file("stale")))],
+        ));
+        assert!(event.is_none());
+        assert!(!view.entries.iter().any(|e| e.name == "stale"));
+    }
+
+    #[test]
+    fn watch_refreshed_removes_an_entry_that_vanished_before_the_fetch_landed() {
+        let mut view = listed_view(vec![file("a")]);
+        let _ = view.update(Message::WatchRefreshed(
+            Location::local("/home"),
+            vec![(OsString::from("a"), None)],
+        ));
+        assert!(!view.entries.iter().any(|e| e.name == "a"));
+    }
+
     impl DirectoryView {
         /// Test-only shim: `apply_action` is private (only reached via
         /// `Message::Keyboard` normally), but driving it directly keeps
         /// these tests from having to fabricate `iced::keyboard::Event`s.
         fn apply_action_for_test(&mut self, action: Action) -> (Task<Message>, Option<Event>) {
             self.apply_action(action)
+        }
+
+        /// Test-only shim: `apply_watch_events` is private (only reached
+        /// via `Message::Watch` normally), but driving it directly keeps
+        /// these tests from having to build a real `watch::subscription`
+        /// stream (which needs a live tokio runtime and a real inotify
+        /// watch — exercised instead by `modules::local`'s own temp-dir
+        /// tests and the stage's manual done-criterion).
+        fn apply_watch_events_for_test(&mut self, events: Vec<DirEvent>) -> Task<Message> {
+            self.apply_watch_events(events)
         }
     }
 }

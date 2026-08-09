@@ -93,6 +93,24 @@ tokio = "1"
 # pins the version this crate's code actually names in `use` paths.
 futures = "0.3"
 
+# `LocalBackend::watch()` (Stage 5, src/modules/local.rs) — the inotify
+# backend CLAUDE.md's "signal, never poll" rule calls for on Linux local
+# watching. Surveyed 2026-08-09: `notify` (cross-platform, wraps inotify/
+# FSEvents/ReadDirectoryChangesW behind one trait) was the obvious
+# alternative, and ships its own debouncer (`notify-debouncer-mini`) that
+# would have done this stage's MOVED_FROM/TO cookie-pairing for us — but
+# Saola only ever runs on Linux (niri is Wayland-only, see this crate's
+# top-level docs), so the cross-platform abstraction buys nothing, and its
+# `Event` type doesn't expose the raw rename `cookie` this stage's pairing
+# logic reads directly. `inotify` (hannobraun's crate) is the thin,
+# idiomatic wrapper CLAUDE.md's own wording ("inotify for local watching")
+# points at: `Event::cookie` and `EventMask::Q_OVERFLOW` are both
+# first-class, and its default `stream` feature bridges to the *existing*
+# shared tokio runtime's `AsyncFd`/timer drivers (iced_futures already
+# turns on tokio's `rt`/`rt-multi-thread`/`time`; `stream` only adds `net`
+# for `AsyncFd` — no second runtime, per CLAUDE.md's "one async runtime").
+inotify = "0.11"
+
 [dev-dependencies]
 # `modules::local`'s unit tests call `LocalBackend` methods directly (not
 # through `iced::Task`), so they need *some* live Tokio runtime for
