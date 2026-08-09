@@ -90,6 +90,11 @@ pub enum Action {
     /// Shift+Delete: always a permanent delete, regardless of
     /// `Caps::TRASH`.
     PermanentDelete,
+
+    // ── Stage 10: undo ────────────────────────────────────────────────────
+    /// Ctrl+Z: pop and invert the most recent invertible op — see
+    /// `core::fs::undo`'s module doc comment for exactly what's invertible.
+    Undo,
 }
 
 /// Resolve one key press into an [`Action`], or `None` if this module
@@ -112,6 +117,7 @@ pub fn resolve(key: &Key, modifiers: Modifiers) -> Option<Action> {
                 "c" => return Some(Action::Copy),
                 "x" => return Some(Action::Cut),
                 "v" => return Some(Action::Paste),
+                "z" => return Some(Action::Undo),
                 _ => {}
             }
         }
@@ -251,10 +257,11 @@ mod tests {
     #[test]
     fn unmapped_keys_resolve_to_none() {
         assert_eq!(resolve(&named(Named::Tab), Modifiers::empty()), None);
-        // "x" is Ctrl+X (Cut) as of Stage 8 — "z" is still unmapped, and
-        // still proves the same thing this test always has (an ordinary
-        // Ctrl+<letter> with no binding falls through to `None`).
-        assert_eq!(resolve(&Key::Character("z".into()), Modifiers::CTRL), None);
+        // "x"/"z" are Ctrl+X (Cut)/Ctrl+Z (Undo) as of Stage 8/10 — "q" is
+        // still unmapped, and still proves the same thing this test always
+        // has (an ordinary Ctrl+<letter> with no binding falls through to
+        // `None`).
+        assert_eq!(resolve(&Key::Character("q".into()), Modifiers::CTRL), None);
     }
 
     #[test]
@@ -369,6 +376,16 @@ mod tests {
         assert_eq!(
             resolve(&named(Named::Delete), Modifiers::SHIFT),
             Some(Action::PermanentDelete)
+        );
+    }
+
+    // ── Stage 10: undo ────────────────────────────────────────────────────
+
+    #[test]
+    fn ctrl_z_undoes() {
+        assert_eq!(
+            resolve(&Key::Character("z".into()), Modifiers::CTRL),
+            Some(Action::Undo)
         );
     }
 }

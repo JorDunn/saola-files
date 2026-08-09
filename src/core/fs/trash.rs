@@ -199,7 +199,12 @@ pub fn delete_permanently(path: &Path) -> Result<(), VfsError> {
 
 // ── Testable cores (env-free — see each public wrapper above) ─────────────
 
-fn trash_into(path: &Path, home_trash: &Path) -> Result<TrashId, VfsError> {
+/// `pub(crate)`, not private: `core::fs::undo`'s own temp-dir tests reuse
+/// this exact testable core to produce a real `TrashId` to restore
+/// (Stage 10) — the alternative would be touching the real `$HOME` trash
+/// via the public [`trash`] wrapper, which CLAUDE.md's "never
+/// `std::env::set_var` in a test" rule rules out redirecting.
+pub(crate) fn trash_into(path: &Path, home_trash: &Path) -> Result<TrashId, VfsError> {
     let target = resolve_trash_target(path, home_trash)?;
     let name = path.file_name().ok_or_else(|| VfsError::Other {
         message: format!("{} has no file name to trash", path.display()),

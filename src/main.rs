@@ -1,11 +1,12 @@
 //! saola-files — the file manager for the Saola desktop environment.
 //!
-//! Current scope (through Stage 8): the application shell (Stage 1), CLI
+//! Current scope (through Stage 10): the application shell (Stage 1), CLI
 //! parsing and `files.toml` loading (Stage 2), real directory browsing
 //! through a VFS `Backend` trait and a local backend, navigation chrome
 //! and live updates (Stages 4–5), mime/icons/opening (Stage 6), the places
-//! sidebar (Stage 7), and now copy/move/rename/new-folder/new-file with
-//! live progress and conflict prompts (Stage 8).
+//! sidebar (Stage 7), copy/move/rename/new-folder/new-file with live
+//! progress and conflict prompts (Stage 8), Trash (Stage 9), and now a
+//! session undo stack plus foreign (Wayland) clipboard interop (Stage 10).
 //!
 //! This binary is a thin shell over the `saola_files` library crate
 //! (`src/lib.rs`) — see that file's docs for why the split exists.
@@ -15,7 +16,8 @@ use std::path::PathBuf;
 use iced::{Element, Fill, Size, Subscription, Task, window};
 use saola_theme::{Theme, convert};
 
-use core::fs::ops;
+use core::clipboard_interop;
+use core::fs::{ops, undo};
 use core::vfs::Location;
 use saola_files::{cli, config, core, modules, ui};
 
@@ -91,6 +93,25 @@ enum Message {
     /// `ui::trashview`'s module doc comment): it's a separate top-level
     /// surface `App` swaps in for the explorer body, not a child of it.
     Trash(ui::trashview::Message),
+    /// The undo toast's own tick/button messages (Stage 10) — same
+    /// top-level status as `Progress`/`Conflict`, for the same reason
+    /// (`ui::dialogs::undo_toast` isn't part of `ui::explorer`'s portal
+    /// seam either).
+    UndoToast(ui::dialogs::undo_toast::Message),
+    /// A best-effort foreign-clipboard read (`core::clipboard_interop::
+    /// read`) came back with something to paste — `Event::PasteRequested`'s
+    /// fallback path when the internal clipboard is empty (Stage 10). Carries
+    /// the same `(op, locations, dest_dir)` shape `Self::start_paste`
+    /// already builds an `ops::OpRequest` from for the internal-clipboard
+    /// case; see `Self::submit_paste_op`, which both paths funnel through.
+    ForeignPasteReady(ops::ClipboardOp, Vec<Location>, Location),
+    /// `Self::start_delete`'s trash branch succeeded (Stage 10): `original`
+    /// is where the item was before, `TrashId` is everything
+    /// `core::fs::trash::restore` needs to undo it — see the free function
+    /// `delete_one`'s doc comment. Never fired for a permanent delete
+    /// (nothing to undo) or a failure (worded to stderr instead, same as
+    /// before this stage).
+    Trashed(Location, core::fs::trash::TrashId),
     /// Swallows a click on the conflict dialog's modal scrim — the dialog
     /// must be answered via one of its three buttons, never dismissed by
     /// clicking outside it (there is no sane default resolution to assume).
@@ -170,6 +191,28 @@ struct App {
     /// still pointed at whatever it was showing before, and switching back
     /// out shows exactly that again.
     trash_active: bool,
+    /// The session undo stack (Stage 10) — a shared cache like
+    /// `clipboard`/`op_ids`, never per-view (CLAUDE.md). See
+    /// `core::fs::undo`'s module doc comment for exactly what's pushed and
+    /// what's a dead end.
+    undo_stack: undo::UndoStack,
+    /// Set to `true` the moment the *currently running* op reports even
+    /// one `OpEvent::Conflict` — `Self::handle_op_event`'s `Finished` arm
+    /// reads this to decide whether the just-finished op is safe to push
+    /// onto `undo_stack` at all (see `core::fs::undo`'s module doc comment,
+    /// "a Move that hit even one conflict prompt is never pushed"). Reset
+    /// to `false` every time `Self::submit_paste_op` starts a fresh op —
+    /// this is deliberately *not* part of `active_op`/`OpRequest` itself
+    /// (which is `Clone`d out to the progress subscription and has no
+    /// natural place for one-shot bookkeeping like this).
+    active_op_had_conflict: bool,
+    /// The undo toast currently fading in/showing/fading out in the ops
+    /// strip, if any — `Self::push_undo` sets this every time it pushes
+    /// onto `undo_stack`, so it always reflects the current top of the
+    /// stack (see `undo::UndoStack::peek_label`'s own doc comment on why
+    /// that invariant needs no extra bookkeeping to hold: undoing always
+    /// pops *and* clears this together, in `Self::start_undo`).
+    undo_toast: Option<ui::dialogs::undo_toast::Toast>,
 }
 
 /// See `App::pending_conflict`'s doc comment.
@@ -236,6 +279,9 @@ impl App {
             pending_conflict: None,
             trash_view: ui::trashview::TrashView::new(config.confirm_empty_trash),
             trash_active: false,
+            undo_stack: undo::UndoStack::new(),
+            active_op_had_conflict: false,
+            undo_toast: None,
         };
         (
             app,
@@ -284,6 +330,26 @@ impl App {
             }
             Message::Noop => Task::none(),
             Message::Trash(inner) => trash_task(self.trash_view.update(inner)),
+            Message::UndoToast(ui::dialogs::undo_toast::Message::UndoClicked) => self.start_undo(),
+            Message::UndoToast(ui::dialogs::undo_toast::Message::Tick) => {
+                if let Some(toast) = &self.undo_toast
+                    && toast.expired(&self.theme, std::time::Instant::now())
+                {
+                    self.undo_toast = None;
+                }
+                Task::none()
+            }
+            Message::ForeignPasteReady(op, locations, dest_dir) => {
+                let kind = match op {
+                    ops::ClipboardOp::Copy => ops::OpKind::Copy,
+                    ops::ClipboardOp::Cut => ops::OpKind::Move,
+                };
+                self.submit_paste_op(kind, locations, dest_dir)
+            }
+            Message::Trashed(original, id) => {
+                self.push_undo(undo::UndoEntry::Trash { id, original });
+                Task::none()
+            }
         }
     }
 
@@ -323,6 +389,7 @@ impl App {
                 }
             }
             ops::OpEvent::Conflict { conflict, reply } => {
+                self.active_op_had_conflict = true;
                 self.pending_conflict = Some(PendingConflict {
                     conflict,
                     reply,
@@ -336,9 +403,38 @@ impl App {
                 for (location, err) in &errors {
                     eprintln!("saola-files: {location}: {err}");
                 }
+
+                // Stage 10: a clean (zero-conflict) Move is undo-able —
+                // see `core::fs::undo`'s module doc comment for exactly
+                // why a conflict-touched op is excluded wholesale rather
+                // than partially reconstructed. `had_conflict` is read
+                // into a local first so this closure doesn't need to
+                // borrow `self` a second way while `self.active_op` is
+                // already borrowed below.
+                let had_conflict = self.active_op_had_conflict;
+                let move_undo = self.active_op.as_ref().and_then(|request| {
+                    if request.kind != ops::OpKind::Move || had_conflict {
+                        return None;
+                    }
+                    let pairs: Vec<(Location, Location)> = request
+                        .sources
+                        .iter()
+                        .filter(|source| !errors.iter().any(|(loc, _)| loc == *source))
+                        .filter_map(|source| {
+                            let name = source.path.file_name()?;
+                            let to = request.dest_dir.join(name);
+                            undo::can_undo_rename(source, &to).then(|| (source.clone(), to))
+                        })
+                        .collect();
+                    (!pairs.is_empty()).then_some(undo::UndoEntry::Move { pairs })
+                });
+
                 self.active_op = None;
                 self.active_op_progress = None;
                 self.pending_conflict = None;
+                if let Some(entry) = move_undo {
+                    self.push_undo(entry);
+                }
             }
             ops::OpEvent::Cancelled => {
                 self.active_op = None;
@@ -364,37 +460,105 @@ impl App {
         });
     }
 
-    /// `Event::PasteRequested`'s handling: builds and submits an
-    /// [`ops::OpRequest`] from the clipboard's current contents into
-    /// `dest_dir`. A paste with an empty clipboard, or while another op is
-    /// already running, is a silent no-op — Stage 8 deliberately doesn't
-    /// queue a second op (see the Stage 8 handoff for what a real queue
-    /// would need); the context menu's Paste row is already hidden when
-    /// the clipboard is empty (`ui::menus`' `clipboard_has_contents`), so
-    /// the only way to hit the empty case is the Ctrl+V keyboard shortcut.
+    /// `Event::PasteRequested`'s handling: the internal clipboard
+    /// (`core::fs::ops::Clipboard`, "authoritative" per CLAUDE.md) wins
+    /// when it has contents; an *empty* internal clipboard falls back to a
+    /// best-effort read of the foreign (Wayland) clipboard (Stage 10) —
+    /// `core::clipboard_interop::read`, which never blocks this call (it's
+    /// dispatched as its own `Task::perform`, landing later as
+    /// `Message::ForeignPasteReady`) and never fails loudly (a foreign
+    /// read that finds nothing, or can't reach a compositor at all, just
+    /// resolves to `Message::Noop` — the same silent no-op an empty
+    /// internal clipboard already was before this stage). While another op
+    /// is already running, both paths are a no-op — Stage 8 deliberately
+    /// doesn't queue a second op (see the Stage 8 handoff for what a real
+    /// queue would need).
     fn start_paste(&mut self, dest_dir: Location) -> Task<Message> {
         if self.active_op.is_some() {
             return Task::none();
         }
-        let Some(clipboard_op) = self.clipboard.op() else {
-            return Task::none();
-        };
-        let sources = self.clipboard.locations().to_vec();
-        if sources.is_empty() {
-            return Task::none();
+        if let Some(clipboard_op) = self.clipboard.op() {
+            let sources = self.clipboard.locations().to_vec();
+            if !sources.is_empty() {
+                let kind = match clipboard_op {
+                    ops::ClipboardOp::Copy => ops::OpKind::Copy,
+                    ops::ClipboardOp::Cut => ops::OpKind::Move,
+                };
+                if clipboard_op == ops::ClipboardOp::Cut {
+                    self.clipboard.clear();
+                }
+                return self.submit_paste_op(kind, sources, dest_dir);
+            }
         }
 
-        let kind = match clipboard_op {
-            ops::ClipboardOp::Copy => ops::OpKind::Copy,
-            ops::ClipboardOp::Cut => ops::OpKind::Move,
-        };
+        Task::perform(clipboard_interop::read(), move |foreign| match foreign {
+            Some(clipboard_interop::ForeignClipboard { op, locations })
+                if !locations.is_empty() =>
+            {
+                Message::ForeignPasteReady(op, locations, dest_dir)
+            }
+            _ => Message::Noop,
+        })
+    }
+
+    /// Builds and submits the actual [`ops::OpRequest`] — the tail end
+    /// both `Self::start_paste`'s internal-clipboard path and
+    /// `Message::ForeignPasteReady`'s foreign-clipboard path funnel
+    /// through, so there is exactly one place an op is ever actually
+    /// started from a paste (Stage 10). Re-checks `active_op.is_some()`
+    /// (already checked once in `start_paste`, before the foreign-read
+    /// `Task` was even dispatched) because a foreign read is asynchronous:
+    /// another paste — or any other op — could have started in the
+    /// meantime.
+    fn submit_paste_op(
+        &mut self,
+        kind: ops::OpKind,
+        sources: Vec<Location>,
+        dest_dir: Location,
+    ) -> Task<Message> {
+        if self.active_op.is_some() || sources.is_empty() {
+            return Task::none();
+        }
         let id = self.op_ids.alloc();
+        self.active_op_had_conflict = false;
         self.active_op = Some(ops::OpRequest::new(id, kind, sources, dest_dir));
-
-        if clipboard_op == ops::ClipboardOp::Cut {
-            self.clipboard.clear();
-        }
         Task::none()
+    }
+
+    /// Pushes `entry` onto the undo stack and (re)seeds the undo toast
+    /// from its label — every push call site in this file goes through
+    /// this one method rather than touching `undo_stack`/`undo_toast`
+    /// separately, keeping `undo_toast`'s "always reflects the current
+    /// top of the stack" invariant (see `App::undo_toast`'s own doc
+    /// comment) in exactly one place.
+    fn push_undo(&mut self, entry: undo::UndoEntry) {
+        let label = entry.label();
+        self.undo_stack.push(entry);
+        self.undo_toast = Some(ui::dialogs::undo_toast::Toast::new(
+            label,
+            std::time::Instant::now(),
+        ));
+    }
+
+    /// Ctrl+Z / the undo toast's own "Undo" button: pops the most recent
+    /// invertible entry and inverts it. Pops *before* the async `apply`
+    /// call starts (see `undo::UndoStack::pop`'s doc comment — there is no
+    /// redo to put a failed entry back for) and clears `undo_toast`
+    /// unconditionally, since whatever it was showing is necessarily the
+    /// entry just popped (`Self::push_undo`'s invariant). A failure is
+    /// worded to stderr, the same posture every other backend failure in
+    /// this file already takes.
+    fn start_undo(&mut self) -> Task<Message> {
+        let Some(entry) = self.undo_stack.pop() else {
+            return Task::none();
+        };
+        self.undo_toast = None;
+        Task::perform(undo::apply(entry), |result| {
+            if let Err(err) = result {
+                eprintln!("saola-files: couldn't undo: {err}");
+            }
+            Message::Noop
+        })
     }
 
     /// Navigates the active `DirectoryView` to `location` — the shared
@@ -476,17 +640,28 @@ impl App {
                 Task::none()
             }
             ui::dirview::Event::CopyRequested(locations) => {
-                self.clipboard.set_copy(locations);
-                Task::none()
+                self.clipboard.set_copy(locations.clone());
+                write_foreign_clipboard(ops::ClipboardOp::Copy, locations)
             }
             ui::dirview::Event::CutRequested(locations) => {
-                self.clipboard.set_cut(locations);
-                Task::none()
+                self.clipboard.set_cut(locations.clone());
+                write_foreign_clipboard(ops::ClipboardOp::Cut, locations)
             }
             ui::dirview::Event::PasteRequested(dest_dir) => self.start_paste(dest_dir),
             ui::dirview::Event::DeleteRequested(locations, mode) => {
                 self.start_delete(locations, mode)
             }
+            ui::dirview::Event::Renamed(from, to) => {
+                if undo::can_undo_rename(&from, &to) {
+                    self.push_undo(undo::UndoEntry::Rename { from, to });
+                }
+                Task::none()
+            }
+            ui::dirview::Event::Created(created) => {
+                self.push_undo(undo::UndoEntry::New { created });
+                Task::none()
+            }
+            ui::dirview::Event::UndoRequested => self.start_undo(),
         }
     }
 
@@ -522,11 +697,18 @@ impl App {
         let tasks: Vec<Task<Message>> = locations
             .into_iter()
             .map(|location| {
-                Task::perform(delete_one(location, force_permanent), |result| {
-                    if let Err((location, err)) = result {
-                        eprintln!("saola-files: couldn't delete {location}: {err}");
+                let original = location.clone();
+                Task::perform(delete_one(location, force_permanent), move |result| {
+                    match result {
+                        // Stage 10: a trash-delete is undo-able — see
+                        // `Message::Trashed`'s doc comment.
+                        Ok(Some(id)) => Message::Trashed(original, id),
+                        Ok(None) => Message::Noop,
+                        Err((location, err)) => {
+                            eprintln!("saola-files: couldn't delete {location}: {err}");
+                            Message::Noop
+                        }
                     }
-                    Message::Noop
                 })
             })
             .collect();
@@ -610,7 +792,14 @@ impl App {
             .map(|request| ui::dialogs::progress::subscription(request).map(Message::OpEvent))
             .unwrap_or_else(Subscription::none);
 
-        Subscription::batch([keyboard, watch, mounts, ops])
+        // Stage 10: the undo toast's fade tick, gated to only run while a
+        // toast is actually showing — CLAUDE.md's "nothing ticks without a
+        // documented exception" (see `ui::dialogs::undo_toast`'s own
+        // module doc comment for this exception's reasoning).
+        let undo_toast = ui::dialogs::undo_toast::subscription(self.undo_toast.is_some())
+            .map(Message::UndoToast);
+
+        Subscription::batch([keyboard, watch, mounts, ops, undo_toast])
     }
 
     fn theme(&self) -> iced::Theme {
@@ -663,15 +852,30 @@ impl App {
 
         // Stage 8: the ops strip, stacked below the explorer body (a
         // persistent bar, not a popover) whenever a copy/move is running.
-        let with_progress: Element<'_, Message> = match &self.active_op_progress {
-            Some(progress) => iced::widget::column![
+        // Stage 10: the undo toast takes the exact same footer position
+        // whenever *no* op is running but an undo-able one just finished —
+        // the two are mutually exclusive (an op finishing is what clears
+        // `active_op_progress` and, in the same `handle_op_event` call,
+        // sets `undo_toast`), so at most one of these two strips is ever
+        // showing at once, never both stacked.
+        let with_progress: Element<'_, Message> = match (&self.active_op_progress, &self.undo_toast)
+        {
+            (Some(progress), _) => iced::widget::column![
                 body,
                 ui::dialogs::progress::view(t, progress).map(Message::Progress),
             ]
             .width(Fill)
             .height(Fill)
             .into(),
-            None => body,
+            (None, Some(toast)) => iced::widget::column![
+                body,
+                ui::dialogs::undo_toast::view(t, toast, std::time::Instant::now())
+                    .map(Message::UndoToast),
+            ]
+            .width(Fill)
+            .height(Fill)
+            .into(),
+            (None, None) => body,
         };
 
         // The conflict dialog is a true modal: stacked over everything
@@ -726,6 +930,24 @@ fn trash_task(task: Task<ui::trashview::Message>) -> Task<Message> {
     task.map(Message::Trash)
 }
 
+/// `Event::CopyRequested`/`CutRequested`'s foreign-clipboard half (Stage
+/// 10): writes `locations` to the Wayland clipboard alongside the
+/// existing `self.clipboard.set_copy`/`set_cut` call that already updates
+/// this app's *internal* clipboard. A free function (not an `App` method)
+/// since it touches no `App` state — plain `Task::perform` composition,
+/// the same shape `directory_task`/`trash_task` already use. A failure
+/// (most commonly: no Wayland compositor) is worded to stderr; this app's
+/// own internal clipboard/paste already worked before this stage existed
+/// and keeps working regardless of whether this succeeds.
+fn write_foreign_clipboard(op: ops::ClipboardOp, locations: Vec<Location>) -> Task<Message> {
+    Task::perform(clipboard_interop::write(op, locations), |result| {
+        if let Err(err) = result {
+            eprintln!("saola-files: couldn't update the system clipboard: {err}");
+        }
+        Message::Noop
+    })
+}
+
 /// One location's half of `App::start_delete`: trashes it when its
 /// backend claims `Caps::TRASH` and `force_permanent` wasn't requested
 /// (Shift+Delete), permanently deletes it otherwise. Local-only for now on
@@ -736,7 +958,16 @@ fn trash_task(task: Task<ui::trashview::Message>) -> Task<Message> {
 /// Stage 13): deleting a non-empty remote directory that way would fail
 /// rather than recurse. No such backend exists yet, so this isn't
 /// reachable today — flagged here for whichever stage adds one.
-async fn delete_one(location: Location, force_permanent: bool) -> Result<(), (Location, String)> {
+/// **Stage 10 change:** returns `Ok(Some(TrashId))` for a successful trash
+/// (was `Ok(())`) so `start_delete` can carry it back as `Message::Trashed`
+/// for `App::push_undo` — the hook point the Stage 9 handoff named
+/// ("currently the `TrashId` is discarded with `.map(|_id| ())`"). A
+/// permanent delete (either branch) still has nothing to undo, so it stays
+/// `Ok(None)`.
+async fn delete_one(
+    location: Location,
+    force_permanent: bool,
+) -> Result<Option<core::fs::trash::TrashId>, (Location, String)> {
     let Some(backend) = modules::resolve(&location.scheme) else {
         return Err((
             location.clone(),
@@ -748,16 +979,18 @@ async fn delete_one(location: Location, force_permanent: bool) -> Result<(), (Lo
     if location.is_local() && !force_permanent && caps.contains(core::vfs::Caps::TRASH) {
         let path = location.path.clone();
         return core::fs::trash::trash(&path)
-            .map(|_id| ())
+            .map(Some)
             .map_err(|err| (location.clone(), err.to_string()));
     }
     if location.is_local() {
         let path = location.path.clone();
         return core::fs::trash::delete_permanently(&path)
+            .map(|()| None)
             .map_err(|err| (location.clone(), err.to_string()));
     }
     backend
         .remove(&location)
         .await
+        .map(|()| None)
         .map_err(|err| (location.clone(), err.to_string()))
 }

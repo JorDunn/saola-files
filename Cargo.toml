@@ -143,6 +143,33 @@ xdg-mime = "0.4"
 # same dependency.
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 
+# `core::clipboard_interop` (Stage 10) — writing `text/uri-list` +
+# `x-special/gnome-copied-files` on copy/cut, and a best-effort read on
+# paste, so a plain Ctrl+C in this app pastes into Nautilus/Dolphin/etc.
+# and vice versa. Surveyed 2026-08-09: `arboard` (the usual cross-platform
+# clipboard crate) has no concept of file-list MIME types at all — it's
+# text/image only, and this app needs to offer/parse two specific,
+# file-manager-shaped MIME payloads, not generic clipboard text. Hand-rolling
+# the Wayland `wlr-data-control`/`ext-data-control` protocol bindings
+# directly (`wayland-client` + `wayland-protocols-wlr`) is what
+# `wl-clipboard-rs` already *is* — it's the crate the `wl-copy`/`wl-paste`
+# CLI tools themselves are built on (same author), it exposes exactly the
+# multi-MIME-source `copy_multi`/MIME-filtered `get_contents` shape this
+# module needs, and it's already resident in this machine's cargo registry
+# cache at 0.9.3 (no new download). **Unconditional, not feature-gated**:
+# `--no-default-features` only elides *remote protocol* backends (the
+# `sftp` feature) — desktop clipboard interop is exactly as fundamental a
+# local-desktop concern as inotify watching (`inotify`, above) or mount
+# discovery (`zbus`, above), both already unconditional dependencies, so
+# gating this one differently would be an arbitrary inconsistency. It talks
+# to the compositor over `$WAYLAND_DISPLAY` at *runtime* only — building
+# this crate (including in a headless CI sandbox with no compositor at all)
+# never touches Wayland, and every call site wraps it in `spawn_blocking`
+# with the failure path (`ConnectError::NoCompositor` when unset/absent)
+# turned into an ordinary `Result`, never a panic — see
+# `core::clipboard_interop`'s own module doc comment.
+wl-clipboard-rs = "0.9"
+
 [dev-dependencies]
 # `modules::local`'s unit tests call `LocalBackend` methods directly (not
 # through `iced::Task`), so they need *some* live Tokio runtime for

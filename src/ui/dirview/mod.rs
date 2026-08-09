@@ -237,6 +237,26 @@ pub enum Event {
     /// `DeleteMode::Permanent`, which always skips the trash regardless of
     /// capability — see [`DeleteMode`]'s doc comment.
     DeleteRequested(Vec<Location>, DeleteMode),
+    /// A successful inline rename (F2 / "Rename…") just landed: `from` is
+    /// where the entry was, `to` is where it is now (Stage 10). Bubbled
+    /// purely so `App` can push a `core::fs::undo::UndoEntry::Rename` onto
+    /// its (App-owned, not per-view — CLAUDE.md) undo stack; this view
+    /// already applied the rename to its own `entries`/`selection` before
+    /// this fires (`Message::RenameResult`'s `Ok` arm), so nothing here
+    /// changes what's on screen.
+    Renamed(Location, Location),
+    /// A successful New Folder/New File (Ctrl+Shift+N / the context menu)
+    /// just landed at `Location` (Stage 10) — the undo counterpart to
+    /// [`Event::Renamed`], pushing a `core::fs::undo::UndoEntry::New`.
+    Created(Location),
+    /// Ctrl+Z: pop and invert the most recent invertible op. Bubbled
+    /// rather than handled here because the undo stack itself is
+    /// App-owned, shared state (CLAUDE.md: "Shared caches … live on the
+    /// App, never per-view") — this view never sees an `UndoEntry` at all,
+    /// the same "just ask the owner" shape `Event::DeleteRequested` uses
+    /// for the shared clipboard/ops-engine state it can't touch directly
+    /// either.
+    UndoRequested,
 }
 
 /// Whether a `DeleteRequested` should try the trash first, or always skip
@@ -953,18 +973,23 @@ impl DirectoryView {
                     Ok(()) => {
                         if let Some(state) = self.rename.take() {
                             let new_name = OsString::from(state.buffer.trim());
+                            let from = dir_location.join(&old_name);
+                            let to = dir_location.join(&new_name);
                             self.rename_entry_by_name(&old_name, new_name.clone());
                             self.selection.rename(&old_name, new_name);
                             self.recompute_visible();
+                            (Task::none(), Some(Event::Renamed(from, to)))
+                        } else {
+                            (Task::none(), None)
                         }
                     }
                     Err(err) => {
                         if let Some(state) = self.rename.as_mut() {
                             state.error = Some(err.to_string());
                         }
+                        (Task::none(), None)
                     }
                 }
-                (Task::none(), None)
             }
             Message::CreateResult(dir_location, name, result) => {
                 if dir_location != self.location {
@@ -972,9 +997,10 @@ impl DirectoryView {
                 }
                 match result {
                     Ok(()) => {
+                        let created = dir_location.join(&name);
                         self.pending_select = Some(name);
                         self.pending_rename = true;
-                        (self.load(), None)
+                        (self.load(), Some(Event::Created(created)))
                     }
                     Err(err) => {
                         eprintln!(
@@ -1288,6 +1314,9 @@ impl DirectoryView {
                     Some(Event::DeleteRequested(targets, DeleteMode::Permanent)),
                 )
             }
+
+            // ── Stage 10: undo ────────────────────────────────────────────
+            Action::Undo => (Task::none(), Some(Event::UndoRequested)),
         }
     }
 
@@ -2385,7 +2414,15 @@ mod tests {
             OsString::from("a"),
             Ok(()),
         ));
-        assert!(event.is_none());
+        // Stage 10: a successful rename bubbles `Event::Renamed` so `App`
+        // can push it onto the undo stack.
+        match event {
+            Some(Event::Renamed(from, to)) => {
+                assert_eq!(from, Location::local("/home/a"));
+                assert_eq!(to, Location::local("/home/a-renamed"));
+            }
+            other => panic!("expected Renamed, got {other:?}"),
+        }
         assert!(view.rename_state().is_none());
         assert!(view.entries.iter().any(|e| e.name == "a-renamed"));
         assert!(!view.entries.iter().any(|e| e.name == "a"));
@@ -2423,7 +2460,14 @@ mod tests {
             OsString::from("New Folder"),
             Ok(()),
         ));
-        assert!(event.is_none());
+        // Stage 10: a successful create bubbles `Event::Created` so `App`
+        // can push it onto the undo stack.
+        match event {
+            Some(Event::Created(created)) => {
+                assert_eq!(created, Location::local("/home/New Folder"));
+            }
+            other => panic!("expected Created, got {other:?}"),
+        }
         assert!(view.is_loading());
 
         // The reload lands, carrying the freshly created entry.
