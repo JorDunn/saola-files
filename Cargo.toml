@@ -82,7 +82,14 @@ async-trait = "0.1"
 # transitively. No `rt-multi-thread`/other extra features requested here:
 # iced's own feature selection already provides the runtime this crate's
 # code calls into.
-tokio = "1"
+# `features = ["sync"]` added Stage 11: `core::thumbs::thumbnail_for` bounds
+# concurrent thumbnail generation with a `tokio::sync::Semaphore`
+# (CLAUDE.md: "never unbounded task spawns") — `Semaphore` lives behind
+# tokio's `sync` feature specifically, which nothing already enables
+# transitively (iced's own `tokio` feature only pulls in `iced_futures`'
+# executor integration, not `tokio::sync`), so this is requested explicitly
+# rather than relied on.
+tokio = { version = "1", features = ["sync"] }
 
 # `core::vfs::{ReadStream, WriteSink}` and the local backend's chunked
 # read/write (Stage 3) need `Stream`/`Sink`/`BoxStream` and a channel that
@@ -169,6 +176,30 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 # turned into an ordinary `Result`, never a panic — see
 # `core::clipboard_interop`'s own module doc comment.
 wl-clipboard-rs = "0.9"
+
+# `core::thumbs` (Stage 11) — decoding a source image and resizing it down
+# to a thumbnail. Surveyed 2026-08-09: already resident transitively at
+# 0.25.10 (`iced`'s own `image` feature — see the `iced` entry above —
+# pulls it in for `iced::widget::image` to decode/display bytes with), so
+# this is just making that an explicit, versioned direct dependency rather
+# than relying on it staying available transitively; no new download, no
+# new version in the dependency graph. Default features (`default-formats`)
+# match what iced's own resolution already built, covering every common
+# raster format (jpeg/png/gif/webp/bmp/ico/tiff/…) a thumbnailer needs.
+image = "0.25"
+
+# `core::thumbs` (Stage 11) — writing the freedesktop thumbnail spec's
+# required `tEXt` metadata chunks (`Thumb::URI`/`Thumb::MTime`) and reading
+# them back to validate a cached entry. Surveyed 2026-08-09: `image`'s own
+# PNG encoder (`image::codecs::png`) has no API for writing arbitrary
+# `tEXt` chunks at all — it only encodes pixel data — so satisfying the
+# spec's metadata requirement needs the lower-level `png` crate directly,
+# which `Encoder::add_text_chunk`/`Decoder`'s `Info::uncompressed_latin1_
+# text` expose exactly what's needed. Already resident transitively at
+# 0.18.1 (`image`'s own `png` feature, part of its `default-formats`), so
+# — same as the `image` entry above — this is an explicit direct dependency
+# for a crate already in the resolved graph, not a new download.
+png = "0.18"
 
 [dev-dependencies]
 # `modules::local`'s unit tests call `LocalBackend` methods directly (not

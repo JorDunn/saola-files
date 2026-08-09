@@ -25,6 +25,7 @@ use saola_theme::Theme;
 
 use crate::core::apps::AppsDb;
 use crate::core::mime::MimeDb;
+use crate::core::thumbs::ThumbCache;
 use crate::ui::dirview::{self, DirectoryView};
 use crate::ui::header;
 use crate::ui::sidebar::{self, Sidebar};
@@ -43,10 +44,11 @@ pub enum Message {
 /// `DirectoryView`) with its toolbar, lifting messages into the caller's
 /// `M` via `map`.
 ///
-/// `mime_db`/`apps_db` are the App-level shared caches (CLAUDE.md: "Shared
-/// caches (thumbs, mime, apps, …) live on the App, never per-view"),
-/// threaded straight through to `active.view` for row glyph selection and
-/// the context menu/Open-with popover, never built or cached here.
+/// `mime_db`/`thumb_cache`/`apps_db` are the App-level shared caches
+/// (CLAUDE.md: "Shared caches (thumbs, mime, apps, …) live on the App,
+/// never per-view"), threaded straight through to `active.view` for row
+/// glyph/thumbnail selection and the context menu/Open-with popover, never
+/// built or cached here.
 /// `clipboard_has_contents` (Stage 8) is the same shape: `App` owns the
 /// actual `core::fs::ops::Clipboard`, this seam only ever reads a bool off
 /// it so the context menu's Paste row can be capability-honest about
@@ -59,11 +61,23 @@ pub enum Message {
 /// be `Copy`, so it can only be consumed once; the two `Message::Sidebar`/
 /// `Message::Directory` constructors used per-subtree are plain `Fn`s and
 /// have no such restriction.
+// Stage 11 pushed this from 7 params to 8 (`thumb_cache` joined the other
+// App-owned shared caches this seam threads straight through — see the
+// doc comment just below). `clippy::too_many_arguments`'s default
+// threshold is 7; every one of these is a distinct, differently-typed
+// shared cache or piece of render state this function's own doc comment
+// already explains the purpose of, so bundling them into a single
+// "context" struct would be indirection for its own sake (CLAUDE.md:
+// "prefer explicit code over clever abstraction") rather than a real
+// simplification — every call site would still have to name each field
+// individually to build it.
+#[allow(clippy::too_many_arguments)]
 pub fn view<'a, M: 'a>(
     theme: &'a Theme,
     sidebar: &'a Sidebar,
     active: &'a DirectoryView,
     mime_db: &'a MimeDb,
+    thumb_cache: &'a ThumbCache,
     apps_db: &'a AppsDb,
     clipboard_has_contents: bool,
     map: impl Fn(Message) -> M + 'a,
@@ -73,7 +87,7 @@ pub fn view<'a, M: 'a>(
 
     let directory: Element<'a, dirview::Message> = column![
         header::view(theme, active),
-        active.view(theme, mime_db, apps_db, clipboard_has_contents)
+        active.view(theme, mime_db, thumb_cache, apps_db, clipboard_has_contents)
     ]
     .width(Fill)
     .height(Fill)

@@ -11,7 +11,10 @@
 //! This binary is a thin shell over the `saola_files` library crate
 //! (`src/lib.rs`) — see that file's docs for why the split exists.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::SystemTime;
 
 use iced::{Element, Fill, Size, Subscription, Task, window};
 use saola_theme::{Theme, convert};
@@ -20,6 +23,24 @@ use core::clipboard_interop;
 use core::fs::{ops, undo};
 use core::vfs::Location;
 use saola_files::{cli, config, core, modules, ui};
+
+/// The App-owned decoded-thumbnail LRU's capacity (Stage 11 — CLAUDE.md's
+/// "~512-handle LRU"). A plain implementation constant, the same posture
+/// `modules::local`'s `CHANNEL_CAPACITY`/`WATCH_CHANNEL_CAPACITY` already
+/// take for their own bounded-resource sizes: not derived from the theme
+/// (it bounds a background cache, not anything rendered), not a config
+/// knob (nothing in `files.toml`'s documented shape covers it, and a
+/// wrong value here degrades gracefully — a smaller cache just means more
+/// re-decodes on scroll-back, never a correctness issue).
+const THUMB_LRU_CAPACITY: usize = 512;
+
+/// How many thumbnails may be generated concurrently (Stage 11 — CLAUDE.md:
+/// "never unbounded task spawns"). Small on purpose: thumbnail generation
+/// is blocking CPU work (image decode + resize) sharing the same blocking
+/// pool `modules::local`'s file I/O already uses; a handful at a time keeps
+/// a 5k-image directory's initial scroll responsive rather than saturating
+/// every blocking-pool thread with decode work at once.
+const THUMB_MAX_CONCURRENT: usize = 4;
 
 fn main() -> iced::Result {
     let invocation = match cli::parse(std::env::args_os().skip(1)) {
@@ -112,6 +133,15 @@ enum Message {
     /// (nothing to undo) or a failure (worded to stderr instead, same as
     /// before this stage).
     Trashed(Location, core::fs::trash::TrashId),
+    /// A background thumbnail generation (`core::thumbs::thumbnail_for`)
+    /// finished (Stage 11) — `location`/`modified` identify exactly which
+    /// request this answers (mirrors `Message::RenameResult`'s staleness-
+    /// guard shape, though here the guard is "is this still in
+    /// `thumb_inflight`", not a location comparison — see
+    /// `Self::request_thumbnails`'s doc comment). `None` means "no
+    /// thumbnail" — unsupported mimetype, decode failure, or the file
+    /// simply isn't local; the row keeps its glyph icon.
+    ThumbnailReady(Location, SystemTime, Option<core::thumbs::ThumbHandle>),
     /// Swallows a click on the conflict dialog's modal scrim — the dialog
     /// must be answered via one of its three buttons, never dismissed by
     /// clicking outside it (there is no sane default resolution to assume).
@@ -213,6 +243,47 @@ struct App {
     /// that invariant needs no extra bookkeeping to hold: undoing always
     /// pops *and* clears this together, in `Self::start_undo`).
     undo_toast: Option<ui::dialogs::undo_toast::Toast>,
+    /// The ~512-handle LRU of decoded thumbnails (Stage 11) — a shared
+    /// cache like `clipboard`/`undo_stack`, never per-view. See
+    /// `core::thumbs::ThumbCache`'s own doc comment for why it's keyed by
+    /// `(Location, mtime)` rather than `Location` alone.
+    thumb_cache: core::thumbs::ThumbCache,
+    /// The thumbnailer registry (Stage 11) — built once at startup, `Arc`'d
+    /// so `Self::request_thumbnails` can clone it cheaply into each
+    /// `Task::perform`'d generation.
+    thumb_registry: Arc<core::thumbs::Registry>,
+    /// Bounds concurrent thumbnail generation (Stage 11) — see
+    /// `THUMB_MAX_CONCURRENT`'s doc comment.
+    thumb_semaphore: Arc<tokio::sync::Semaphore>,
+    /// `$XDG_CACHE_HOME/thumbnails` (or `~/.cache/thumbnails`), resolved
+    /// once at startup — `None` when neither is derivable (no `$HOME`,
+    /// e.g. a minimal CI sandbox), in which case thumbnails are still
+    /// generated per-request but never persisted to disk (see
+    /// `core::thumbs::generate_blocking`'s handling of a `None` cache
+    /// root).
+    thumb_cache_root: Option<PathBuf>,
+    /// Locations with a generation request currently in flight (Stage 11)
+    /// — prevents `Self::request_thumbnails` from dispatching a second
+    /// generation for the same file while the first hasn't come back yet
+    /// (e.g. two `Scrolled` batches in a row both covering the same rows).
+    /// Cleared the moment `Message::ThumbnailReady` lands, success or not.
+    thumb_inflight: HashSet<Location>,
+    /// Locations known to have failed thumbnailing this session, keyed to
+    /// the exact `mtime` that failed (Stage 11) — a file that changes
+    /// (fresh `mtime`) gets a fresh attempt, but a file that fails
+    /// repeatedly at the *same* version isn't retried on every scroll.
+    /// **Not** the spec's persistent `fail/` cache directory (see
+    /// `core::thumbs`'s module doc comment's "Known gaps") — this resets
+    /// every app restart.
+    thumb_failed: HashMap<Location, SystemTime>,
+    /// `files.toml`'s `thumbnails` knob — `Self::request_thumbnails`'
+    /// first gate, checked before any of the more granular ones.
+    thumbnails_enabled: bool,
+    /// `files.toml`'s `thumbnail-max-mb` knob, unconverted — passed to
+    /// `core::thumbs::exceeds_max_size` at the point of use rather than
+    /// pre-multiplied into bytes here, so that pure predicate stays the
+    /// one place the MiB-to-bytes conversion happens.
+    thumbnail_max_mb: u64,
 }
 
 /// See `App::pending_conflict`'s doc comment.
@@ -282,6 +353,14 @@ impl App {
             undo_stack: undo::UndoStack::new(),
             active_op_had_conflict: false,
             undo_toast: None,
+            thumb_cache: core::thumbs::ThumbCache::new(THUMB_LRU_CAPACITY),
+            thumb_registry: Arc::new(core::thumbs::Registry::with_defaults()),
+            thumb_semaphore: Arc::new(tokio::sync::Semaphore::new(THUMB_MAX_CONCURRENT)),
+            thumb_cache_root: core::thumbs::resolve_cache_root(),
+            thumb_inflight: HashSet::new(),
+            thumb_failed: HashMap::new(),
+            thumbnails_enabled: config.thumbnails,
+            thumbnail_max_mb: config.thumbnail_max_mb,
         };
         (
             app,
@@ -348,6 +427,19 @@ impl App {
             }
             Message::Trashed(original, id) => {
                 self.push_undo(undo::UndoEntry::Trash { id, original });
+                Task::none()
+            }
+            Message::ThumbnailReady(location, modified, handle) => {
+                self.thumb_inflight.remove(&location);
+                match handle {
+                    Some(handle) => {
+                        self.thumb_cache.insert(location.clone(), modified, handle);
+                        self.thumb_failed.remove(&location);
+                    }
+                    None => {
+                        self.thumb_failed.insert(location, modified);
+                    }
+                }
                 Task::none()
             }
         }
@@ -662,7 +754,79 @@ impl App {
                 Task::none()
             }
             ui::dirview::Event::UndoRequested => self.start_undo(),
+            ui::dirview::Event::ThumbnailsNeeded(candidates) => self.request_thumbnails(candidates),
         }
+    }
+
+    /// `Event::ThumbnailsNeeded`'s handling (Stage 11): dispatches
+    /// background generation for viewport-visible candidates the view
+    /// bubbled up. Gated by `files.toml`'s `thumbnails`/`thumbnail-max-mb`
+    /// knobs here — `ui::dirview` has no `Config` after construction (see
+    /// `DirectoryView::new`'s own comment on why only a handful of
+    /// config-derived fields survive past startup), and `core::thumbs` has
+    /// no opinion on a UI-facing size cap of its own (see that module's
+    /// doc comment) — so this is the one place both gates actually apply.
+    /// Every dispatched location is tracked in `thumb_inflight` until its
+    /// `Message::ThumbnailReady` lands, so a second viewport batch
+    /// covering the same rows before the first finishes doesn't queue a
+    /// duplicate generation for it.
+    fn request_thumbnails(
+        &mut self,
+        candidates: Vec<ui::dirview::ThumbCandidate>,
+    ) -> Task<Message> {
+        if !self.thumbnails_enabled {
+            return Task::none();
+        }
+        let max_mb = self.thumbnail_max_mb;
+        // Two passes, deliberately: every `filter`/`filter_map` closure
+        // below only ever reads `self` (`thumb_cache`/`thumb_failed`/
+        // `thumb_inflight`/`mime_db`), but the dispatch loop after it needs
+        // to *mutate* `thumb_inflight` — one chained iterator expression
+        // can't hold both an immutable borrow (for the filters) and a
+        // mutable one (for the final step) live at the same time, since
+        // every closure in a single chain is constructed before any of
+        // them run. Collecting the filtered candidates first ends that
+        // immutable borrow before the mutating loop starts.
+        let filtered: Vec<(ui::dirview::ThumbCandidate, String)> = candidates
+            .into_iter()
+            .filter(|candidate| !core::thumbs::exceeds_max_size(candidate.size_bytes, max_mb))
+            .filter(|candidate| {
+                self.thumb_cache
+                    .get_for(&candidate.location, candidate.modified)
+                    .is_none()
+            })
+            .filter(|candidate| {
+                self.thumb_failed.get(&candidate.location) != Some(&candidate.modified)
+            })
+            .filter(|candidate| !self.thumb_inflight.contains(&candidate.location))
+            .filter_map(|candidate| {
+                let name = candidate.location.path.file_name()?;
+                let mimetype = self.mime_db.guess(name, None);
+                Some((candidate, mimetype))
+            })
+            .collect();
+
+        let tasks: Vec<Task<Message>> = filtered
+            .into_iter()
+            .map(|(candidate, mimetype)| {
+                self.thumb_inflight.insert(candidate.location.clone());
+                let request = core::thumbs::ThumbRequest {
+                    location: candidate.location.clone(),
+                    mimetype,
+                    modified: candidate.modified,
+                };
+                let registry = self.thumb_registry.clone();
+                let semaphore = self.thumb_semaphore.clone();
+                let cache_root = self.thumb_cache_root.clone();
+                let location = candidate.location.clone();
+                let modified = candidate.modified;
+                Task::perform(
+                    core::thumbs::thumbnail_for(registry, semaphore, cache_root, request),
+                    move |handle| Message::ThumbnailReady(location.clone(), modified, handle),
+                )
+            })
+            .collect();
+        Task::batch(tasks)
     }
 
     /// `Event::DeleteRequested`'s handling (Stage 9): trash where the
@@ -839,6 +1003,7 @@ impl App {
                     &self.sidebar,
                     view,
                     &self.mime_db,
+                    &self.thumb_cache,
                     &self.apps_db,
                     !self.clipboard.is_empty(),
                     Message::Explorer,

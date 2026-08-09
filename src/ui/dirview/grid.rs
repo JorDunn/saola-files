@@ -21,10 +21,11 @@ use saola_theme::{ColorExt, Surface, Theme, convert, style};
 
 use crate::core::fs::entry::FileEntry;
 use crate::core::mime::MimeDb;
+use crate::core::thumbs::ThumbCache;
 use crate::icons;
 
 use super::rename::RENAME_INPUT_ID;
-use super::{DirectoryView, Message, row_icon};
+use super::{DirectoryView, Message, row_icon, thumbnail_for};
 
 /// Tiles per row. See the module docs — this is a placeholder, not a
 /// layout measurement. `pub(super)` so `DirectoryView::row_step` (the
@@ -63,6 +64,7 @@ pub(super) fn view<'a>(
     state: &'a DirectoryView,
     t: &'a Theme,
     mime_db: &'a MimeDb,
+    thumb_cache: &'a ThumbCache,
 ) -> Element<'a, Message> {
     if let Some(err) = &state.error {
         return empty_state_owned(t, err.to_string());
@@ -97,7 +99,7 @@ pub(super) fn view<'a>(
                 state
                     .entries
                     .get(entry_index)
-                    .map(|entry| tile(state, t, mime_db, start + offset, entry))
+                    .map(|entry| tile(state, t, mime_db, thumb_cache, start + offset, entry))
             });
         row(tiles).spacing(GRID_GAP).into()
     });
@@ -143,6 +145,7 @@ fn tile<'a>(
     state: &'a DirectoryView,
     t: &'a Theme,
     mime_db: &'a MimeDb,
+    thumb_cache: &'a ThumbCache,
     visible_index: usize,
     entry: &'a FileEntry,
 ) -> Element<'a, Message> {
@@ -159,17 +162,27 @@ fn tile<'a>(
 
     // Glyph shape carries type, never hue (style guide §1) — see
     // `list.rs`'s identical note on why the tint only follows selected/
-    // not-selected, never hover, at this call site.
+    // not-selected, never hover, at this call site. Stage 11: a cached
+    // thumbnail (regular files only) replaces the glyph square — see
+    // `list.rs::entry_row`'s identical swap and `thumbnail_for`'s own doc
+    // comment for exactly what qualifies.
     let icon_color = if selected {
         t.palette.paper
     } else {
         t.on_paper.primary
     };
-    let glyph = icons::icon(
-        row_icon(entry, mime_db),
-        t.sizes.icon_bare,
-        icon_color.into_iced(),
-    );
+    let glyph: Element<'a, Message> = match thumbnail_for(state, thumb_cache, entry) {
+        Some(handle) => iced::widget::image(handle.handle())
+            .width(GRID_TILE_SIZE)
+            .height(GRID_TILE_SIZE)
+            .into(),
+        None => icons::icon(
+            row_icon(entry, mime_db),
+            t.sizes.icon_bare,
+            icon_color.into_iced(),
+        )
+        .into(),
+    };
 
     let name = text(entry.display_name().into_owned())
         .size(t.typography.size.secondary)

@@ -19,10 +19,11 @@ use saola_theme::{ColorExt, Surface, Theme, convert, style};
 use crate::config::SortKey;
 use crate::core::fs::entry::{EntryKind, FileEntry};
 use crate::core::mime::MimeDb;
+use crate::core::thumbs::ThumbCache;
 use crate::icons::{self, Icon};
 
 use super::rename::RENAME_INPUT_ID;
-use super::{DirectoryView, Message, row_icon};
+use super::{DirectoryView, Message, row_icon, thumbnail_for};
 
 /// Extra rows rendered above/below the on-screen slice so a fast scroll
 /// flick doesn't show a blank frame before the next `Scrolled` message
@@ -44,6 +45,7 @@ pub(super) fn view<'a>(
     state: &'a DirectoryView,
     t: &'a Theme,
     mime_db: &'a MimeDb,
+    thumb_cache: &'a ThumbCache,
 ) -> Element<'a, Message> {
     if let Some(err) = &state.error {
         // `err.to_string()` is owned, so `empty_state` gets a `String` it
@@ -78,7 +80,7 @@ pub(super) fn view<'a>(
             state
                 .entries
                 .get(entry_index)
-                .map(|entry| entry_row(state, t, mime_db, first + offset, entry))
+                .map(|entry| entry_row(state, t, mime_db, thumb_cache, first + offset, entry))
         });
 
     let body_column = column(
@@ -181,6 +183,7 @@ fn entry_row<'a>(
     state: &'a DirectoryView,
     t: &'a Theme,
     mime_db: &'a MimeDb,
+    thumb_cache: &'a ThumbCache,
     visible_index: usize,
     entry: &'a FileEntry,
 ) -> Element<'a, Message> {
@@ -204,13 +207,30 @@ fn entry_row<'a>(
     // the row's own button chrome it can't also brighten on hover, since
     // an `svg::Style` closure is fixed at build time, not re-evaluated
     // per `button::Status`.
-    let glyph = row_icon(entry, mime_db);
     let icon_color = if selected {
         t.palette.paper
     } else {
         t.on_paper.primary
     };
-    let icon = icons::icon(glyph, t.sizes.icon_row, icon_color.into_iced());
+    // Stage 11: a cached thumbnail (regular files only — see
+    // `DirectoryView::thumbnail_candidates`, the only producer of what
+    // fills `thumb_cache`) replaces the glyph for this one row; everything
+    // else (directories, symlinks, unsupported mimetypes, a cache miss
+    // still in flight) falls back to the glyph exactly as before this
+    // stage. Scaled to the same `sizes.icon_row` box the glyph already
+    // draws in — no separate thumbnail-specific size token needed here.
+    let icon: Element<'a, Message> = match thumbnail_for(state, thumb_cache, entry) {
+        Some(handle) => iced::widget::image(handle.handle())
+            .width(t.sizes.icon_row)
+            .height(t.sizes.icon_row)
+            .into(),
+        None => icons::icon(
+            row_icon(entry, mime_db),
+            t.sizes.icon_row,
+            icon_color.into_iced(),
+        )
+        .into(),
+    };
 
     let name = text(entry.display_name().into_owned())
         .size(t.typography.size.body)
