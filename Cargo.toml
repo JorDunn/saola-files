@@ -52,6 +52,63 @@ toml = "0.9"
 # (alternatives considered, why they lost) — the panel's Cargo.toml is the
 # reference for the format.
 
+# `Backend::caps()` (src/core/vfs.rs, Stage 3). Surveyed 2026-08-08: the
+# alternative is a hand-rolled `struct Caps { watch: bool, trash: bool, ... }`
+# with six `bool` fields — bitflags gives `contains`/`|`/`Debug` for free and
+# is the ecosystem-standard shape for "what can this backend do" capability
+# sets (this exact use case). Already present transitively (pulled in by
+# other deps at 1.3 and 2.x), so this just makes it a direct, versioned
+# dependency instead of an implicit one. `iced_core::keyboard::Modifiers`
+# (already in the dependency graph) is itself built on bitflags 2.x, so
+# there's no version-fragmentation cost.
+bitflags = "2"
+
+# `core::vfs::Backend` (Stage 3) is `dyn`-safe with `async fn` methods via
+# `async_trait`'s boxing macro. Surveyed 2026-08-08: the alternative is
+# hand-writing `fn list(&self, ..) -> Pin<Box<dyn Future<Output = ..> + Send
+# + '_>>` at each of the trait's nine async methods — mechanical
+# boilerplate that obscures the actual signatures teaching-notes-style
+# comments are supposed to explain. `async_trait` is the de facto standard
+# for this (rust-lang/rfcs #3185's motivating use case) and is already
+# transitively present via other deps, so this pins it as a direct one.
+async-trait = "0.1"
+
+# `modules::local`'s `spawn_blocking` calls (Stage 3 — CLAUDE.md: "One
+# async runtime: iced's tokio executor and zbus's tokio integration share
+# it; never construct a second"). Already pulled in transitively by iced's
+# `tokio` feature (see the `iced` entry above), which *is* the shared
+# runtime this crate's blocking-file-I/O calls run on — this makes that an
+# explicit, versioned dependency instead of relying on it staying available
+# transitively. No `rt-multi-thread`/other extra features requested here:
+# iced's own feature selection already provides the runtime this crate's
+# code calls into.
+tokio = "1"
+
+# `core::vfs::{ReadStream, WriteSink}` and the local backend's chunked
+# read/write (Stage 3) need `Stream`/`Sink`/`BoxStream` and a channel that
+# isn't `tokio::sync` (CLAUDE.md: iced messages use `iced::futures::channel::
+# mpsc`, and this crate's `core/` layer must stay iced-free — see its module
+# docs — so it uses the `futures` crate directly rather than reaching through
+# `iced::futures`). Already an indirect dependency of `iced`/`tokio`; this
+# pins the version this crate's code actually names in `use` paths.
+futures = "0.3"
+
+[dev-dependencies]
+# `modules::local`'s unit tests call `LocalBackend` methods directly (not
+# through `iced::Task`), so they need *some* live Tokio runtime for
+# `tokio::task::spawn_blocking` to run on — outside `iced::application`,
+# nothing provides one. Surveyed 2026-08-08: this stays a `dev-dependencies`
+# entry (test-only), not an addition to `[dependencies]`'s plain `tokio =
+# "1"` above, because the running app never constructs its own runtime
+# (CLAUDE.md: "One async runtime … never construct a second" — it uses
+# iced's); only tests, which run outside iced's executor, need to spin up
+# a throwaway one via `#[tokio::test]`. `rt` for `spawn_blocking`/the
+# runtime itself, `macros` for the `#[tokio::test]` attribute, `time` for
+# the async poll-sleep the write-streaming test uses to wait on a detached
+# blocking writer thread — the smallest feature set that makes the
+# local-backend tests runnable.
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+
 [profile.dev.package."*"]
 # Dependencies at full optimization even in dev builds (capture precedent):
 # iced's software/GPU rendering stack is unusably slow at opt-level 0, and
