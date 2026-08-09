@@ -229,6 +229,20 @@ pub enum DirEvent {
 pub type ReadStream = BoxStream<'static, Result<Vec<u8>, VfsError>>;
 
 /// A chunk sink for [`Backend::write`].
+///
+/// **Durability contract (added Stage 8, when `core::fs::ops`'s Move
+/// became the first caller that deletes a source right after a successful
+/// copy):** `Sink::close` must not resolve until every chunk already sent
+/// is durably written at the destination, not merely handed off to some
+/// detached worker. `modules::local::LocalBackend::write`'s `WriterSink`
+/// is the reference implementation — it wraps the raw channel sender so
+/// `poll_close` also joins the `spawn_blocking` writer thread, because a
+/// bare `mpsc::Sender`'s own `Sink::poll_close` only disconnects the
+/// channel and returns `Ready` immediately, which is *not* durable (see
+/// that type's doc comment for the full story, including the integration
+/// test that caught it). A future backend (SFTP) must give its own
+/// `close()` the same guarantee — e.g. actually awaiting the SFTP write
+/// handle's close/fsync, not just dropping a local buffer.
 pub type WriteSink = Pin<Box<dyn Sink<Vec<u8>, Error = VfsError> + Send>>;
 
 /// Every protocol backend implements this. Object-safe (`Box<dyn Backend>`

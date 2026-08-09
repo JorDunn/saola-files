@@ -66,6 +66,20 @@ pub enum Action {
     /// backends that can't signal changes themselves (`Caps::WATCH`
     /// unset).
     Refresh,
+
+    // ── Stage 8: clipboard, rename, new folder ──────────────────────────
+    /// Ctrl+C: copy the current selection to the internal clipboard.
+    Copy,
+    /// Ctrl+X: cut the current selection to the internal clipboard.
+    Cut,
+    /// Ctrl+V: paste the internal clipboard into the current directory.
+    Paste,
+    /// F2: start inline-renaming the cursor row (only meaningful with
+    /// exactly one entry selected — `DirectoryView::apply_action` decides
+    /// that, not this module).
+    Rename,
+    /// Ctrl+Shift+N: create a new folder in the current directory.
+    NewFolder,
 }
 
 /// Resolve one key press into an [`Action`], or `None` if this module
@@ -85,6 +99,9 @@ pub fn resolve(key: &Key, modifiers: Modifiers) -> Option<Action> {
                 "l" => return Some(Action::EditPath),
                 "1" => return Some(Action::SetViewList),
                 "2" => return Some(Action::SetViewGrid),
+                "c" => return Some(Action::Copy),
+                "x" => return Some(Action::Cut),
+                "v" => return Some(Action::Paste),
                 _ => {}
             }
         }
@@ -104,6 +121,19 @@ pub fn resolve(key: &Key, modifiers: Modifiers) -> Option<Action> {
             Key::Named(Named::ArrowRight) => Some(Action::HistoryForward),
             _ => None,
         };
+    }
+
+    // Ctrl+Shift+<letter>, no other modifier: currently only New Folder.
+    // Checked with `eq_ignore_ascii_case` rather than a bare `"n"` match:
+    // Shift held can change which case `Key::Character` reports depending
+    // on the compositor/layout, and this binding must fire either way.
+    if ctrl && shift && !alt {
+        if let Key::Character(c) = key
+            && c.eq_ignore_ascii_case("n")
+        {
+            return Some(Action::NewFolder);
+        }
+        return None;
     }
 
     // Every remaining action is a named key with at most Shift held.
@@ -133,6 +163,7 @@ pub fn resolve(key: &Key, modifiers: Modifiers) -> Option<Action> {
         (Named::Enter, false) => Some(Action::Descend),
         (Named::Backspace, false) => Some(Action::Ascend),
         (Named::F5, false) => Some(Action::Refresh),
+        (Named::F2, false) => Some(Action::Rename),
         _ => None,
     }
 }
@@ -208,7 +239,10 @@ mod tests {
     #[test]
     fn unmapped_keys_resolve_to_none() {
         assert_eq!(resolve(&named(Named::Tab), Modifiers::empty()), None);
-        assert_eq!(resolve(&Key::Character("x".into()), Modifiers::CTRL), None);
+        // "x" is Ctrl+X (Cut) as of Stage 8 — "z" is still unmapped, and
+        // still proves the same thing this test always has (an ordinary
+        // Ctrl+<letter> with no binding falls through to `None`).
+        assert_eq!(resolve(&Key::Character("z".into()), Modifiers::CTRL), None);
     }
 
     #[test]
@@ -253,6 +287,61 @@ mod tests {
         // they fall through to the generic "ctrl || alt => None" guard.
         assert_eq!(
             resolve(&named(Named::ArrowLeft), Modifiers::ALT | Modifiers::SHIFT),
+            None
+        );
+    }
+
+    // ── Stage 8: clipboard, rename, new folder ──────────────────────────
+
+    #[test]
+    fn ctrl_c_x_v_are_copy_cut_paste() {
+        assert_eq!(
+            resolve(&Key::Character("c".into()), Modifiers::CTRL),
+            Some(Action::Copy)
+        );
+        assert_eq!(
+            resolve(&Key::Character("x".into()), Modifiers::CTRL),
+            Some(Action::Cut)
+        );
+        assert_eq!(
+            resolve(&Key::Character("v".into()), Modifiers::CTRL),
+            Some(Action::Paste)
+        );
+    }
+
+    #[test]
+    fn f2_renames() {
+        assert_eq!(
+            resolve(&named(Named::F2), Modifiers::empty()),
+            Some(Action::Rename)
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_n_creates_a_new_folder_regardless_of_reported_case() {
+        assert_eq!(
+            resolve(
+                &Key::Character("n".into()),
+                Modifiers::CTRL | Modifiers::SHIFT
+            ),
+            Some(Action::NewFolder)
+        );
+        assert_eq!(
+            resolve(
+                &Key::Character("N".into()),
+                Modifiers::CTRL | Modifiers::SHIFT
+            ),
+            Some(Action::NewFolder)
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_other_letters_are_unmapped() {
+        assert_eq!(
+            resolve(
+                &Key::Character("x".into()),
+                Modifiers::CTRL | Modifiers::SHIFT
+            ),
             None
         );
     }

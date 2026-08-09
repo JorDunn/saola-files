@@ -48,14 +48,19 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use futures::SinkExt;
 use futures::channel::mpsc;
+use futures::sink::Sink;
 use futures::stream::{BoxStream, StreamExt};
 use inotify::{EventMask, EventStream, Inotify, WatchMask};
+use tokio::task::JoinHandle;
 use tokio::time::Instant as TokioInstant;
 
 use crate::core::fs::entry::{EntryKind, FileEntry};
@@ -249,6 +254,99 @@ fn set_times_blocking(
     file.set_times(times).map_err(|err| io_error(location, err))
 }
 
+/// The [`WriteSink`] `LocalBackend::write` returns.
+///
+/// Wraps the raw `mpsc::Sender<Vec<u8>>` fed to the detached blocking
+/// writer thread (see `write`'s doc comment on why the write itself runs
+/// on `spawn_blocking`) so that `Sink::close` — the one signal a caller
+/// has for "I'm done writing" — actually waits for that thread to finish
+/// flushing every queued chunk to disk before resolving.
+///
+/// **The bug this fixes, and why it mattered.** `mpsc::Sender<T>`'s own
+/// `Sink` impl (`futures_channel::mpsc::sink_impl`) makes `poll_close`
+/// call `self.disconnect()` and return `Ready` *immediately* — it only
+/// closes the channel, it does not wait for the receiver (here, the
+/// spawn_blocking thread) to drain it. A caller treating a bare `tx.
+/// sink_map_err(..)`'s `close().await` as "the write is durable" (Stage
+/// 8's `core::fs::ops::copy_bytes` did, until this was caught by that
+/// stage's own `conflict_apply_to_all_answers_every_later_conflict_
+/// without_prompting` integration test flaking on the *last* file in a
+/// multi-file op — the one with the least slack time before the test's
+/// own assertions ran) gets a **false completion signal**: the file can
+/// still be mid-`write_all` on the blocking thread when `close()` returns.
+/// For an ordinary copy that's a flaky read-back; for `core::fs::ops`'s
+/// Move (which deletes the *source* immediately after a successful copy)
+/// it was a real, if narrow, data-loss window. Fixing it here — the one
+/// place `WriteSink` is actually constructed — benefits every present and
+/// future caller of `Backend::write`, not just the one that happened to
+/// notice.
+struct WriterSink {
+    tx: mpsc::Sender<Vec<u8>>,
+    /// `None` after `poll_close` has already joined it once — `Sink::
+    /// close` can be polled more than once after completing (callers are
+    /// allowed to call it repeatedly), and joining an already-joined
+    /// `JoinHandle` panics, so this is `take()`n the moment it resolves.
+    join: Option<JoinHandle<()>>,
+    location: Location,
+}
+
+impl Sink<Vec<u8>> for WriterSink {
+    type Error = VfsError;
+
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), VfsError>> {
+        Pin::new(&mut self.tx)
+            .poll_ready(cx)
+            .map_err(|_| VfsError::Other {
+                message: format!("write channel to {} closed", self.location),
+            })
+    }
+
+    fn start_send(mut self: Pin<&mut Self>, item: Vec<u8>) -> Result<(), VfsError> {
+        Pin::new(&mut self.tx)
+            .start_send(item)
+            .map_err(|_| VfsError::Other {
+                message: format!("write channel to {} closed", self.location),
+            })
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), VfsError>> {
+        Pin::new(&mut self.tx)
+            .poll_flush(cx)
+            .map_err(|_| VfsError::Other {
+                message: format!("write channel to {} closed", self.location),
+            })
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), VfsError>> {
+        // Closing the channel is what lets the writer thread's `rx.next()`
+        // loop see `None` and exit — idempotent (`mpsc::Sender::disconnect`
+        // tolerates being called more than once), so no need to guard it
+        // with the same `Option`-based "already done" tracking `join` needs.
+        let _ = Pin::new(&mut self.tx).poll_close(cx);
+
+        let Some(join) = self.join.as_mut() else {
+            // Already joined by an earlier `poll_close` — nothing left to
+            // wait for.
+            return Poll::Ready(Ok(()));
+        };
+        match Pin::new(join).poll(cx) {
+            Poll::Ready(result) => {
+                self.join = None;
+                if let Err(err) = result {
+                    // The blocking task panicked — the no-panic rule
+                    // extends to background work (see `run_blocking`'s
+                    // identical posture for the read/list/mkdir side).
+                    return Poll::Ready(Err(VfsError::Other {
+                        message: format!("internal error writing {}: {err}", self.location),
+                    }));
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 #[async_trait]
 impl Backend for LocalBackend {
     fn scheme(&self) -> &'static str {
@@ -317,7 +415,7 @@ impl Backend for LocalBackend {
 
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
         let loc = location.clone();
-        tokio::task::spawn_blocking(move || {
+        let join = tokio::task::spawn_blocking(move || {
             use std::io::Write;
             let mut file = file;
             while let Some(chunk) = futures::executor::block_on(rx.next()) {
@@ -328,11 +426,11 @@ impl Backend for LocalBackend {
             }
         });
 
-        let closed_message = format!("write channel to {location} closed");
-        let sink = tx.sink_map_err(move |_| VfsError::Other {
-            message: closed_message.clone(),
-        });
-        Ok(Box::pin(sink))
+        Ok(Box::pin(WriterSink {
+            tx,
+            join: Some(join),
+            location: location.clone(),
+        }))
     }
 
     async fn mkdir(&self, location: &Location) -> Result<(), VfsError> {

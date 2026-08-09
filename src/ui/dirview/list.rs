@@ -10,7 +10,9 @@
 //! `ui_font` docs) — the style guide's "tabular numerals on size and date
 //! columns" rule.
 
-use iced::widget::{Space, button, column, container, mouse_area, row, scrollable, text};
+use iced::widget::{
+    Space, button, column, container, mouse_area, row, scrollable, text, text_input,
+};
 use iced::{Element, Fill, Length};
 use saola_theme::{ColorExt, Surface, Theme, convert, style};
 
@@ -19,6 +21,7 @@ use crate::core::fs::entry::{EntryKind, FileEntry};
 use crate::core::mime::MimeDb;
 use crate::icons::{self, Icon};
 
+use super::rename::RENAME_INPUT_ID;
 use super::{DirectoryView, Message, row_icon};
 
 /// Extra rows rendered above/below the on-screen slice so a fast scroll
@@ -181,6 +184,17 @@ fn entry_row<'a>(
     visible_index: usize,
     entry: &'a FileEntry,
 ) -> Element<'a, Message> {
+    // Stage 8: a row mid-inline-rename swaps its label for a `text_input`
+    // and stops being a clickable button entirely (there is nothing sane
+    // for a click on a field mid-edit to do) — checked by name, matching
+    // `RenameState::original`'s own doc comment on why the target is fixed
+    // by name rather than by (possibly now-stale) row position.
+    if let Some(rename) = state.rename_state()
+        && rename.original == entry.name
+    {
+        return renaming_row(t, mime_db, entry, rename);
+    }
+
     let selected = state.selection.is_selected(&entry.name);
     let has_cursor = state.selection.cursor() == Some(visible_index);
 
@@ -233,6 +247,61 @@ fn entry_row<'a>(
 
     mouse_area(styled)
         .on_double_click(Message::RowDoubleClicked(visible_index))
+        .into()
+}
+
+/// The inline-rename presentation of one row: the ordinary glyph, plus a
+/// `text_input` in place of the name label. Size/date columns stay put so
+/// the row's width/height don't jump while editing; the date column shows
+/// `rename.error` instead of the entry's date when a previous submit
+/// failed (CLAUDE.md's capability-honest wording — a rejected rename is
+/// worded inline, never a color change or a modal).
+fn renaming_row<'a>(
+    t: &'a Theme,
+    mime_db: &'a MimeDb,
+    entry: &'a FileEntry,
+    rename: &'a super::rename::RenameState,
+) -> Element<'a, Message> {
+    let icon = icons::icon(
+        row_icon(entry, mime_db),
+        t.sizes.icon_row,
+        t.on_paper.primary.into_iced(),
+    );
+
+    let field = text_input("Name", &rename.buffer)
+        .id(RENAME_INPUT_ID)
+        .on_input(Message::RenameChanged)
+        .on_submit(Message::RenameSubmitted)
+        .style(style::text_input::rest(t, Surface::Paper))
+        .font(convert::ui_font(t))
+        .size(t.typography.size.body)
+        .width(Fill);
+
+    let name_row = row![icon, field]
+        .spacing(t.sizes.pill_gap)
+        .align_y(iced::Center);
+
+    let trailing_text = rename.error.clone().unwrap_or_else(|| date_text(entry));
+    let trailing = text(trailing_text)
+        .size(t.typography.size.secondary)
+        .font(convert::mono_font(t));
+    let size = text(size_text(entry))
+        .size(t.typography.size.secondary)
+        .font(convert::mono_font(t));
+
+    let content = row![
+        container(name_row).width(Fill),
+        container(size)
+            .width(Length::Fixed(SIZE_COLUMN))
+            .align_x(iced::alignment::Horizontal::Right),
+        container(trailing).width(Length::Fixed(DATE_COLUMN)),
+    ]
+    .align_y(iced::Center)
+    .padding([0.0, t.sizes.pill_gap]);
+
+    container(content)
+        .width(Fill)
+        .height(t.sizes.list_row)
         .into()
 }
 

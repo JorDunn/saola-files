@@ -13,7 +13,9 @@
 //! virtualization math below (it only cares about "how many tiles per
 //! row", not where that number comes from).
 
-use iced::widget::{Space, button, column, container, mouse_area, row, scrollable, text};
+use iced::widget::{
+    Space, button, column, container, mouse_area, row, scrollable, text, text_input,
+};
 use iced::{Center, Element, Fill, Length};
 use saola_theme::{ColorExt, Surface, Theme, convert, style};
 
@@ -21,6 +23,7 @@ use crate::core::fs::entry::FileEntry;
 use crate::core::mime::MimeDb;
 use crate::icons;
 
+use super::rename::RENAME_INPUT_ID;
 use super::{DirectoryView, Message, row_icon};
 
 /// Tiles per row. See the module docs — this is a placeholder, not a
@@ -143,6 +146,14 @@ fn tile<'a>(
     visible_index: usize,
     entry: &'a FileEntry,
 ) -> Element<'a, Message> {
+    // Stage 8: same inline-rename swap `list.rs::entry_row` does — see
+    // that function's doc comment for why this checks by name.
+    if let Some(rename) = state.rename_state()
+        && rename.original == entry.name
+    {
+        return renaming_tile(t, mime_db, entry, rename);
+    }
+
     let selected = state.selection.is_selected(&entry.name);
     let has_cursor = state.selection.cursor() == Some(visible_index);
 
@@ -184,6 +195,51 @@ fn tile<'a>(
 
     mouse_area(styled)
         .on_double_click(Message::RowDoubleClicked(visible_index))
+        .into()
+}
+
+/// The inline-rename presentation of one tile: same glyph, a `text_input`
+/// in place of the name label below it. No error-message slot the way
+/// `list.rs::renaming_row`'s date column has (a tile has no second text
+/// line to spare) — a rejected rename's message still lands in the field
+/// via `RenameState::error`, it just isn't rendered here; the field stays
+/// open either way, so nothing is silently lost, only the specific reason
+/// isn't shown in grid view. Worth a follow-up if this proves confusing in
+/// practice; not blocking for this stage.
+fn renaming_tile<'a>(
+    t: &'a Theme,
+    mime_db: &'a MimeDb,
+    entry: &'a FileEntry,
+    rename: &'a super::rename::RenameState,
+) -> Element<'a, Message> {
+    let glyph = icons::icon(
+        row_icon(entry, mime_db),
+        t.sizes.icon_bare,
+        t.on_paper.primary.into_iced(),
+    );
+
+    let field = text_input("Name", &rename.buffer)
+        .id(RENAME_INPUT_ID)
+        .on_input(Message::RenameChanged)
+        .on_submit(Message::RenameSubmitted)
+        .style(style::text_input::rest(t, Surface::Paper))
+        .font(convert::ui_font(t))
+        .size(t.typography.size.secondary);
+
+    let content = column![
+        container(glyph)
+            .width(Fill)
+            .height(Length::Fixed(GRID_TILE_SIZE))
+            .align_x(iced::alignment::Horizontal::Center)
+            .align_y(Center),
+        field,
+    ]
+    .width(Length::Fixed(GRID_TILE_SIZE));
+
+    container(content)
+        .width(Length::Fixed(GRID_TILE_SIZE))
+        .height(Length::Fixed(GRID_TILE_SIZE + GRID_LABEL_HEIGHT))
+        .padding(t.sizes.pill_gap / 2.0)
         .into()
 }
 

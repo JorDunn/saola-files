@@ -47,6 +47,10 @@ pub enum Message {
 /// caches (thumbs, mime, apps, …) live on the App, never per-view"),
 /// threaded straight through to `active.view` for row glyph selection and
 /// the context menu/Open-with popover, never built or cached here.
+/// `clipboard_has_contents` (Stage 8) is the same shape: `App` owns the
+/// actual `core::fs::ops::Clipboard`, this seam only ever reads a bool off
+/// it so the context menu's Paste row can be capability-honest about
+/// whether there's anything to paste.
 ///
 /// Built as one `Element<'a, Message>` tree first (the sidebar and the
 /// header+directory column each mapped into `Message` exactly once) and
@@ -61,6 +65,7 @@ pub fn view<'a, M: 'a>(
     active: &'a DirectoryView,
     mime_db: &'a MimeDb,
     apps_db: &'a AppsDb,
+    clipboard_has_contents: bool,
     map: impl Fn(Message) -> M + 'a,
 ) -> Element<'a, M> {
     let sidebar_view: Element<'a, Message> =
@@ -68,7 +73,7 @@ pub fn view<'a, M: 'a>(
 
     let directory: Element<'a, dirview::Message> = column![
         header::view(theme, active),
-        active.view(theme, mime_db, apps_db)
+        active.view(theme, mime_db, apps_db, clipboard_has_contents)
     ]
     .width(Fill)
     .height(Fill)

@@ -1,19 +1,21 @@
 //! saola-files — the file manager for the Saola desktop environment.
 //!
-//! Current scope (through Stage 7): the application shell (Stage 1), CLI
+//! Current scope (through Stage 8): the application shell (Stage 1), CLI
 //! parsing and `files.toml` loading (Stage 2), real directory browsing
 //! through a VFS `Backend` trait and a local backend, navigation chrome
-//! and live updates (Stages 4–5), mime/icons/opening (Stage 6), and now
-//! the places sidebar (Stage 7).
+//! and live updates (Stages 4–5), mime/icons/opening (Stage 6), the places
+//! sidebar (Stage 7), and now copy/move/rename/new-folder/new-file with
+//! live progress and conflict prompts (Stage 8).
 //!
 //! This binary is a thin shell over the `saola_files` library crate
 //! (`src/lib.rs`) — see that file's docs for why the split exists.
 
 use std::path::PathBuf;
 
-use iced::{Element, Size, Subscription, Task, window};
+use iced::{Element, Fill, Size, Subscription, Task, window};
 use saola_theme::{Theme, convert};
 
+use core::fs::ops;
 use core::vfs::Location;
 use saola_files::{cli, config, core, ui};
 
@@ -76,6 +78,22 @@ fn main() -> iced::Result {
 enum Message {
     Window(ui::window::Event),
     Explorer(ui::explorer::Message),
+    /// Stage 8: an event off the active op's progress stream
+    /// (`ui::dialogs::progress::subscription`).
+    OpEvent(ops::OpEvent),
+    /// The ops strip's Cancel button.
+    Progress(ui::dialogs::progress::Message),
+    /// The conflict dialog's buttons/checkbox.
+    Conflict(ui::dialogs::conflict::Message),
+    /// Swallows a click on the conflict dialog's modal scrim — the dialog
+    /// must be answered via one of its three buttons, never dismissed by
+    /// clicking outside it (there is no sane default resolution to assume).
+    /// The iced 0.14 gotcha CLAUDE.md documents: a `mouse_area` needs a
+    /// real `.on_press` to actually capture the click, the same "no
+    /// `.on_press` = doesn't capture its press" behavior a bare `button`
+    /// has (`ui::menus`'s popover scrim is the same trick, there closing
+    /// the menu instead of doing nothing).
+    Noop,
 }
 
 struct App {
@@ -106,6 +124,40 @@ struct App {
     /// `core::apps::resolve_terminal_from_env`, not cached here — it's a
     /// cheap env read, not worth a second cache.
     terminal: Option<String>,
+    /// The internal clipboard (Stage 8) — a shared cache like `mime_db`/
+    /// `apps_db`/`sidebar`, not per-view: Ctrl+C in one tab and Ctrl+V in
+    /// another (once tabs exist) must see the same clipboard.
+    clipboard: ops::Clipboard,
+    /// Monotonic [`ops::OpId`] allocator — one per `App`, per
+    /// `ops::OpIdSource`'s own doc comment.
+    op_ids: ops::OpIdSource,
+    /// The one currently-running copy/move op, if any. Stage 8 never runs
+    /// more than one at a time — see `Self::start_paste`'s doc comment for
+    /// why a second paste while one is in flight is dropped rather than
+    /// queued.
+    active_op: Option<ops::OpRequest>,
+    /// The live progress snapshot for `active_op`, accumulated from its
+    /// event stream by `Self::handle_op_event`. Always `Some` exactly when
+    /// `active_op` is (kept as two `Option`s rather than one combined type
+    /// only because `active_op` needs to be handed to
+    /// `ui::dialogs::progress::subscription` by itself, without also
+    /// borrowing the progress snapshot `App::subscription` doesn't touch).
+    active_op_progress: Option<ui::dialogs::progress::Progress>,
+    /// The conflict the active op is waiting on an answer for, if any —
+    /// `App`'s half of the capacity-1 reply-channel pattern (CLAUDE.md; see
+    /// `core::fs::ops`'s module docs).
+    pending_conflict: Option<PendingConflict>,
+}
+
+/// See `App::pending_conflict`'s doc comment.
+struct PendingConflict {
+    conflict: ops::Conflict,
+    reply: futures::channel::mpsc::Sender<ops::ConflictDecision>,
+    /// The dialog's "Apply to all conflicts" checkbox — round-tripped
+    /// through `ui::dialogs::conflict::view` each frame, since that module
+    /// holds no state of its own (CLAUDE.md's "ui:: is free of app-window
+    /// concerns" posture extended to this dialog too).
+    apply_to_all: bool,
 }
 
 impl App {
@@ -154,6 +206,11 @@ impl App {
             mime_db: core::mime::MimeDb::new(),
             apps_db: core::apps::AppsDb::load(),
             terminal: config.terminal.clone(),
+            clipboard: ops::Clipboard::new(),
+            op_ids: ops::OpIdSource::default(),
+            active_op: None,
+            active_op_progress: None,
+            pending_conflict: None,
         };
         (
             app,
@@ -183,7 +240,135 @@ impl App {
                 }
                 Task::batch(tasks)
             }
+            Message::OpEvent(event) => self.handle_op_event(event),
+            Message::Progress(ui::dialogs::progress::Message::CancelRequested) => {
+                if let Some(request) = &self.active_op {
+                    request.request_cancel();
+                }
+                Task::none()
+            }
+            Message::Conflict(ui::dialogs::conflict::Message::ChoiceSelected(choice)) => {
+                self.answer_conflict(choice);
+                Task::none()
+            }
+            Message::Conflict(ui::dialogs::conflict::Message::ApplyToAllToggled(value)) => {
+                if let Some(pending) = self.pending_conflict.as_mut() {
+                    pending.apply_to_all = value;
+                }
+                Task::none()
+            }
+            Message::Noop => Task::none(),
         }
+    }
+
+    /// Translates one [`ops::OpEvent`] off the active op's stream into
+    /// `App` state — `ui::dialogs::progress`/`conflict` never see a raw
+    /// event themselves, only what this builds from it (see
+    /// `ui::dialogs::progress`'s module doc comment).
+    fn handle_op_event(&mut self, event: ops::OpEvent) -> Task<Message> {
+        match event {
+            ops::OpEvent::Started {
+                files_total,
+                bytes_total,
+            } => {
+                let kind = self
+                    .active_op
+                    .as_ref()
+                    .map(|request| request.kind)
+                    .unwrap_or(ops::OpKind::Copy);
+                self.active_op_progress = Some(ui::dialogs::progress::Progress::started(
+                    kind,
+                    files_total,
+                    bytes_total,
+                ));
+            }
+            ops::OpEvent::FileStarted { name } => {
+                if let Some(progress) = self.active_op_progress.as_mut() {
+                    progress.current_name = Some(name);
+                }
+            }
+            ops::OpEvent::Progress {
+                files_done,
+                bytes_done,
+            } => {
+                if let Some(progress) = self.active_op_progress.as_mut() {
+                    progress.files_done = files_done;
+                    progress.bytes_done = bytes_done;
+                }
+            }
+            ops::OpEvent::Conflict { conflict, reply } => {
+                self.pending_conflict = Some(PendingConflict {
+                    conflict,
+                    reply,
+                    apply_to_all: false,
+                });
+            }
+            ops::OpEvent::Finished { errors } => {
+                // No error-dialog surface exists yet (same posture
+                // `handle_directory_event`'s spawn failures already take)
+                // — worded to stderr rather than silently dropped.
+                for (location, err) in &errors {
+                    eprintln!("saola-files: {location}: {err}");
+                }
+                self.active_op = None;
+                self.active_op_progress = None;
+                self.pending_conflict = None;
+            }
+            ops::OpEvent::Cancelled => {
+                self.active_op = None;
+                self.active_op_progress = None;
+                self.pending_conflict = None;
+            }
+        }
+        Task::none()
+    }
+
+    /// Sends the human's choice back down the pending conflict's reply
+    /// channel — `try_send` (CLAUDE.md's bounded-bridging rule), and a
+    /// failure (the engine gave up waiting — see `core::fs::ops::
+    /// send_event`'s doc comment) is silently dropped rather than
+    /// retried: the op has already moved on by the time that could happen.
+    fn answer_conflict(&mut self, choice: ops::ConflictChoice) {
+        let Some(mut pending) = self.pending_conflict.take() else {
+            return;
+        };
+        let _ = pending.reply.try_send(ops::ConflictDecision {
+            choice,
+            apply_to_all: pending.apply_to_all,
+        });
+    }
+
+    /// `Event::PasteRequested`'s handling: builds and submits an
+    /// [`ops::OpRequest`] from the clipboard's current contents into
+    /// `dest_dir`. A paste with an empty clipboard, or while another op is
+    /// already running, is a silent no-op — Stage 8 deliberately doesn't
+    /// queue a second op (see the Stage 8 handoff for what a real queue
+    /// would need); the context menu's Paste row is already hidden when
+    /// the clipboard is empty (`ui::menus`' `clipboard_has_contents`), so
+    /// the only way to hit the empty case is the Ctrl+V keyboard shortcut.
+    fn start_paste(&mut self, dest_dir: Location) -> Task<Message> {
+        if self.active_op.is_some() {
+            return Task::none();
+        }
+        let Some(clipboard_op) = self.clipboard.op() else {
+            return Task::none();
+        };
+        let sources = self.clipboard.locations().to_vec();
+        if sources.is_empty() {
+            return Task::none();
+        }
+
+        let kind = match clipboard_op {
+            ops::ClipboardOp::Copy => ops::OpKind::Copy,
+            ops::ClipboardOp::Cut => ops::OpKind::Move,
+        };
+        let id = self.op_ids.alloc();
+        self.active_op = Some(ops::OpRequest::new(id, kind, sources, dest_dir));
+
+        if clipboard_op == ops::ClipboardOp::Cut {
+            self.clipboard.clear();
+        }
+        Task::none()
     }
 
     /// Navigates the active `DirectoryView` to `location` — the shared
@@ -246,6 +431,15 @@ impl App {
                 }
                 Task::none()
             }
+            ui::dirview::Event::CopyRequested(locations) => {
+                self.clipboard.set_copy(locations);
+                Task::none()
+            }
+            ui::dirview::Event::CutRequested(locations) => {
+                self.clipboard.set_cut(locations);
+                Task::none()
+            }
+            ui::dirview::Event::PasteRequested(dest_dir) => self.start_paste(dest_dir),
         }
     }
 
@@ -299,7 +493,18 @@ impl App {
             .subscription()
             .map(|m| Message::Explorer(ui::explorer::Message::Sidebar(m)));
 
-        Subscription::batch([keyboard, watch, mounts])
+        // Stage 8: the active op's progress stream, if one is running —
+        // identified by `OpRequest` (its manual `Hash`-by-`id`, see that
+        // type's doc comment), so iced keeps the same running copy/move
+        // alive across re-renders and tears it down the moment `active_op`
+        // goes back to `None`.
+        let ops = self
+            .active_op
+            .as_ref()
+            .map(|request| ui::dialogs::progress::subscription(request).map(Message::OpEvent))
+            .unwrap_or_else(Subscription::none);
+
+        Subscription::batch([keyboard, watch, mounts, ops])
     }
 
     fn theme(&self) -> iced::Theme {
@@ -316,13 +521,14 @@ impl App {
     fn view(&self) -> Element<'_, Message> {
         let t = &self.theme;
 
-        let body = match self.views.get(self.active) {
+        let body: Element<'_, Message> = match self.views.get(self.active) {
             Some(view) => ui::explorer::view(
                 t,
                 &self.sidebar,
                 view,
                 &self.mime_db,
                 &self.apps_db,
+                !self.clipboard.is_empty(),
                 Message::Explorer,
             ),
             // Degrades to a blank paper surface rather than panicking —
@@ -331,7 +537,42 @@ impl App {
             None => iced::widget::Space::new().into(),
         };
 
-        ui::window::view(t, "Files", body, Message::Window)
+        // Stage 8: the ops strip, stacked below the explorer body (a
+        // persistent bar, not a popover) whenever a copy/move is running.
+        let with_progress: Element<'_, Message> = match &self.active_op_progress {
+            Some(progress) => iced::widget::column![
+                body,
+                ui::dialogs::progress::view(t, progress).map(Message::Progress),
+            ]
+            .width(Fill)
+            .height(Fill)
+            .into(),
+            None => body,
+        };
+
+        // The conflict dialog is a true modal: stacked over everything
+        // else with a scrim that swallows clicks (`Message::Noop` — see
+        // its doc comment) rather than closing on an outside click, since
+        // there is no sane default resolution to fall back to.
+        let with_conflict: Element<'_, Message> = match &self.pending_conflict {
+            Some(pending) => {
+                let scrim =
+                    iced::widget::mouse_area(iced::widget::Space::new().width(Fill).height(Fill))
+                        .on_press(Message::Noop);
+                let dialog = iced::widget::container(
+                    ui::dialogs::conflict::view(t, &pending.conflict, pending.apply_to_all)
+                        .map(Message::Conflict),
+                )
+                .width(Fill)
+                .height(Fill)
+                .align_x(iced::alignment::Horizontal::Center)
+                .align_y(iced::alignment::Vertical::Center);
+                iced::widget::stack![with_progress, scrim, dialog].into()
+            }
+            None => with_progress,
+        };
+
+        ui::window::view(t, "Files", with_conflict, Message::Window)
     }
 }
 

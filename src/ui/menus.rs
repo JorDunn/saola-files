@@ -17,14 +17,16 @@
 //! constructs `dirview::Message` values, the same boundary those two
 //! files already respect.
 //!
-//! **Scope cut, worth stating plainly:** this stage's context menu only
-//! offers what Stage 6 can actually deliver on — Open, Open with…, Open in
-//! terminal, and config-defined `[[action]]` custom actions filtered by
-//! mimetype/scheme. Cut/copy/paste/rename/new/delete wait on the ops
-//! engine (Stage 8) and trash (Stage 9); adding rows for them now that
-//! quietly do nothing would be a fake affordance, not an honest one —
-//! CLAUDE.md's capability-honest posture applies to "not built yet" the
-//! same way it applies to "this backend can't do that."
+//! **Scope, updated Stage 8:** Cut/Copy/Paste/Rename/New Folder/New File
+//! joined Open/Open with…/Open in terminal/custom actions this stage, now
+//! that `core::fs::ops` and `dirview::rename` exist to actually back them.
+//! Paste is worded/gated on whether the clipboard has anything
+//! (`clipboard_has_contents`, threaded in at render time the same way
+//! `mime_db`/`apps_db` already are — CLAUDE.md's capability-honest
+//! posture: an always-enabled Paste that silently does nothing would be a
+//! fake affordance). **Delete still isn't here** — it waits on trash
+//! (Stage 9); adding a permanent-delete-only row before that stage decides
+//! how deletion should be worded would be presuming its answer.
 //!
 //! **Anchoring is simplified too:** a precise "grow from the trigger
 //! button" popover (style guide §6) needs the trigger's on-screen rect,
@@ -54,13 +56,18 @@ pub fn overlay<'a>(
     state: &'a DirectoryView,
     mime_db: &'a MimeDb,
     apps_db: &'a AppsDb,
+    clipboard_has_contents: bool,
     content: Element<'a, Message>,
 ) -> Element<'a, Message> {
     if state.open_with_open() {
         return popover_stack(t, content, open_with_popover(t, state, mime_db, apps_db));
     }
     if state.menu_open() {
-        return popover_stack(t, content, context_menu(t, state, mime_db));
+        return popover_stack(
+            t,
+            content,
+            context_menu(t, state, mime_db, clipboard_has_contents),
+        );
     }
     content
 }
@@ -88,6 +95,7 @@ fn context_menu<'a>(
     t: &'a Theme,
     state: &'a DirectoryView,
     mime_db: &'a MimeDb,
+    clipboard_has_contents: bool,
 ) -> Element<'a, Message> {
     let selected = state.selected_entries();
     let mut items: Vec<Element<'a, Message>> = Vec::new();
@@ -111,6 +119,45 @@ fn context_menu<'a>(
         Icon::Terminal,
         "Open in terminal",
         Message::MenuOpenTerminalRequested,
+    ));
+
+    // ── Stage 8: clipboard / rename / new ────────────────────────────────
+    if !selected.is_empty() {
+        items.push(menu_row(t, Icon::Copy, "Copy", Message::MenuCopyRequested));
+        items.push(menu_row(
+            t,
+            Icon::Scissors,
+            "Cut",
+            Message::MenuCutRequested,
+        ));
+    }
+    if clipboard_has_contents {
+        items.push(menu_row(
+            t,
+            Icon::ClipboardPaste,
+            "Paste",
+            Message::MenuPasteRequested,
+        ));
+    }
+    if selected.len() == 1 {
+        items.push(menu_row(
+            t,
+            Icon::Pencil,
+            "Rename…",
+            Message::MenuRenameRequested,
+        ));
+    }
+    items.push(menu_row(
+        t,
+        Icon::FolderPlus,
+        "New Folder",
+        Message::MenuNewFolderRequested,
+    ));
+    items.push(menu_row(
+        t,
+        Icon::FilePlus,
+        "New File",
+        Message::MenuNewFileRequested,
     ));
 
     if !selected.is_empty() {
