@@ -27,23 +27,12 @@
 
 use iced::widget::{button, column, container, row, scrollable, text};
 use iced::{Center, Element, Fill, Subscription};
-use saola_theme::{ColorExt, Surface, Theme, convert, style};
+use saola_theme::icon::{self, Icon};
+use saola_theme::{ColorExt, Surface, Theme, convert, style, widget};
 
 use crate::core::places::Place;
 use crate::core::udisks::{Mount, MountsSource, UdisksMounts};
 use crate::core::vfs::Location;
-use crate::icons::{self, Icon};
-
-/// The sidebar's fixed column width. Layout-specific to this file
-/// manager's chrome, not a saola-theme design-system size — same
-/// distinction `ui::window`'s `RESIZE_EDGE`/`RESIZE_CORNER` and
-/// `ui::dirview::list`'s `SIZE_COLUMN`/`DATE_COLUMN` draw. **Upstream
-/// gap** (verified against the pinned `saola-theme-v0.5.0` tag): the
-/// Stage 3 handoff already flagged `sizes.window_sidebar` as missing from
-/// saola-theme; this is that same still-open gap, not a new one.
-/// TODO(saola-theme): promote to `sizes.window_sidebar` upstream and
-/// delete this constant once a new tag ships it.
-const SIDEBAR_WIDTH: f32 = 200.0;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -108,7 +97,7 @@ impl Sidebar {
             .collect();
 
         if !self.mounts.is_empty() {
-            rows.push(section_label(t, "Removable"));
+            rows.push(widget::section_label(t, Surface::Paper, "REMOVABLE"));
             rows.extend(self.mounts.iter().map(|mount| {
                 let location = Location::local(mount.mount_point.clone());
                 mount_row(t, mount, location == *current)
@@ -117,38 +106,34 @@ impl Sidebar {
 
         let content = column(rows).width(Fill);
 
-        // Region separation by *ground*, not by a line. `container::tile`
-        // is saola-theme's recessed-panel helper — `on_paper.fill_subtle`
-        // (ink at 4%) at `radii.tile` — so the places column sits one alpha
-        // step below the file listing's plain paper, the same way the
-        // quick-settings popover's media row sits below its popover. That
-        // keeps the three-colour rule intact (this is a step of ink, not a
-        // fourth hue) while making "sidebar" and "files" read as two zones
-        // rather than one continuous sheet.
+        // Region separation by *ground*, not by a line: `style::container::
+        // inset` (Stage 12 — the upstreamed promotion of the pending
+        // `container::tile`-at-`radii.inset` gap this call site used to
+        // flag) is `on_paper.fill_subtle` (ink at 4%) at `radii.inset`
+        // (20px, the style guide §4 "Inset panels, media rows | 18–22px"
+        // tier — `container::tile`'s own `radii.tile`, 13px, is for *icon*
+        // tiles, one size class down from a window-scale panel like this
+        // one). The places column sits one alpha step below the file
+        // listing's plain paper, the same way the quick-settings popover's
+        // media row sits below its popover — keeping the three-colour rule
+        // intact (a step of ink, not a fourth hue) while making "sidebar"
+        // and "files" read as two zones rather than one continuous sheet.
         //
         // `ui::explorer` (and `main.rs`'s trash composition) is what insets
-        // this tile from the window edges with `sizes.island_gap`; the tile
-        // only owns its own inner breathing room here.
+        // this panel from the window edges with `sizes.island_gap`; the
+        // panel only owns its own inner breathing room here.
         //
-        // **Upstream gap** (verified against the pinned `saola-theme-v0.5.0`
-        // tag): `container::tile` rounds at `radii.tile` (13px), which the
-        // style guide §4 assigns to *icon* tiles; a window-scale inset panel
-        // like this one belongs at `radii.inset` (20px, "Inset panels, media
-        // rows | 18–22px"). `radii.inset` exists as a token but no style
-        // helper reads it. TODO(saola-theme): add
-        // `style::container::inset(t, Surface)` — `tile`'s recipe at
-        // `radii.inset` — and switch this call site (and `ui::header`'s
-        // toolbar, and `ui::trashview`'s) to it once a new tag ships it;
-        // bump the pinned tag in this crate's `Cargo.toml` in that PR.
+        // `sizes.window_sidebar` (200, Stage 12) replaces this file's own
+        // `SIDEBAR_WIDTH` local constant.
         container(
             scrollable(content)
                 .style(style::scrollable::rest(t, Surface::Paper))
                 .width(Fill)
                 .height(Fill),
         )
-        .style(style::container::tile(t, Surface::Paper))
+        .style(style::container::inset(t, Surface::Paper))
         .padding(t.sizes.pill_gap)
-        .width(SIDEBAR_WIDTH)
+        .width(t.sizes.window_sidebar)
         .height(Fill)
         .into()
     }
@@ -181,7 +166,7 @@ fn mounts_stream() -> impl iced::futures::Stream<Item = Message> {
 fn place_row<'a>(t: &'a Theme, place: &'a Place, selected: bool) -> Element<'a, Message> {
     row_button(
         t,
-        Icon::for_place(place.kind),
+        crate::icons::for_place(place.kind),
         &place.label,
         selected,
         Message::PlaceClicked(place.location.clone()),
@@ -191,7 +176,7 @@ fn place_row<'a>(t: &'a Theme, place: &'a Place, selected: bool) -> Element<'a, 
 fn mount_row<'a>(t: &'a Theme, mount: &'a Mount, selected: bool) -> Element<'a, Message> {
     row_button(
         t,
-        Icon::for_mount(mount.removable),
+        crate::icons::for_mount(mount.removable),
         &mount.label,
         selected,
         Message::MountClicked(Location::local(mount.mount_point.clone())),
@@ -226,7 +211,7 @@ fn row_button<'a>(
     // button's full `list_row` height, and *then* `align_y(Center)` puts
     // the glyph and label on the row's centre line.
     let content = row![
-        icons::icon(glyph, t.sizes.icon_row, icon_color.into_iced()),
+        icon::icon(glyph, t.sizes.icon_row, icon_color.into_iced()),
         text(label)
             .size(t.typography.size.body)
             .font(convert::ui_font(t)),
@@ -235,75 +220,20 @@ fn row_button<'a>(
     .height(Fill)
     .align_y(Center);
 
+    // Stage 12: `style::button::list_row` — the upstreamed promotion of
+    // this function's own hand-rolled recipe (§6 "List row": height
+    // `sizes.list_row`, `radii.pill`, transparent at rest, `fill_subtle`
+    // hover, terracotta selected with ivory text). The sidebar has no
+    // keyboard cursor this stage (only mouse selection-by-current-location),
+    // so `focused` is always `false` — `list_row`'s fourth parameter, which
+    // draws the keyboard-focus ring `ui::dirview::list`'s own rows use.
     button(content)
-        .style(row_style(t, selected))
+        .style(style::button::list_row(t, Surface::Paper, selected, false))
         .width(Fill)
         .height(t.sizes.list_row)
         .padding([0.0, t.sizes.pill_gap])
         .on_press(on_press)
         .into()
-}
-
-fn section_label<'a>(t: &'a Theme, label: &'a str) -> Element<'a, Message> {
-    container(
-        text(label)
-            .size(t.typography.size.label)
-            .font(convert::mono_font_medium(t))
-            .color(t.on_paper.tertiary.into_iced()),
-    )
-    .padding([t.sizes.pill_gap, t.sizes.pill_gap])
-    .into()
-}
-
-/// §6 "List row" (`docs/SAOLA-STYLE-GUIDE.md`): height `sizes.list_row`,
-/// `radii.pill`, transparent at rest, `fill_subtle` on hover, terracotta
-/// when selected with ivory text — identical recipe to
-/// `ui::dirview::list::row_style`, minus that function's keyboard-cursor
-/// focus ring (the sidebar has no keyboard cursor this stage, only mouse
-/// selection-by-current-location).
-///
-/// **Upstream gap** (verified against the pinned `saola-theme-v0.5.0`
-/// tag): there is still no `style::button::list_row` helper — this is the
-/// *third* local derivation of the same recipe (`dirview::list::row_style`,
-/// `dirview::grid::tile_style`, and now this one). TODO(saola-theme):
-/// promote to `style::button::list_row(t, Surface, selected: bool)`
-/// upstream and delete all three call sites' local copies once a new tag
-/// ships it; bump the pinned tag in this crate's `Cargo.toml` in the same
-/// PR that adopts it.
-fn row_style(t: &Theme, selected: bool) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
-    let radius = t.radii.pill;
-    let on = t.on_paper;
-    let accent = t.palette.accent;
-    let paper_text = t.palette.paper;
-
-    move |_, status| {
-        let (background, text_color) = if selected {
-            let bg = match status {
-                button::Status::Hovered => on.fill_subtle.over(accent),
-                button::Status::Pressed => on.fill.over(accent),
-                _ => accent,
-            };
-            (Some(bg), paper_text)
-        } else {
-            let bg = match status {
-                button::Status::Hovered => Some(on.fill_subtle),
-                button::Status::Pressed => Some(on.fill),
-                _ => None,
-            };
-            (bg, on.primary)
-        };
-
-        button::Style {
-            background: background.map(|color| iced::Background::Color(color.into_iced())),
-            text_color: text_color.into_iced(),
-            border: iced::Border {
-                color: iced::Color::TRANSPARENT,
-                width: 0.0,
-                radius: radius.into(),
-            },
-            ..button::Style::default()
-        }
-    }
 }
 
 #[cfg(test)]

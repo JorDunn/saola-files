@@ -43,8 +43,10 @@
 //! anchor to the window's top-right corner instead, roughly under where
 //! the header's overflow button always renders.
 
-use iced::widget::{Space, button, column, container, mouse_area, row, stack, text};
-use iced::{Center, Element, Fill, Length};
+use iced::widget::{Space, column, container, mouse_area, stack, text};
+use iced::{Element, Fill};
+use saola_theme::icon::Icon;
+use saola_theme::widget::{self as saola_widget, Emphasis};
 use saola_theme::{ColorExt, Surface, Theme, convert, style};
 
 use crate::config::CustomAction;
@@ -52,7 +54,6 @@ use crate::core::apps::{AppsDb, DesktopEntry};
 use crate::core::fs::entry::{EntryKind, FileEntry};
 use crate::core::mime::MimeDb;
 use crate::core::vfs::Caps;
-use crate::icons::{self, Icon};
 
 use super::dirview::{DirectoryView, Message};
 
@@ -204,7 +205,7 @@ fn context_menu<'a>(
         }
     }
 
-    popover_container(t, column(items).width(Length::Fixed(240.0)))
+    popover_container(t, column(items).width(t.sizes.menu_width))
 }
 
 fn open_with_popover<'a>(
@@ -233,7 +234,7 @@ fn open_with_popover<'a>(
         })
         .collect();
 
-    popover_container(t, column(items).width(Length::Fixed(260.0)))
+    popover_container(t, column(items).width(t.sizes.menu_width))
 }
 
 fn entry_mimetype(entry: &FileEntry, mime_db: &MimeDb) -> String {
@@ -244,28 +245,21 @@ fn entry_mimetype(entry: &FileEntry, mime_db: &MimeDb) -> String {
     }
 }
 
+/// Stage 12: delegates to `saola_theme::widget::menu_row` — the exact
+/// upstream promotion of this crate's own local derivation (`style::
+/// button::menu_row` + this constructor were "promoted from saola-files
+/// `menus.rs`, two near-identical clones", per that helper's own doc
+/// comment). Kept as a thin local wrapper (rather than rewriting every call
+/// site's argument order) so every `menu_row(t, Icon::X, "label", message)`
+/// call below stays unchanged.
 fn menu_row<'a>(
     t: &'a Theme,
     glyph: Icon,
     label: &'a str,
     message: Message,
 ) -> Element<'a, Message> {
-    let icon_color = t.on_ink.secondary.into_iced();
-    let content = row![
-        icons::icon(glyph, t.sizes.icon_menu, icon_color),
-        text(label)
-            .size(t.typography.size.body)
-            .font(convert::ui_font(t)),
-    ]
-    .spacing(t.sizes.pill_gap)
-    .align_y(Center);
-
-    button(content)
-        .style(style::button::bare(t, Surface::Ink))
-        .width(Fill)
-        .padding([8.0, t.sizes.popover_padding / 2.0])
-        .on_press(message)
-        .into()
+    let tint = saola_widget::role(t, Surface::Ink, Emphasis::Quiet);
+    saola_widget::menu_row(t, Surface::Ink, Some(glyph), label, tint, Some(message))
 }
 
 fn open_with_row<'a>(
@@ -273,26 +267,22 @@ fn open_with_row<'a>(
     entry: &'a DesktopEntry,
     is_default: bool,
 ) -> Element<'a, Message> {
-    let (glyph, icon_color) = if is_default {
+    let (glyph, tint) = if is_default {
         (Icon::Check, t.palette.accent.into_iced())
     } else {
-        (Icon::ExternalLink, t.on_ink.secondary.into_iced())
+        (
+            Icon::ExternalLink,
+            saola_widget::role(t, Surface::Ink, Emphasis::Quiet),
+        )
     };
-    let content = row![
-        icons::icon(glyph, t.sizes.icon_menu, icon_color),
-        text(entry.name.as_str())
-            .size(t.typography.size.body)
-            .font(convert::ui_font(t)),
-    ]
-    .spacing(t.sizes.pill_gap)
-    .align_y(Center);
-
-    button(content)
-        .style(style::button::bare(t, Surface::Ink))
-        .width(Fill)
-        .padding([8.0, t.sizes.popover_padding / 2.0])
-        .on_press(Message::OpenWithChosen(entry.id.clone()))
-        .into()
+    saola_widget::menu_row(
+        t,
+        Surface::Ink,
+        Some(glyph),
+        &entry.name,
+        tint,
+        Some(Message::OpenWithChosen(entry.id.clone())),
+    )
 }
 
 fn empty_note<'a>(t: &'a Theme, message: &'a str) -> Element<'a, Message> {

@@ -123,7 +123,7 @@ impl Default for MimeDb {
     }
 }
 
-/// The coarse classification [`crate::icons::Icon::for_entry`] draws a
+/// The coarse classification [`crate::icons::for_entry`] draws a
 /// glyph *shape* from. Deliberately coarser than a raw mimetype string:
 /// dozens of `text/x-*` source-language mimetypes all read as
 /// [`Category::Code`] — one glyph, the way a real file manager's icon set

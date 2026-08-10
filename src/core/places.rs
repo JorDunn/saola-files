@@ -23,7 +23,7 @@ use crate::config::SavedServer;
 use crate::core::vfs::Location;
 
 /// What kind of shortcut a [`Place`] is — the sidebar reads this to pick
-/// an icon ([`crate::icons::Icon::for_place`]); nothing else in `core/`
+/// an icon ([`crate::icons::for_place`]); nothing else in `core/`
 /// branches on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaceKind {

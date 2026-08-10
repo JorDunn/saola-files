@@ -14,13 +14,13 @@ use iced::widget::{
     Space, button, column, container, mouse_area, row, scrollable, text, text_input,
 };
 use iced::{Element, Fill, Length};
+use saola_theme::icon::{self, Icon};
 use saola_theme::{ColorExt, Surface, Theme, convert, style};
 
 use crate::config::SortKey;
 use crate::core::fs::entry::{EntryKind, FileEntry};
 use crate::core::mime::MimeDb;
 use crate::core::thumbs::ThumbCache;
-use crate::icons::{self, Icon};
 
 use super::rename::RENAME_INPUT_ID;
 use super::{DirectoryView, Message, row_icon, thumbnail_for};
@@ -183,9 +183,9 @@ fn header_cell<'a>(
         };
         row![
             name,
-            icons::icon(glyph, t.sizes.icon_row, t.on_paper.secondary.into_iced()),
+            icon::icon(glyph, t.sizes.icon_row, t.on_paper.secondary.into_iced()),
         ]
-        .spacing(4.0)
+        .spacing(t.sizes.gap_tight)
         .align_y(iced::Center)
         .into()
     } else {
@@ -249,7 +249,7 @@ fn entry_row<'a>(
             .width(t.sizes.icon_row)
             .height(t.sizes.icon_row)
             .into(),
-        None => icons::icon(
+        None => icon::icon(
             row_icon(entry, mime_db),
             t.sizes.icon_row,
             icon_color.into_iced(),
@@ -292,7 +292,12 @@ fn entry_row<'a>(
     .padding([0.0, t.sizes.pill_gap]);
 
     let styled = button(content)
-        .style(row_style(t, selected, has_cursor))
+        .style(style::button::list_row(
+            t,
+            Surface::Paper,
+            selected,
+            has_cursor,
+        ))
         .width(Fill)
         .height(t.sizes.list_row)
         .padding(0)
@@ -315,7 +320,7 @@ fn renaming_row<'a>(
     entry: &'a FileEntry,
     rename: &'a super::rename::RenameState,
 ) -> Element<'a, Message> {
-    let icon = icons::icon(
+    let icon = icon::icon(
         row_icon(entry, mime_db),
         t.sizes.icon_row,
         t.on_paper.primary.into_iced(),
@@ -362,67 +367,8 @@ fn renaming_row<'a>(
         .into()
 }
 
-/// §6 "List row" (`docs/SAOLA-STYLE-GUIDE.md`): height `sizes.list_row`
-/// (38px, inside the spec's 36–42px range), `radii.pill`, transparent at
-/// rest, `fill_subtle` on hover, terracotta when selected with ivory
-/// text. The keyboard cursor (a concept distinct from selection — iced
-/// buttons have no `Status::Focused`, so it's app state) draws
-/// `style::focus_border` around the row it sits on.
-///
-/// **Upstream gap** (verified against the pinned `saola-theme-v0.5.0`
-/// tag): there is no `style::button::list_row` helper yet, so this is
-/// derived locally from the `rest`/`active` recipes in saola-theme's
-/// `style/button.rs`. TODO(saola-theme): promote this to
-/// `style::button::list_row(t, Surface, selected: bool)` upstream and
-/// delete this function once a new tag ships it; bump the pinned tag in
-/// this crate's `Cargo.toml` in the same PR that adopts it.
-fn row_style(
-    t: &Theme,
-    selected: bool,
-    has_cursor: bool,
-) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
-    let radius = t.radii.pill;
-    let on = t.on_paper;
-    let accent = t.palette.accent;
-    let paper_text = t.palette.paper;
-    let focus = style::focus_border(t, radius);
-
-    move |_, status| {
-        let (background, text_color) = if selected {
-            let bg = match status {
-                button::Status::Hovered => on.fill_subtle.over(accent),
-                button::Status::Pressed => on.fill.over(accent),
-                _ => accent,
-            };
-            (Some(bg), paper_text)
-        } else {
-            let bg = match status {
-                button::Status::Hovered => Some(on.fill_subtle),
-                button::Status::Pressed => Some(on.fill),
-                _ => None,
-            };
-            (bg, on.primary)
-        };
-
-        button::Style {
-            background: background.map(|color| iced::Background::Color(color.into_iced())),
-            text_color: text_color.into_iced(),
-            border: if has_cursor {
-                focus
-            } else {
-                iced::Border {
-                    color: iced::Color::TRANSPARENT,
-                    width: 0.0,
-                    radius: radius.into(),
-                }
-            },
-            ..button::Style::default()
-        }
-    }
-}
-
 fn empty_state<'a>(t: &'a Theme, message: &'a str) -> Element<'a, Message> {
-    empty_state_owned(t, message.to_owned())
+    saola_theme::widget::empty_state(t, Surface::Paper, message)
 }
 
 fn empty_state_owned<'a>(t: &'a Theme, message: String) -> Element<'a, Message> {

@@ -34,12 +34,12 @@ use std::path::PathBuf;
 
 use iced::widget::{Space, button, column, container, row, scrollable, text};
 use iced::{Center, Element, Fill, Task};
+use saola_theme::icon::{self, Icon};
 use saola_theme::{ColorExt, Surface, Theme, convert, style};
 
 use crate::core::fs::entry::EntryKind;
 use crate::core::fs::trash::{self, TrashedItem};
 use crate::core::vfs::VfsError;
-use crate::icons::{self, Icon};
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -168,14 +168,14 @@ impl TrashView {
         let toolbar_row = toolbar(t, self.items.is_empty(), self.confirming_empty);
 
         let body: Element<'a, Message> = if let Some(err) = &self.error {
-            empty_state(t, err)
+            saola_theme::widget::empty_state(t, Surface::Paper, err)
         } else if self.items.is_empty() {
             let message = if self.loading {
                 "Loading…"
             } else {
                 "Trash is empty"
             };
-            empty_state(t, message)
+            saola_theme::widget::empty_state(t, Surface::Paper, message)
         } else {
             let rows: Vec<Element<'a, Message>> = self
                 .items
@@ -234,7 +234,7 @@ fn toolbar<'a>(t: &'a Theme, items_empty: bool, confirming: bool) -> Element<'a,
         .color(t.on_paper.primary.into_iced());
 
     let empty_content = row![
-        icons::icon(
+        icon::icon(
             Icon::Trash2,
             t.sizes.icon_row,
             t.on_paper.primary.into_iced()
@@ -247,20 +247,20 @@ fn toolbar<'a>(t: &'a Theme, items_empty: bool, confirming: bool) -> Element<'a,
     .align_y(Center);
     let mut empty_button = button(empty_content)
         .style(style::button::rest(t, Surface::Paper))
-        .padding([6.0, 14.0]);
+        .padding(t.paddings.pill_button);
     if !items_empty {
         empty_button = empty_button.on_press(Message::EmptyRequested);
     }
 
     // The trash browser's toolbar is the same chrome region `ui::header`'s
-    // is, so it takes the same recessed `container::tile` ground rather
-    // than sitting on the listing's paper.
+    // is, so it takes the same recessed `style::container::inset` ground
+    // (Stage 12) rather than sitting on the listing's paper.
     container(
         row![title, Space::new().width(Fill), empty_button]
             .align_y(Center)
             .width(Fill),
     )
-    .style(style::container::tile(t, Surface::Paper))
+    .style(style::container::inset(t, Surface::Paper))
     .width(Fill)
     .height(t.sizes.window_header)
     .padding([0.0, t.sizes.pill_gap])
@@ -287,7 +287,7 @@ fn confirm_strip<'a>(t: &'a Theme) -> Element<'a, Message> {
             .font(convert::ui_font(t)),
     )
     .style(style::button::rest(t, Surface::Paper))
-    .padding([6.0, 14.0])
+    .padding(t.paddings.pill_button)
     .on_press(Message::EmptyCancelClicked);
 
     let confirm = button(
@@ -296,19 +296,19 @@ fn confirm_strip<'a>(t: &'a Theme) -> Element<'a, Message> {
             .font(convert::ui_font(t)),
     )
     .style(style::button::rest(t, Surface::Paper))
-    .padding([6.0, 14.0])
+    .padding(t.paddings.pill_button)
     .on_press(Message::EmptyConfirmClicked);
 
-    // Takes the toolbar's own `container::tile` ground: it *replaces* the
-    // toolbar in place, so it has to occupy the same region, at the same
-    // height, on the same surface — otherwise confirming would look like
-    // the chrome band vanished.
+    // Takes the toolbar's own `style::container::inset` ground (Stage 12):
+    // it *replaces* the toolbar in place, so it has to occupy the same
+    // region, at the same height, on the same surface — otherwise
+    // confirming would look like the chrome band vanished.
     container(
         row![label, Space::new().width(Fill), cancel, confirm]
             .spacing(t.sizes.pill_gap)
             .align_y(Center),
     )
-    .style(style::container::tile(t, Surface::Paper))
+    .style(style::container::inset(t, Surface::Paper))
     .width(Fill)
     .height(t.sizes.window_header)
     .padding([0.0, t.sizes.pill_gap])
@@ -324,7 +324,7 @@ fn item_row<'a>(t: &'a Theme, index: usize, item: &'a TrashedItem) -> Element<'a
     } else {
         Icon::File
     };
-    let icon = icons::icon(glyph, t.sizes.icon_row, t.on_paper.primary.into_iced());
+    let icon = icon::icon(glyph, t.sizes.icon_row, t.on_paper.primary.into_iced());
 
     let name = item
         .original_path
@@ -346,7 +346,7 @@ fn item_row<'a>(t: &'a Theme, index: usize, item: &'a TrashedItem) -> Element<'a
         .color(t.on_paper.secondary.into_iced());
 
     let restore_content = row![
-        icons::icon(
+        icon::icon(
             Icon::RotateCcw,
             t.sizes.icon_row,
             t.on_paper.primary.into_iced()
@@ -355,11 +355,11 @@ fn item_row<'a>(t: &'a Theme, index: usize, item: &'a TrashedItem) -> Element<'a
             .size(t.typography.size.label)
             .font(convert::ui_font(t)),
     ]
-    .spacing(4.0)
+    .spacing(t.sizes.gap_tight)
     .align_y(Center);
     let restore = button(restore_content)
         .style(style::button::bare(t, Surface::Paper))
-        .padding([6.0, 10.0])
+        .padding(t.paddings.strip)
         .on_press(Message::RestoreRequested(index));
 
     let content = row![icon, labels, date, restore]
@@ -368,20 +368,6 @@ fn item_row<'a>(t: &'a Theme, index: usize, item: &'a TrashedItem) -> Element<'a
         .padding([t.sizes.pill_gap / 2.0, t.sizes.pill_gap]);
 
     container(content).width(Fill).into()
-}
-
-fn empty_state<'a>(t: &'a Theme, message: &'a str) -> Element<'a, Message> {
-    container(
-        text(message.to_owned())
-            .size(t.typography.size.secondary)
-            .font(convert::ui_font_regular(t))
-            .color(t.on_paper.tertiary.into_iced()),
-    )
-    .width(Fill)
-    .height(Fill)
-    .align_x(iced::alignment::Horizontal::Center)
-    .align_y(iced::alignment::Vertical::Center)
-    .into()
 }
 
 #[cfg(test)]

@@ -12,10 +12,10 @@ use std::path::{Component, PathBuf};
 
 use iced::widget::{button, container, row, text, text_input};
 use iced::{Center, Element, Fill};
-use saola_theme::{ColorExt, Surface, Theme, convert, style};
+use saola_theme::icon::{self, Icon};
+use saola_theme::{ColorExt, Surface, Theme, convert, style, widget};
 
 use crate::core::vfs::Location;
-use crate::icons::{self, Icon};
 use crate::keymap::Action;
 use crate::ui::dirview::{self, DirectoryView};
 
@@ -48,6 +48,18 @@ fn editor<'a>(t: &'a Theme, buffer: &'a str) -> Element<'a, dirview::Message> {
         .into()
 }
 
+/// Stage 12: each pill's styling is now `style::button::breadcrumb` (the
+/// upstreamed promotion of this function's own hand-rolled `active`/`bare`
+/// branch) with `paddings.breadcrumb`, separated by a `chevron-right` glyph
+/// in the `quaternary` role — the exact recipe `widget::breadcrumb`
+/// documents. This crate can't call that composite constructor directly:
+/// its crumb labels are computed fresh every `view()` from `Location`
+/// components (`to_string_lossy`/`format!` all produce owned `String`s), and
+/// `widget::breadcrumb` needs `&'a str` slices that outlive the returned
+/// `Element<'a, _>` — a bound only `'static`/pre-stored labels can satisfy.
+/// So `pill` stays a local per-crumb builder (owning its `text(label)` the
+/// same way the pre-Stage-12 version did) while still adopting the shared
+/// style/padding/separator pieces.
 fn pills<'a>(t: &'a Theme, location: &'a Location) -> Element<'a, dirview::Message> {
     let mut segments: Vec<Element<'a, dirview::Message>> = Vec::new();
 
@@ -62,12 +74,13 @@ fn pills<'a>(t: &'a Theme, location: &'a Location) -> Element<'a, dirview::Messa
     // pill for remote locations" requirement. It jumps to that authority's
     // root, same as the plain "/" pill below.
     if let Some(authority) = &location.authority {
-        segments.push(pill(
+        push_pill(
             t,
+            &mut segments,
             format!("{}://{authority}", location.scheme),
             root.clone(),
             false,
-        ));
+        );
     }
 
     let components: Vec<_> = location
@@ -80,7 +93,7 @@ fn pills<'a>(t: &'a Theme, location: &'a Location) -> Element<'a, dirview::Messa
         .collect();
 
     let is_root = components.is_empty();
-    segments.push(pill(t, "/".to_owned(), root, is_root));
+    push_pill(t, &mut segments, "/".to_owned(), root, is_root);
 
     let mut cumulative = PathBuf::from("/");
     let last_index = components.len().saturating_sub(1);
@@ -95,32 +108,52 @@ fn pills<'a>(t: &'a Theme, location: &'a Location) -> Element<'a, dirview::Messa
         // conversion `FileEntry::display_name` uses — a breadcrumb label
         // is inherently human-facing text, not the path identity itself
         // (which stays in `target.path` as a real `PathBuf`).
-        segments.push(pill(
+        push_pill(
             t,
+            &mut segments,
             part.to_string_lossy().into_owned(),
             target,
             index == last_index,
-        ));
+        );
     }
 
-    let trail = row(segments).spacing(4.0).align_y(Center);
+    let trail = row(segments).spacing(t.sizes.pill_gap).align_y(Center);
 
     // The edit-pencil gives a mouse-only path into `Action::EditPath` —
     // Ctrl+L is the primary trigger, this is parity for anyone not
     // driving the keyboard.
-    let edit = button(icons::icon(
+    let edit = widget::icon_button(
+        t,
+        Surface::Paper,
         Icon::Pencil,
-        t.sizes.icon_row,
+        None,
         t.on_paper.primary.into_iced(),
-    ))
-    .style(style::button::bare(t, Surface::Paper))
-    .padding([4.0, 10.0])
-    .on_press(dirview::Message::Action(Action::EditPath));
+        Some(dirview::Message::Action(Action::EditPath)),
+    );
 
     row![container(trail).width(Fill), edit]
         .align_y(Center)
         .width(Fill)
         .into()
+}
+
+/// Pushes one crumb pill onto `segments`, followed by a
+/// `Icon::ChevronRight` separator glyph in the `quaternary` role when
+/// another crumb follows — `widget::breadcrumb`'s exact separator recipe
+/// (see its doc comment), inlined here since the composite constructor
+/// itself can't be called (see [`pills`]'s doc comment).
+fn push_pill<'a>(
+    t: &'a Theme,
+    segments: &mut Vec<Element<'a, dirview::Message>>,
+    label: String,
+    target: Location,
+    is_current: bool,
+) {
+    if !segments.is_empty() {
+        let separator_tint = t.on_paper.quaternary.into_iced();
+        segments.push(icon::icon(Icon::ChevronRight, t.sizes.icon_bar, separator_tint).into());
+    }
+    segments.push(pill(t, label, target, is_current));
 }
 
 fn pill<'a>(
@@ -132,19 +165,9 @@ fn pill<'a>(
     let content = text(label)
         .size(t.typography.size.secondary)
         .font(convert::ui_font(t));
-    // `button::rest`/`button::active` are two distinct opaque closure
-    // types (see saola-theme's `style::segmented` docs for the same
-    // constraint) — branch on the whole button, not just the style
-    // argument, so each arm's `.style(...)` call picks a single concrete
-    // type before `.padding`/`.on_press` unify them back into one
-    // `Button<...>`.
-    let styled = if is_current {
-        button(content).style(style::button::active(t, Surface::Paper))
-    } else {
-        button(content).style(style::button::bare(t, Surface::Paper))
-    };
-    styled
-        .padding([4.0, 10.0])
+    button(content)
+        .style(style::button::breadcrumb(t, Surface::Paper, is_current))
+        .padding(t.paddings.breadcrumb)
         .on_press(dirview::Message::BreadcrumbClicked(target))
         .into()
 }

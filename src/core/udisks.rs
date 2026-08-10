@@ -73,7 +73,7 @@ pub struct Mount {
     pub mount_point: PathBuf,
     /// Whether the underlying drive reports itself as removable
     /// (`Drive.Removable`) — the sidebar picks between the hard-drive and
-    /// USB-stick glyphs on this (`crate::icons::Icon::for_mount`), never a
+    /// USB-stick glyphs on this (`crate::icons::for_mount`), never a
     /// color (style guide §1: shape, never hue).
     pub removable: bool,
 }

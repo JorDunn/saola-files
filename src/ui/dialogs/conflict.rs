@@ -11,15 +11,10 @@
 
 use iced::widget::{button, checkbox, column, container, row, text};
 use iced::{Center, Element, Fill, Length};
+use saola_theme::icon::{self, Icon};
 use saola_theme::{ColorExt, Surface, Theme, convert, style};
 
 use crate::core::fs::ops::{Conflict, ConflictChoice};
-use crate::icons::{self, Icon};
-
-/// Dialog card width. Layout-specific, not a saola-theme size — same
-/// "local constant, documented style debt" posture `ui::sidebar::
-/// SIDEBAR_WIDTH`/`ui::dialogs::progress::STRIP_HEIGHT` already take.
-const DIALOG_WIDTH: f32 = 380.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Message {
@@ -77,10 +72,14 @@ pub fn view<'a>(t: &'a Theme, conflict: &'a Conflict, apply_to_all: bool) -> Ele
 
     let content = column![title, body, buttons, apply_all]
         .spacing(t.sizes.popover_padding / 2.0)
-        .width(Length::Fixed(DIALOG_WIDTH));
+        .width(Length::Fixed(t.sizes.dialog_width));
 
+    // Stage 12: `style::dialog::surface` — the dialog kit's card recipe
+    // (paper-surface card at `radii.card` with the popover shadow; always
+    // this recipe, never a `Surface`-dependent one, since a dialog is a
+    // light window by definition — see that helper's doc comment).
     container(content)
-        .style(style::container::card(t, Surface::Paper))
+        .style(style::dialog::surface(t))
         .padding(t.sizes.popover_padding)
         .into()
 }
@@ -92,7 +91,7 @@ fn choice_button<'a>(
     choice: ConflictChoice,
 ) -> Element<'a, Message> {
     let content = row![
-        icons::icon(glyph, t.sizes.icon_row, t.on_paper.primary.into_iced()),
+        icon::icon(glyph, t.sizes.icon_row, t.on_paper.primary.into_iced()),
         text(label)
             .size(t.typography.size.body)
             .font(convert::ui_font(t)),
@@ -108,7 +107,7 @@ fn choice_button<'a>(
     // sit hard against the button's left edge.
     button(container(content).center_x(Fill))
         .style(style::button::rest(t, Surface::Paper))
-        .padding([10.0, 16.0])
+        .padding(t.paddings.dialog_button)
         .width(Fill)
         .on_press(Message::ChoiceSelected(choice))
         .into()

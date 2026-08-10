@@ -10,20 +10,12 @@
 //! does that translation once, per event, same split `ui::sidebar` draws
 //! between `core::udisks::Mount`s and its own render-time `view`.
 
-use iced::widget::{button, column, container, progress_bar, row, text};
-use iced::{Center, Element, Fill, Length, Subscription};
-use saola_theme::{ColorExt, Surface, Theme, convert, style};
+use iced::widget::{button, column, row, text};
+use iced::{Center, Element, Fill, Subscription};
+use saola_theme::icon::{self, Icon};
+use saola_theme::{ColorExt, Surface, Theme, convert, style, widget};
 
 use crate::core::fs::ops::{OpEvent, OpKind, OpRequest};
-use crate::icons::{self, Icon};
-
-/// Height of the ops strip. Layout-specific to this chrome, not a
-/// saola-theme design-system size — same "local constant, documented
-/// upstream gap" posture `ui::sidebar::SIDEBAR_WIDTH` already takes.
-/// TODO(saola-theme): promote to a `sizes.ops_strip` token if a second
-/// consumer of the same height ever shows up; one call site isn't worth a
-/// tag bump on its own yet.
-const STRIP_HEIGHT: f32 = 56.0;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Message {
@@ -110,7 +102,7 @@ pub fn view<'a>(t: &'a Theme, progress: &'a Progress) -> Element<'a, Message> {
         )
     };
 
-    let icon = icons::icon(
+    let icon = icon::icon(
         Icon::ClipboardPaste,
         t.sizes.icon_row,
         t.on_paper.primary.into_iced(),
@@ -120,37 +112,33 @@ pub fn view<'a>(t: &'a Theme, progress: &'a Progress) -> Element<'a, Message> {
         text(label)
             .size(t.typography.size.secondary)
             .font(convert::ui_font(t)),
-        progress_bar(0.0..=100.0, progress.percent())
-            .style(style::progress::bar(t, Surface::Paper))
-            .girth(6.0),
+        widget::progress_rule(t, Surface::Paper, progress.percent() / 100.0),
     ]
-    .spacing(4.0)
+    .spacing(t.sizes.gap_tight)
     .width(Fill);
 
-    let cancel = button(icons::icon(
+    let cancel = button(icon::icon(
         Icon::X,
         t.sizes.icon_row,
         t.on_paper.primary.into_iced(),
     ))
     .style(style::button::bare(t, Surface::Paper))
-    .padding([6.0, 10.0])
+    .padding(t.paddings.strip)
     .on_press(Message::CancelRequested);
 
-    container(
+    // Stage 12: `widget::footer_strip` — the footer band a window docks its
+    // transient chrome into (this strip and `ui::dialogs::undo_toast`'s,
+    // which occupy the identical band and must read as one continuous piece
+    // of chrome when one replaces the other — see that helper's doc
+    // comment, promoted from exactly this pair).
+    widget::footer_strip(
+        t,
+        Surface::Paper,
         row![icon, text_col, cancel]
             .spacing(t.sizes.pill_gap)
             .align_y(Center)
             .width(Fill),
     )
-    .style(style::container::card(t, Surface::Paper))
-    .width(Fill)
-    .height(Length::Fixed(STRIP_HEIGHT))
-    .padding([0.0, t.sizes.popover_padding / 2.0])
-    // The strip has a fixed height and no vertical padding, so its
-    // contents need centring explicitly or they render flush against the
-    // card's top edge.
-    .align_y(Center)
-    .into()
 }
 
 #[cfg(test)]

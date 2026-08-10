@@ -17,12 +17,12 @@ use iced::widget::{
     Space, button, column, container, mouse_area, row, scrollable, text, text_input,
 };
 use iced::{Center, Element, Fill, Length};
+use saola_theme::icon;
 use saola_theme::{ColorExt, Surface, Theme, convert, style};
 
 use crate::core::fs::entry::FileEntry;
 use crate::core::mime::MimeDb;
 use crate::core::thumbs::ThumbCache;
-use crate::icons;
 
 use super::rename::RENAME_INPUT_ID;
 use super::{DirectoryView, Message, row_icon, thumbnail_for};
@@ -32,24 +32,6 @@ use super::{DirectoryView, Message, row_icon, thumbnail_for};
 /// Up/Down/PageUp/PageDown cursor math) can step by a full visual row in
 /// grid mode instead of by one item at a time.
 pub(super) const GRID_COLUMNS: usize = 6;
-
-/// The glyph square's side length.
-///
-/// **Upstream gap** (verified against the pinned `saola-theme-v0.5.0`
-/// tag — same posture as `list.rs`'s `row_style` TODO, and already
-/// anticipated in the Stage 3 handoff's upstream-debt list): there is no
-/// `sizes.grid_tile` token yet. TODO(saola-theme): promote this to
-/// `sizes.grid_tile` and delete the local constant once a new tag ships
-/// it; bump the pinned tag in this crate's `Cargo.toml` in the same PR.
-const GRID_TILE_SIZE: f32 = 96.0;
-
-/// Extra height below the glyph square reserved for the name label.
-const GRID_LABEL_HEIGHT: f32 = 34.0;
-
-/// Gap between tiles, both axes, and between the tile and its own border.
-/// Same upstream-gap posture as `GRID_TILE_SIZE` — pending
-/// `sizes.grid_tile_gap`.
-const GRID_GAP: f32 = 12.0;
 
 /// Extra rows rendered above/below the on-screen band, same purpose as
 /// `list.rs`'s `OVERSCAN_ROWS` but in units of tile-rows (each covers
@@ -79,7 +61,7 @@ pub(super) fn view<'a>(
     }
 
     let total = state.visible.len();
-    let tile_row_height = GRID_TILE_SIZE + GRID_LABEL_HEIGHT + GRID_GAP;
+    let tile_row_height = t.sizes.grid_tile + t.sizes.grid_tile_label + t.sizes.grid_tile_gap;
     let total_rows = total.div_ceil(GRID_COLUMNS);
     let (first_row, last_row) = visible_row_range(state, tile_row_height, total_rows);
 
@@ -101,7 +83,7 @@ pub(super) fn view<'a>(
                     .get(entry_index)
                     .map(|entry| tile(state, t, mime_db, thumb_cache, start + offset, entry))
             });
-        row(tiles).spacing(GRID_GAP).into()
+        row(tiles).spacing(t.sizes.grid_tile_gap).into()
     });
 
     let body_column = column(
@@ -109,8 +91,8 @@ pub(super) fn view<'a>(
             .chain(rows)
             .chain(std::iter::once(after.into())),
     )
-    .spacing(GRID_GAP)
-    .padding(GRID_GAP)
+    .spacing(t.sizes.grid_tile_gap)
+    .padding(t.sizes.grid_tile_gap)
     .width(Fill);
 
     scrollable(body_column)
@@ -173,10 +155,10 @@ fn tile<'a>(
     };
     let glyph: Element<'a, Message> = match thumbnail_for(state, thumb_cache, entry) {
         Some(handle) => iced::widget::image(handle.handle())
-            .width(GRID_TILE_SIZE)
-            .height(GRID_TILE_SIZE)
+            .width(t.sizes.grid_tile)
+            .height(t.sizes.grid_tile)
             .into(),
-        None => icons::icon(
+        None => icon::icon(
             row_icon(entry, mime_db),
             t.sizes.icon_bare,
             icon_color.into_iced(),
@@ -196,12 +178,12 @@ fn tile<'a>(
     let content = column![
         container(glyph)
             .width(Fill)
-            .height(Length::Fixed(GRID_TILE_SIZE))
+            .height(Length::Fixed(t.sizes.grid_tile))
             .align_x(iced::alignment::Horizontal::Center)
             .align_y(Center),
         name,
     ]
-    .width(Length::Fixed(GRID_TILE_SIZE))
+    .width(Length::Fixed(t.sizes.grid_tile))
     .align_x(Center);
 
     // The wrapping `container` centres glyph+label vertically in the tile.
@@ -210,9 +192,14 @@ fn tile<'a>(
     // collect below the label; a `container` hands its child loose limits
     // and *does* align the result.
     let styled = button(container(content).height(Fill).align_y(Center))
-        .style(tile_style(t, selected, has_cursor))
-        .width(Length::Fixed(GRID_TILE_SIZE))
-        .height(Length::Fixed(GRID_TILE_SIZE + GRID_LABEL_HEIGHT))
+        .style(style::button::selection_tile(
+            t,
+            Surface::Paper,
+            selected,
+            has_cursor,
+        ))
+        .width(Length::Fixed(t.sizes.grid_tile))
+        .height(Length::Fixed(t.sizes.grid_tile + t.sizes.grid_tile_label))
         .padding(t.sizes.pill_gap / 2.0)
         .on_press(Message::RowClicked(visible_index));
 
@@ -235,7 +222,7 @@ fn renaming_tile<'a>(
     entry: &'a FileEntry,
     rename: &'a super::rename::RenameState,
 ) -> Element<'a, Message> {
-    let glyph = icons::icon(
+    let glyph = icon::icon(
         row_icon(entry, mime_db),
         t.sizes.icon_bare,
         t.on_paper.primary.into_iced(),
@@ -252,81 +239,26 @@ fn renaming_tile<'a>(
     let content = column![
         container(glyph)
             .width(Fill)
-            .height(Length::Fixed(GRID_TILE_SIZE))
+            .height(Length::Fixed(t.sizes.grid_tile))
             .align_x(iced::alignment::Horizontal::Center)
             .align_y(Center),
         field,
     ]
-    .width(Length::Fixed(GRID_TILE_SIZE))
+    .width(Length::Fixed(t.sizes.grid_tile))
     .align_x(Center);
 
     // Same centring an ordinary `tile` gets, so a tile mid-rename doesn't
     // shift its glyph relative to its neighbours.
     container(content)
-        .width(Length::Fixed(GRID_TILE_SIZE))
-        .height(Length::Fixed(GRID_TILE_SIZE + GRID_LABEL_HEIGHT))
+        .width(Length::Fixed(t.sizes.grid_tile))
+        .height(Length::Fixed(t.sizes.grid_tile + t.sizes.grid_tile_label))
         .padding(t.sizes.pill_gap / 2.0)
         .align_y(Center)
         .into()
 }
 
-/// Selected/cursor tile treatment. Same "no upstream style for this yet"
-/// posture as `list.rs`'s `row_style` — a tile is a bigger, squarer
-/// analogue of a list row, so the recipe (transparent rest, `fill_subtle`
-/// hover, terracotta selected, `focus_border` ring for the keyboard
-/// cursor) is deliberately identical, just at `radii.tile` instead of
-/// `radii.pill`.
-///
-/// TODO(saola-theme): promote to a `style::button`/`style::container`
-/// "selected tile" helper (paired with `sizes.grid_tile`) and delete this
-/// once saola-theme ships it; bump the pinned tag in the same PR.
-fn tile_style(
-    t: &Theme,
-    selected: bool,
-    has_cursor: bool,
-) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
-    let radius = t.radii.tile;
-    let on = t.on_paper;
-    let accent = t.palette.accent;
-    let paper_text = t.palette.paper;
-    let focus = style::focus_border(t, radius);
-
-    move |_, status| {
-        let (background, text_color) = if selected {
-            let bg = match status {
-                button::Status::Hovered => on.fill_subtle.over(accent),
-                button::Status::Pressed => on.fill.over(accent),
-                _ => accent,
-            };
-            (Some(bg), paper_text)
-        } else {
-            let bg = match status {
-                button::Status::Hovered => Some(on.fill_subtle),
-                button::Status::Pressed => Some(on.fill),
-                _ => None,
-            };
-            (bg, on.primary)
-        };
-
-        button::Style {
-            background: background.map(|color| iced::Background::Color(color.into_iced())),
-            text_color: text_color.into_iced(),
-            border: if has_cursor {
-                focus
-            } else {
-                iced::Border {
-                    color: iced::Color::TRANSPARENT,
-                    width: 0.0,
-                    radius: radius.into(),
-                }
-            },
-            ..button::Style::default()
-        }
-    }
-}
-
 fn empty_state<'a>(t: &'a Theme, message: &'a str) -> Element<'a, Message> {
-    empty_state_owned(t, message.to_owned())
+    saola_theme::widget::empty_state(t, Surface::Paper, message)
 }
 
 fn empty_state_owned<'a>(t: &'a Theme, message: String) -> Element<'a, Message> {

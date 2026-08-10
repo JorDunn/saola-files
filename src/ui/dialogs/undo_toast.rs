@@ -30,22 +30,10 @@
 
 use std::time::{Duration, Instant};
 
-use iced::widget::{button, container, row, text};
-use iced::{Center, Element, Fill, Length, Subscription};
-use saola_theme::{ColorExt, Surface, Theme, convert, style};
-
-use crate::icons::{self, Icon};
-
-/// Height of the toast strip — deliberately the same literal
-/// `ui::dialogs::progress::STRIP_HEIGHT` uses (that constant is private to
-/// its own module, so this is a second copy, not a shared one): the two
-/// strips occupy the identical footer position and must read as one
-/// continuous piece of chrome, never a visible height jump when one
-/// replaces the other. TODO(saola-theme): promote to a shared
-/// `sizes.ops_strip` token — `ui::dialogs::progress`'s own TODO comment
-/// already flags this gap; a second consumer here is exactly the "second
-/// call site" that comment says would justify the tag bump.
-const STRIP_HEIGHT: f32 = 56.0;
+use iced::widget::{button, container, progress_bar, row, text};
+use iced::{Center, Element, Fill, Subscription};
+use saola_theme::icon::{self, Icon};
+use saola_theme::{ColorExt, Surface, Theme, convert, motion, style};
 
 /// How often the strip re-renders while a toast is up — coarse enough to
 /// cost nothing (this is a fade, not `saola-capture::modules::toast`'s
@@ -91,42 +79,6 @@ impl Toast {
         let total = Duration::from_millis(theme.motion.toast_total.into());
         now.saturating_duration_since(self.shown_at) >= total
     }
-
-    fn alpha(&self, theme: &Theme, now: Instant) -> f32 {
-        alpha_for(theme, now.saturating_duration_since(self.shown_at))
-    }
-}
-
-/// The fade-alpha half of `saola-capture::modules::toast::phase` — in over
-/// `toast_in`, steady over `toast_idle`, out over `toast_out`. No offset
-/// component here (see the module doc comment on why this toast never
-/// slides).
-fn alpha_for(theme: &Theme, elapsed: Duration) -> f32 {
-    let in_dur = Duration::from_millis(theme.motion.toast_in.into());
-    let idle_dur = Duration::from_millis(theme.motion.toast_idle.into());
-    let out_dur = Duration::from_millis(theme.motion.toast_out.into());
-
-    if elapsed < in_dur {
-        fraction(elapsed, in_dur)
-    } else if elapsed < in_dur + idle_dur {
-        1.0
-    } else {
-        let fade_elapsed = elapsed.saturating_sub(in_dur + idle_dur);
-        1.0 - fraction(fade_elapsed, out_dur)
-    }
-}
-
-/// `elapsed / total`, clamped — identical shape to
-/// `core::fs::ops`'s/`saola-capture::modules::toast`'s own `fraction`
-/// helpers, re-derived locally rather than shared (eight lines, three
-/// independent modules, none of which may import each other — `core`
-/// can't see `ui`, and this crate shares no code with `saola-capture` at
-/// all).
-fn fraction(elapsed: Duration, total: Duration) -> f32 {
-    if total.is_zero() {
-        return 1.0;
-    }
-    (elapsed.as_secs_f32() / total.as_secs_f32()).clamp(0.0, 1.0)
 }
 
 /// Ticks only while `has_toast` — the same gated-subscription shape
@@ -141,22 +93,37 @@ pub fn subscription(has_toast: bool) -> Subscription<Message> {
     }
 }
 
-/// Renders the toast: a rotate-ccw icon, the frozen label, and an "Undo"
-/// button — `App::view` only calls this while `App::undo_toast` is `Some`,
-/// mirroring `ui::dialogs::progress::view`'s own "no empty rendering to
-/// keep honest here, the caller decides" posture.
+/// Renders the toast: the §6 notification card kit (a `notification_card`
+/// backdrop, a leading `icon_tile`, and a bottom-edge `life_rule` countdown)
+/// around a rotate-ccw icon, the frozen label, and an "Undo" button —
+/// `App::view` only calls this while `App::undo_toast` is `Some`, mirroring
+/// `ui::dialogs::progress::view`'s own "no empty rendering to keep honest
+/// here, the caller decides" posture.
+///
+/// Stage 12: promoted from a hand-rolled `container::card` + manual
+/// `scale_alpha` closure to `style::container::notification_card` +
+/// `style::notification::{life_rule, icon_tile}` +
+/// `motion::{toast_alpha, life_fraction}` — the exact upstream recipe those
+/// helpers' own doc comments describe as "saola-capture's toast derived
+/// exactly this card locally". `notification_card` is ink-only (a toast is
+/// shell-layer chrome per the style guide, regardless of the paper window
+/// it floats over), so this toast now reads as an ink card rather than a
+/// paper one — a deliberate part of adopting the shared recipe, not a bug.
 pub fn view<'a>(t: &'a Theme, toast: &'a Toast, now: Instant) -> Element<'a, Message> {
-    let alpha = toast.alpha(t, now);
-    let scale_alpha = |mut color: iced::Color| {
-        color.a *= alpha;
-        color
-    };
+    let elapsed = now.saturating_duration_since(toast.shown_at);
+    let alpha = motion::toast_alpha(t, elapsed);
+    let life = motion::life_fraction(t, elapsed);
 
-    let icon_color = scale_alpha(t.on_paper.primary.into_iced());
-    let text_color = scale_alpha(t.on_paper.primary.into_iced());
-    let accent_text = scale_alpha(t.palette.accent.into_iced());
+    let icon_color = t.on_ink.primary.with_opacity(alpha);
+    let text_color = t.on_ink.primary.with_opacity(alpha);
+    let accent_text = t.palette.accent.with_opacity(alpha);
 
-    let icon = icons::icon(Icon::RotateCcw, t.sizes.icon_row, icon_color);
+    let icon_tile = container(icon::icon(Icon::RotateCcw, t.sizes.icon_row, icon_color))
+        .style(style::notification::icon_tile(t))
+        .width(t.sizes.icon_tile)
+        .height(t.sizes.icon_tile)
+        .align_x(Center)
+        .align_y(Center);
 
     let label = text(toast.label.clone())
         .size(t.typography.size.secondary)
@@ -169,26 +136,35 @@ pub fn view<'a>(t: &'a Theme, toast: &'a Toast, now: Instant) -> Element<'a, Mes
             .font(convert::ui_font(t))
             .color(accent_text),
     )
-    .style(style::button::bare(t, Surface::Paper))
-    .padding([6.0, 10.0])
+    .style(style::button::bare(t, Surface::Ink))
+    .padding(t.paddings.strip)
     .on_press(Message::UndoClicked);
 
+    let body = row![
+        icon_tile,
+        label,
+        container(undo)
+            .width(Fill)
+            .align_x(iced::alignment::Horizontal::Right)
+    ]
+    .spacing(t.sizes.pill_gap)
+    .align_y(Center)
+    .width(Fill);
+
+    let life_rule = progress_bar(0.0..=1.0, life)
+        .length(Fill)
+        .girth(t.sizes.life_rule)
+        .style(style::notification::life_rule(t));
+
     container(
-        row![
-            icon,
-            label,
-            container(undo)
-                .width(Fill)
-                .align_x(iced::alignment::Horizontal::Right)
-        ]
-        .spacing(t.sizes.pill_gap)
-        .align_y(Center)
-        .width(Fill),
+        iced::widget::column![body, life_rule]
+            .spacing(t.sizes.pill_gap / 2.0)
+            .width(Fill),
     )
-    .style(style::container::card(t, Surface::Paper))
+    .style(style::container::notification_card(t, alpha))
     .width(Fill)
-    .height(Length::Fixed(STRIP_HEIGHT))
-    .padding([0.0, t.sizes.popover_padding / 2.0])
+    .height(t.sizes.ops_strip)
+    .padding([t.sizes.pill_gap / 2.0, t.sizes.popover_padding / 2.0])
     // Centred for the same reason `ui::dialogs::progress`'s strip is —
     // the two occupy the identical footer band and must read as one
     // continuous piece of chrome when one replaces the other.
@@ -221,28 +197,10 @@ mod tests {
         assert!(!toast.expired(&theme, now + total / 2));
     }
 
-    #[test]
-    fn alpha_fades_in_then_stays_at_full_then_fades_out() {
-        let theme = theme();
-        let in_dur = Duration::from_millis(theme.motion.toast_in.into());
-        let idle_dur = Duration::from_millis(theme.motion.toast_idle.into());
-        let total = Duration::from_millis(theme.motion.toast_total.into());
-
-        assert_eq!(alpha_for(&theme, Duration::ZERO), 0.0);
-        assert_eq!(alpha_for(&theme, in_dur), 1.0);
-        assert_eq!(alpha_for(&theme, in_dur + idle_dur / 2), 1.0);
-        assert_eq!(alpha_for(&theme, total), 0.0);
-    }
-
-    #[test]
-    fn fraction_clamps_and_guards_a_zero_total() {
-        assert_eq!(fraction(Duration::from_secs(1), Duration::ZERO), 1.0);
-        assert_eq!(
-            fraction(Duration::from_secs(10), Duration::from_secs(1)),
-            1.0
-        );
-        assert_eq!(fraction(Duration::ZERO, Duration::from_secs(1)), 0.0);
-    }
+    // The fade-envelope math itself (`alpha_for`/`fraction`) moved upstream
+    // to `saola_theme::motion::toast_alpha`/`fraction` in Stage 12 — that
+    // crate's own `motion` test module covers the three-phase envelope now;
+    // this module has no local math left to re-test.
 
     #[test]
     fn subscription_is_none_without_a_toast() {

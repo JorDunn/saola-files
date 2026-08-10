@@ -971,10 +971,7 @@ impl App {
     }
 
     fn style(&self, theme: &iced::Theme) -> iced::theme::Style {
-        iced::theme::Style {
-            background_color: iced::Color::TRANSPARENT,
-            ..iced::theme::default(theme)
-        }
+        saola_theme::chrome::transparent_clear(theme)
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -1055,9 +1052,21 @@ impl App {
         // there is no sane default resolution to fall back to.
         let with_conflict: Element<'_, Message> = match &self.pending_conflict {
             Some(pending) => {
-                let scrim =
-                    iced::widget::mouse_area(iced::widget::Space::new().width(Fill).height(Fill))
-                        .on_press(Message::Noop);
+                // Stage 12: the invisible click-swallowing scrim now paints
+                // the real §2 modal backdrop (`scrim.modal`,
+                // `rgba(12,10,0,0.62)`) instead of nothing — the click-swallow
+                // behavior (`Message::Noop`, see its own doc comment) is
+                // unchanged, only the paint underneath it.
+                let scrim = iced::widget::mouse_area(
+                    iced::widget::container(iced::widget::Space::new())
+                        .style(saola_theme::style::container::scrim(
+                            t,
+                            saola_theme::style::container::ScrimKind::Modal,
+                        ))
+                        .width(Fill)
+                        .height(Fill),
+                )
+                .on_press(Message::Noop);
                 let dialog = iced::widget::container(
                     ui::dialogs::conflict::view(t, &pending.conflict, pending.apply_to_all)
                         .map(Message::Conflict),

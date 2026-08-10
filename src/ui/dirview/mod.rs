@@ -1791,13 +1791,13 @@ impl DirectoryView {
 /// mimetype from the name alone (no content sniff — see `core::mime`'s
 /// module docs for why that's the right tradeoff for a per-frame,
 /// per-row call).
-pub(super) fn row_icon(entry: &FileEntry, mime_db: &MimeDb) -> crate::icons::Icon {
+pub(super) fn row_icon(entry: &FileEntry, mime_db: &MimeDb) -> saola_theme::icon::Icon {
     let category = if entry.kind == EntryKind::Directory {
         crate::core::mime::Category::Directory
     } else {
         crate::core::mime::category(&mime_db.guess(&entry.name, None))
     };
-    crate::icons::Icon::for_entry(entry.kind, entry.is_symlink, category)
+    crate::icons::for_entry(entry.kind, entry.is_symlink, category)
 }
 
 /// The cached thumbnail for one row/tile, if any — shared by `list.rs`/

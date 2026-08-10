@@ -18,11 +18,11 @@
 
 use iced::widget::{button, container, row, text};
 use iced::{Center, Element, Fill};
-use saola_theme::{ColorExt, Surface, Theme, convert, style};
+use saola_theme::icon::{self, Icon};
+use saola_theme::{ColorExt, Surface, Theme, convert, style, widget};
 
 use crate::config::View;
 use crate::core::vfs::Caps;
-use crate::icons::{self, Icon};
 use crate::keymap::Action;
 use crate::ui::breadcrumbs;
 use crate::ui::dirview::{self, DirectoryView};
@@ -61,17 +61,17 @@ pub fn view<'a>(t: &'a Theme, state: &'a DirectoryView) -> Element<'a, dirview::
 
     // The toolbar is the second of the window's two chrome regions (the
     // places sidebar is the first) and takes the same recessed ground:
-    // `container::tile` at `on_paper.fill_subtle`. Sitting the navigation
-    // controls on a step of ink — rather than on the same paper the file
-    // listing uses — is what stops the toolbar, the column headers and the
-    // rows below them from reading as one undifferentiated sheet. Its
-    // inset from the window edge and from the listing below comes from
-    // `ui::explorer` (`sizes.island_gap`), not from here.
-    //
-    // See `ui::sidebar::Sidebar::view` for the `container::inset` upstream
-    // gap this shares (`radii.tile` where §4 wants `radii.inset`).
+    // `style::container::inset` at `on_paper.fill_subtle`, `radii.inset` —
+    // Stage 12's upstreamed promotion of `container::tile`-at-`radii.inset`
+    // (see `ui::sidebar::Sidebar::view`'s doc comment for the full
+    // rationale). Sitting the navigation controls on a step of ink — rather
+    // than on the same paper the file listing uses — is what stops the
+    // toolbar, the column headers and the rows below them from reading as
+    // one undifferentiated sheet. Its inset from the window edge and from
+    // the listing below comes from `ui::explorer` (`sizes.island_gap`), not
+    // from here.
     container(content)
-        .style(style::container::tile(t, Surface::Paper))
+        .style(style::container::inset(t, Surface::Paper))
         .width(Fill)
         .height(t.sizes.window_header)
         .padding([0.0, t.sizes.pill_gap])
@@ -85,67 +85,51 @@ pub fn view<'a>(t: &'a Theme, state: &'a DirectoryView) -> Element<'a, dirview::
 /// doesn't capture its press, which is exactly "there's nowhere to go"
 /// for Back/Forward at the ends of the history stacks. `style::button::
 /// bare`'s own `Status::Disabled` arm dims *label text*, but an `Svg`
-/// icon's tint is a fixed color baked in at build time (`icons::icon`'s
-/// `.style()` closure never reads `button::Status`) — so this function
+/// icon's tint is a fixed color baked in at build time — so this function
 /// picks the dimmed `on_paper.disabled` tint itself when `!enabled`,
-/// rather than relying on the button style to do it.
+/// exactly the tint `widget::icon_button`'s own doc comment says the caller
+/// (not the button style) must choose.
 fn nav_button<'a>(
     t: &'a Theme,
     glyph: Icon,
     enabled: bool,
     action: Action,
 ) -> Element<'a, dirview::Message> {
-    let color = if enabled {
-        t.on_paper.primary
+    let tint = if enabled {
+        widget::role(t, Surface::Paper, widget::Emphasis::Rest)
     } else {
-        t.on_paper.disabled
+        widget::role(t, Surface::Paper, widget::Emphasis::Disabled)
     };
-    let content = icons::icon(glyph, t.sizes.icon_row, color.into_iced());
-    let mut b = button(content)
-        .style(style::button::bare(t, Surface::Paper))
-        .padding([6.0, 12.0]);
-    if enabled {
-        b = b.on_press(dirview::Message::Action(action));
-    }
-    b.into()
+    widget::icon_button(
+        t,
+        Surface::Paper,
+        glyph,
+        None,
+        tint,
+        enabled.then_some(dirview::Message::Action(action)),
+    )
 }
 
-/// The list/grid segmented switcher, built from `style::segmented`
-/// exactly the way that module's own docs describe: a track container
-/// plus one button per option, each styled `segment(t, s, is_selected)`.
-/// Icon tint follows `segment`'s own selected/unselected label color
-/// (ivory-on-terracotta selected, ink-on-fill otherwise) — same reasoning
-/// as `nav_button`'s doc comment: an `Svg` icon's tint is fixed at build
-/// time, so it can't ride the button style's own per-`Status` text color.
+/// The list/grid segmented switcher — Stage 12: `widget::segmented_row`, the
+/// upstreamed promotion of this function's own hand-rolled track+segment
+/// assembly (ported from saola-capture per that constructor's own doc
+/// comment). `segmented_row` is label-only (no icon slot), so the previous
+/// List/Grid glyphs are dropped here — a deliberate part of adopting the
+/// shared control, not an oversight; see the Stage 12 handoff's "expect
+/// visual diffs" note.
 fn view_switcher<'a>(t: &'a Theme, mode: View) -> Element<'a, dirview::Message> {
-    let segment = |glyph: Icon, label: &'static str, target: View, action: Action| {
-        let selected = mode == target;
-        let color = if selected {
-            t.palette.paper
-        } else {
-            t.on_paper.primary
-        };
-        let content = row![
-            icons::icon(glyph, t.sizes.icon_row, color.into_iced()),
-            text(label)
-                .size(t.typography.size.label)
-                .font(convert::ui_font(t)),
-        ]
-        .spacing(4.0)
-        .align_y(Center);
-        button(content)
-            .style(style::segmented::segment(t, Surface::Paper, selected))
-            .padding([6.0, 14.0])
-            .on_press(dirview::Message::Action(action))
-    };
-
-    container(row![
-        segment(Icon::List, "List", View::List, Action::SetViewList),
-        segment(Icon::LayoutGrid, "Grid", View::Grid, Action::SetViewGrid),
-    ])
-    .style(style::segmented::track(t, Surface::Paper))
-    .padding(2.0)
-    .into()
+    widget::segmented_row(
+        t,
+        Surface::Paper,
+        &[(View::List, "List"), (View::Grid, "Grid")],
+        &mode,
+        |target| {
+            dirview::Message::Action(match target {
+                View::List => Action::SetViewList,
+                View::Grid => Action::SetViewGrid,
+            })
+        },
+    )
 }
 
 /// The hidden-files toggle: an ordinary pill that's `active` (terracotta)
@@ -153,6 +137,9 @@ fn view_switcher<'a>(t: &'a Theme, mode: View) -> Element<'a, dirview::Message> 
 /// as the segmented switcher above, just a single control instead of two.
 /// The glyph itself tracks the same state the label does: an open eye
 /// once hidden files are showing, a slashed eye while they're hidden.
+/// `style::button::emphasis` (Stage 12) picks between the two recipes
+/// behind one closure type — the exact constraint that helper's own doc
+/// comment names this call site as an example of.
 fn hidden_toggle<'a>(t: &'a Theme, active: bool) -> Element<'a, dirview::Message> {
     let glyph = if active { Icon::Eye } else { Icon::EyeOff };
     let color = if active {
@@ -161,20 +148,16 @@ fn hidden_toggle<'a>(t: &'a Theme, active: bool) -> Element<'a, dirview::Message
         t.on_paper.primary
     };
     let content = row![
-        icons::icon(glyph, t.sizes.icon_row, color.into_iced()),
+        icon::icon(glyph, t.sizes.icon_row, color.into_iced()),
         text("Hidden")
             .size(t.typography.size.label)
             .font(convert::ui_font(t)),
     ]
-    .spacing(4.0)
+    .spacing(t.sizes.gap_tight)
     .align_y(Center);
-    let styled = if active {
-        button(content).style(style::button::active(t, Surface::Paper))
-    } else {
-        button(content).style(style::button::rest(t, Surface::Paper))
-    };
-    styled
-        .padding([6.0, 14.0])
+    button(content)
+        .style(style::button::emphasis(t, Surface::Paper, active))
+        .padding(t.paddings.pill_button)
         .on_press(dirview::Message::Action(Action::ToggleHidden))
         .into()
 }
@@ -183,14 +166,12 @@ fn hidden_toggle<'a>(t: &'a Theme, active: bool) -> Element<'a, dirview::Message
 /// (`Message::OpenMenu`) — Stage 6's real wiring of the chrome slot Stage 4
 /// reserved.
 fn overflow_button<'a>(t: &'a Theme) -> Element<'a, dirview::Message> {
-    let content = icons::icon(
+    widget::icon_button(
+        t,
+        Surface::Paper,
         Icon::Ellipsis,
-        t.sizes.icon_row,
+        None,
         t.on_paper.primary.into_iced(),
-    );
-    button(content)
-        .style(style::button::bare(t, Surface::Paper))
-        .padding([6.0, 12.0])
-        .on_press(dirview::Message::OpenMenu)
-        .into()
+        Some(dirview::Message::OpenMenu),
+    )
 }
