@@ -123,20 +123,39 @@ fn visible_range(state: &DirectoryView, row_height: f32, total: usize) -> (usize
 }
 
 fn header_row<'a>(state: &'a DirectoryView, t: &'a Theme) -> Element<'a, Message> {
-    let name = header_cell(t, "Name", SortKey::Name, state, Fill);
-    let size = header_cell(t, "Size", SortKey::Size, state, Length::Fixed(SIZE_COLUMN));
+    use iced::alignment::Horizontal;
+
+    // Each header is aligned the way its own column's values are (see
+    // `entry_row`): Name and Date read left-to-right, Size is right-aligned
+    // so the digits line up under each other.
+    let name = header_cell(t, "Name", SortKey::Name, state, Fill, Horizontal::Left);
+    let size = header_cell(
+        t,
+        "Size",
+        SortKey::Size,
+        state,
+        Length::Fixed(SIZE_COLUMN),
+        Horizontal::Right,
+    );
     let date = header_cell(
         t,
         "Date modified",
         SortKey::Modified,
         state,
         Length::Fixed(DATE_COLUMN),
+        Horizontal::Left,
     );
 
+    // `align_y` on the container, *not* only on the row: a `container`
+    // hands its child loose limits and then aligns the resulting node, so
+    // this is the one place in this row that can actually centre the
+    // header cells inside the `list_row`-tall band. Without it they sit
+    // flush against the band's top edge.
     container(row![name, size, date].align_y(iced::Center))
         .width(Fill)
         .height(t.sizes.list_row)
         .padding([0.0, t.sizes.pill_gap])
+        .align_y(iced::Center)
         .into()
 }
 
@@ -146,6 +165,7 @@ fn header_cell<'a>(
     key: SortKey,
     state: &DirectoryView,
     width: Length,
+    align: iced::alignment::Horizontal,
 ) -> Element<'a, Message> {
     let name = text(label)
         .size(t.typography.size.label)
@@ -172,7 +192,12 @@ fn header_cell<'a>(
         name.into()
     };
 
-    button(content)
+    // A `button` never aligns its own content — it places it at the
+    // padding's top-left corner (see `entry_row`'s note) — so a header
+    // cell with an explicit column width would always render its label
+    // hard against the column's left edge. The `container` fills the
+    // button's inner width and does the aligning instead.
+    button(container(content).width(Fill).align_x(align))
         .style(style::button::bare(t, Surface::Paper))
         .on_press(Message::HeaderClicked(key))
         .width(width)
@@ -248,6 +273,13 @@ fn entry_row<'a>(
         .size(t.typography.size.secondary)
         .font(convert::mono_font(t));
 
+    // `.height(Fill)` is what actually centres this row's cells inside the
+    // `list_row`-tall button below. An iced `button` lays its content out
+    // at the padding's top-left corner and never aligns it
+    // (`layout::padded` -> `layout::positioned`), so a `Shrink`-height row
+    // ends up pinned to the top of the 38px row with `align_y(Center)`
+    // only centring the cells against each other. Filling the height gives
+    // `align_y` the button's full height to centre within.
     let content = row![
         container(name_row).width(Fill),
         container(size)
@@ -255,6 +287,7 @@ fn entry_row<'a>(
             .align_x(iced::alignment::Horizontal::Right),
         container(date).width(Length::Fixed(DATE_COLUMN)),
     ]
+    .height(Fill)
     .align_y(iced::Center)
     .padding([0.0, t.sizes.pill_gap]);
 
@@ -319,9 +352,13 @@ fn renaming_row<'a>(
     .align_y(iced::Center)
     .padding([0.0, t.sizes.pill_gap]);
 
+    // `align_y` so a row mid-rename sits on the same centre line as the
+    // ordinary rows around it (a `container` — unlike a `button` — does
+    // align its child, so this is all that's needed here).
     container(content)
         .width(Fill)
         .height(t.sizes.list_row)
+        .align_y(iced::Center)
         .into()
 }
 

@@ -189,6 +189,10 @@ pub fn view<'a>(t: &'a Theme, toast: &'a Toast, now: Instant) -> Element<'a, Mes
     .width(Fill)
     .height(Length::Fixed(STRIP_HEIGHT))
     .padding([0.0, t.sizes.popover_padding / 2.0])
+    // Centred for the same reason `ui::dialogs::progress`'s strip is —
+    // the two occupy the identical footer band and must read as one
+    // continuous piece of chrome when one replaces the other.
+    .align_y(Center)
     .into()
 }
 

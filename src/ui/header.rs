@@ -59,7 +59,20 @@ pub fn view<'a>(t: &'a Theme, state: &'a DirectoryView) -> Element<'a, dirview::
         .align_y(Center)
         .width(Fill);
 
+    // The toolbar is the second of the window's two chrome regions (the
+    // places sidebar is the first) and takes the same recessed ground:
+    // `container::tile` at `on_paper.fill_subtle`. Sitting the navigation
+    // controls on a step of ink — rather than on the same paper the file
+    // listing uses — is what stops the toolbar, the column headers and the
+    // rows below them from reading as one undifferentiated sheet. Its
+    // inset from the window edge and from the listing below comes from
+    // `ui::explorer` (`sizes.island_gap`), not from here.
+    //
+    // See `ui::sidebar::Sidebar::view` for the `container::inset` upstream
+    // gap this shares (`radii.tile` where §4 wants `radii.inset`).
     container(content)
+        .style(style::container::tile(t, Surface::Paper))
+        .width(Fill)
         .height(t.sizes.window_header)
         .padding([0.0, t.sizes.pill_gap])
         .align_y(Center)

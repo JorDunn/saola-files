@@ -100,7 +100,13 @@ fn choice_button<'a>(
     .spacing(t.sizes.pill_gap)
     .align_y(Center);
 
-    button(content)
+    // These three buttons are `Fill`-width so they stack as equal-width
+    // rows in the dialog card — which means their glyph+label has to be
+    // centred explicitly. An iced `button` places its content at the
+    // padding's top-left corner and never aligns it, so without the
+    // wrapping `container` (which does align its child) every label would
+    // sit hard against the button's left edge.
+    button(container(content).center_x(Fill))
         .style(style::button::rest(t, Surface::Paper))
         .padding([10.0, 16.0])
         .width(Fill)

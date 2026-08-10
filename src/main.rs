@@ -992,7 +992,13 @@ impl App {
                 .view(t, &core::places::trash_location())
                 .map(|m| Message::Explorer(ui::explorer::Message::Sidebar(m)));
             let trash_column: Element<'_, Message> = self.trash_view.view(t).map(Message::Trash);
+            // Same region geometry `ui::explorer::view` applies to the
+            // ordinary composition (see its comment on `sizes.island_gap`):
+            // the sidebar is an inset chrome island either way, so the
+            // trash browser must not shift it by a pixel when it swaps in.
             iced::widget::row![sidebar_view, trash_column]
+                .spacing(t.sizes.island_gap)
+                .padding(t.sizes.island_gap)
                 .width(Fill)
                 .height(Fill)
                 .into()

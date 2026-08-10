@@ -85,16 +85,30 @@ pub fn view<'a, M: 'a>(
     let sidebar_view: Element<'a, Message> =
         sidebar.view(theme, active.location()).map(Message::Sidebar);
 
+    // Region geometry lives here, in the one place that knows all three
+    // regions exist. `sizes.island_gap` ("gap between islands") is the gap
+    // token the panel already uses between its own free-standing chrome
+    // surfaces, and that is exactly the job here: the places sidebar and
+    // the toolbar are two inset chrome islands, the directory listing is
+    // the paper ground they float on. One token, used as the gap *between*
+    // the regions (row `spacing`), the gap between toolbar and listing
+    // (column `spacing`), and the inset from the window's own edges (row
+    // `padding`), so every seam in the window measures the same.
+    let gap = theme.sizes.island_gap;
+
     let directory: Element<'a, dirview::Message> = column![
         header::view(theme, active),
         active.view(theme, mime_db, thumb_cache, apps_db, clipboard_has_contents)
     ]
+    .spacing(gap)
     .width(Fill)
     .height(Fill)
     .into();
     let directory: Element<'a, Message> = directory.map(Message::Directory);
 
     let content: Element<'a, Message> = row![sidebar_view, directory]
+        .spacing(gap)
+        .padding(gap)
         .width(Fill)
         .height(Fill)
         .into();

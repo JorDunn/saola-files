@@ -190,7 +190,15 @@ impl TrashView {
                 .into()
         };
 
-        column![toolbar_row, body].width(Fill).height(Fill).into()
+        // `sizes.island_gap` between the toolbar island and the listing
+        // below it — the identical seam `ui::explorer::view` puts between
+        // `ui::header`'s toolbar and the directory view, so switching to
+        // the trash browser doesn't change the window's rhythm.
+        column![toolbar_row, body]
+            .spacing(t.sizes.island_gap)
+            .width(Fill)
+            .height(Fill)
+            .into()
     }
 }
 
@@ -244,11 +252,16 @@ fn toolbar<'a>(t: &'a Theme, items_empty: bool, confirming: bool) -> Element<'a,
         empty_button = empty_button.on_press(Message::EmptyRequested);
     }
 
+    // The trash browser's toolbar is the same chrome region `ui::header`'s
+    // is, so it takes the same recessed `container::tile` ground rather
+    // than sitting on the listing's paper.
     container(
         row![title, Space::new().width(Fill), empty_button]
             .align_y(Center)
             .width(Fill),
     )
+    .style(style::container::tile(t, Surface::Paper))
+    .width(Fill)
     .height(t.sizes.window_header)
     .padding([0.0, t.sizes.pill_gap])
     .align_y(Center)
@@ -286,11 +299,17 @@ fn confirm_strip<'a>(t: &'a Theme) -> Element<'a, Message> {
     .padding([6.0, 14.0])
     .on_press(Message::EmptyConfirmClicked);
 
+    // Takes the toolbar's own `container::tile` ground: it *replaces* the
+    // toolbar in place, so it has to occupy the same region, at the same
+    // height, on the same surface — otherwise confirming would look like
+    // the chrome band vanished.
     container(
         row![label, Space::new().width(Fill), cancel, confirm]
             .spacing(t.sizes.pill_gap)
             .align_y(Center),
     )
+    .style(style::container::tile(t, Surface::Paper))
+    .width(Fill)
     .height(t.sizes.window_header)
     .padding([0.0, t.sizes.pill_gap])
     .align_y(Center)

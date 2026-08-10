@@ -146,6 +146,10 @@ pub fn view<'a>(t: &'a Theme, progress: &'a Progress) -> Element<'a, Message> {
     .width(Fill)
     .height(Length::Fixed(STRIP_HEIGHT))
     .padding([0.0, t.sizes.popover_padding / 2.0])
+    // The strip has a fixed height and no vertical padding, so its
+    // contents need centring explicitly or they render flush against the
+    // card's top edge.
+    .align_y(Center)
     .into()
 }
 

@@ -189,6 +189,10 @@ fn tile<'a>(
         .font(convert::ui_font_regular(t))
         .align_x(iced::alignment::Horizontal::Center);
 
+    // `align_x(Center)` on the column, not just on the `name` text: a
+    // `text` widget's own `align_x` only positions the glyphs inside the
+    // text's own box, and that box is `Shrink`-wide — so without this the
+    // label hugs the tile's left edge instead of sitting under the icon.
     let content = column![
         container(glyph)
             .width(Fill)
@@ -197,9 +201,15 @@ fn tile<'a>(
             .align_y(Center),
         name,
     ]
-    .width(Length::Fixed(GRID_TILE_SIZE));
+    .width(Length::Fixed(GRID_TILE_SIZE))
+    .align_x(Center);
 
-    let styled = button(content)
+    // The wrapping `container` centres glyph+label vertically in the tile.
+    // A `button` places its content at the padding's top-left corner and
+    // never aligns it, so the tile's leftover height would otherwise all
+    // collect below the label; a `container` hands its child loose limits
+    // and *does* align the result.
+    let styled = button(container(content).height(Fill).align_y(Center))
         .style(tile_style(t, selected, has_cursor))
         .width(Length::Fixed(GRID_TILE_SIZE))
         .height(Length::Fixed(GRID_TILE_SIZE + GRID_LABEL_HEIGHT))
@@ -247,12 +257,16 @@ fn renaming_tile<'a>(
             .align_y(Center),
         field,
     ]
-    .width(Length::Fixed(GRID_TILE_SIZE));
+    .width(Length::Fixed(GRID_TILE_SIZE))
+    .align_x(Center);
 
+    // Same centring an ordinary `tile` gets, so a tile mid-rename doesn't
+    // shift its glyph relative to its neighbours.
     container(content)
         .width(Length::Fixed(GRID_TILE_SIZE))
         .height(Length::Fixed(GRID_TILE_SIZE + GRID_LABEL_HEIGHT))
         .padding(t.sizes.pill_gap / 2.0)
+        .align_y(Center)
         .into()
 }
 

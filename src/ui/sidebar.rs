@@ -117,12 +117,37 @@ impl Sidebar {
 
         let content = column(rows).width(Fill);
 
+        // Region separation by *ground*, not by a line. `container::tile`
+        // is saola-theme's recessed-panel helper — `on_paper.fill_subtle`
+        // (ink at 4%) at `radii.tile` — so the places column sits one alpha
+        // step below the file listing's plain paper, the same way the
+        // quick-settings popover's media row sits below its popover. That
+        // keeps the three-colour rule intact (this is a step of ink, not a
+        // fourth hue) while making "sidebar" and "files" read as two zones
+        // rather than one continuous sheet.
+        //
+        // `ui::explorer` (and `main.rs`'s trash composition) is what insets
+        // this tile from the window edges with `sizes.island_gap`; the tile
+        // only owns its own inner breathing room here.
+        //
+        // **Upstream gap** (verified against the pinned `saola-theme-v0.5.0`
+        // tag): `container::tile` rounds at `radii.tile` (13px), which the
+        // style guide §4 assigns to *icon* tiles; a window-scale inset panel
+        // like this one belongs at `radii.inset` (20px, "Inset panels, media
+        // rows | 18–22px"). `radii.inset` exists as a token but no style
+        // helper reads it. TODO(saola-theme): add
+        // `style::container::inset(t, Surface)` — `tile`'s recipe at
+        // `radii.inset` — and switch this call site (and `ui::header`'s
+        // toolbar, and `ui::trashview`'s) to it once a new tag ships it;
+        // bump the pinned tag in this crate's `Cargo.toml` in that PR.
         container(
             scrollable(content)
                 .style(style::scrollable::rest(t, Surface::Paper))
                 .width(Fill)
                 .height(Fill),
         )
+        .style(style::container::tile(t, Surface::Paper))
+        .padding(t.sizes.pill_gap)
         .width(SIDEBAR_WIDTH)
         .height(Fill)
         .into()
@@ -190,6 +215,16 @@ fn row_button<'a>(
     } else {
         t.on_paper.primary
     };
+    // `.height(Fill)` is load-bearing, not decoration. An iced `button`
+    // lays its content out at the padding's top-left corner and never
+    // aligns it (`layout::padded` -> `layout::positioned`, which just
+    // does `content.move_to((padding.left, padding.top))`) — so inside a
+    // button with an explicit `.height(...)`, a `Shrink`-height row is
+    // pinned to the *top* of the row and `align_y(Center)` alone does
+    // nothing (it only centres the row's children within the row's own
+    // 16px-tall box). Making the row `Fill` grows that box to the
+    // button's full `list_row` height, and *then* `align_y(Center)` puts
+    // the glyph and label on the row's centre line.
     let content = row![
         icons::icon(glyph, t.sizes.icon_row, icon_color.into_iced()),
         text(label)
@@ -197,6 +232,7 @@ fn row_button<'a>(
             .font(convert::ui_font(t)),
     ]
     .spacing(t.sizes.pill_gap)
+    .height(Fill)
     .align_y(Center);
 
     button(content)
