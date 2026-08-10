@@ -36,7 +36,7 @@ iced = { version = "0.14", features = ["tokio", "svg", "image"] }
 # Never point this at `branch = "main"`; bumping the tag is a deliberate,
 # reviewed change (see CLAUDE.md "Design language").
 # Pinned 2026-08-08 at the same tag the panel and capture use.
-saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.7.0", version = "0.7.0" }
+saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.8.0", version = "0.8.0" }
 
 # Config parsing. Surveyed 2026-08-08: the family standard is hand-walked
 # parsing over a real parser's loose document type. capture (the newest
