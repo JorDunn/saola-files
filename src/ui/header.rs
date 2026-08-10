@@ -110,18 +110,16 @@ fn nav_button<'a>(
     )
 }
 
-/// The list/grid segmented switcher — Stage 12: `widget::segmented_row`, the
-/// upstreamed promotion of this function's own hand-rolled track+segment
-/// assembly (ported from saola-capture per that constructor's own doc
-/// comment). `segmented_row` is label-only (no icon slot), so the previous
-/// List/Grid glyphs are dropped here — a deliberate part of adopting the
-/// shared control, not an oversight; see the Stage 12 handoff's "expect
-/// visual diffs" note.
+/// The list/grid segmented switcher — `widget::segmented_row_icons` since
+/// saola-theme 0.8.0, which restores the List/Grid glyphs Stage 12's
+/// label-only `segmented_row` adoption had to drop (that constructor has
+/// no icon slot; the icon-only sibling was added upstream for exactly
+/// this view-switcher shape, per its doc comment).
 fn view_switcher<'a>(t: &'a Theme, mode: View) -> Element<'a, dirview::Message> {
-    widget::segmented_row(
+    widget::segmented_row_icons(
         t,
         Surface::Paper,
-        &[(View::List, "List"), (View::Grid, "Grid")],
+        &[(View::List, Icon::List), (View::Grid, Icon::LayoutGrid)],
         &mode,
         |target| {
             dirview::Message::Action(match target {
