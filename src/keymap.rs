@@ -95,6 +95,15 @@ pub enum Action {
     /// Ctrl+Z: pop and invert the most recent invertible op — see
     /// `core::fs::undo`'s module doc comment for exactly what's invertible.
     Undo,
+
+    // ── Stage 13: properties ────────────────────────────────────────────
+    /// Alt+Enter: open the properties dialog for the current selection —
+    /// `DirectoryView`/`App` decide what that shows (name, mime, size,
+    /// dates, permissions), not this module. Deliberately Alt+Enter, not
+    /// plain Enter (already `Action::Descend`) or F2 (already
+    /// `Action::Rename`) — matches the mainstream file-manager convention
+    /// this style guide follows for "get info".
+    Properties,
 }
 
 /// Resolve one key press into an [`Action`], or `None` if this module
@@ -129,12 +138,15 @@ pub fn resolve(key: &Key, modifiers: Modifiers) -> Option<Action> {
 
     // Alt+<arrow>, no other modifier riding along: browser-style history
     // navigation, plus the pre-existing Alt+Up ascend synonym for plain
-    // Backspace (handled below).
+    // Backspace (handled below). Alt+Enter (Stage 13) rides along in the
+    // same "Alt + one named key" bucket rather than the arrows' own match
+    // arm, since it isn't a history/ascend action.
     if alt && !ctrl && !shift {
         return match key {
             Key::Named(Named::ArrowUp) => Some(Action::Ascend),
             Key::Named(Named::ArrowLeft) => Some(Action::HistoryBack),
             Key::Named(Named::ArrowRight) => Some(Action::HistoryForward),
+            Key::Named(Named::Enter) => Some(Action::Properties),
             _ => None,
         };
     }
@@ -386,6 +398,26 @@ mod tests {
         assert_eq!(
             resolve(&Key::Character("z".into()), Modifiers::CTRL),
             Some(Action::Undo)
+        );
+    }
+
+    // ── Stage 13: properties ─────────────────────────────────────────────
+
+    #[test]
+    fn alt_enter_opens_properties() {
+        assert_eq!(
+            resolve(&named(Named::Enter), Modifiers::ALT),
+            Some(Action::Properties)
+        );
+    }
+
+    #[test]
+    fn plain_enter_still_descends_not_properties() {
+        // Alt+Enter must not swallow the plain-Enter binding it sits right
+        // next to in the match arm above.
+        assert_eq!(
+            resolve(&named(Named::Enter), Modifiers::empty()),
+            Some(Action::Descend)
         );
     }
 }

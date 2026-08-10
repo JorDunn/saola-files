@@ -50,6 +50,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::future::Future;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
@@ -155,6 +156,12 @@ fn entry_from_metadata(name: OsString, meta: &fs::Metadata) -> FileEntry {
         size: meta.len(),
         modified: meta.modified().ok(),
         is_symlink: file_type.is_symlink(),
+        // `st_mode & 0o7777`: the permission bits alone, without the file-
+        // type bits `st_mode`'s upper bits also carry (`kind`/`is_symlink`
+        // already cover that) — `Permissions::mode()` returns the full
+        // `st_mode`, so this masks it down to just what a `chmod` argument
+        // or an `rwxr-xr-x` rendering wants (`ui::dialogs::properties`).
+        mode: Some(meta.permissions().mode() & 0o7777),
     }
 }
 

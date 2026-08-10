@@ -111,6 +111,7 @@ mod tests {
             size: 0,
             modified: None,
             is_symlink: false,
+            mode: None,
         }
     }
 

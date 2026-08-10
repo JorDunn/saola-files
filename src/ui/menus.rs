@@ -36,6 +36,11 @@
 //! posture is about not hiding what a control does, not about surfacing
 //! every possible variant of it in the menu.
 //!
+//! **Scope, updated Stage 13:** "Properties" joined the menu, the mouse
+//! path to the same dialog Alt+Enter opens (`ui::dialogs::properties`).
+//! Shown whenever the selection isn't empty, same gate `Copy`/`Cut` already
+//! use.
+//!
 //! **Anchoring is simplified too:** a precise "grow from the trigger
 //! button" popover (style guide §6) needs the trigger's on-screen rect,
 //! which iced 0.14's plain `view()` has no way to learn without threading
@@ -183,6 +188,15 @@ fn context_menu<'a>(
         "New File",
         Message::MenuNewFileRequested,
     ));
+    // ── Stage 13: properties ─────────────────────────────────────────────
+    if !selected.is_empty() {
+        items.push(menu_row(
+            t,
+            Icon::Info,
+            "Properties",
+            Message::MenuPropertiesRequested,
+        ));
+    }
 
     if !selected.is_empty() {
         let scheme = state.location().scheme.clone();

@@ -211,6 +211,11 @@ pub enum Message {
     /// can type its real name immediately instead of "New Folder" then a
     /// second F2.
     CreateResult(Location, OsString, Result<(), VfsError>),
+
+    // ── Stage 13: properties ─────────────────────────────────────────────
+    /// "Properties" in the context menu — the mouse path to the same
+    /// dialog Alt+Enter opens (`Action::Properties`).
+    MenuPropertiesRequested,
 }
 
 /// What the owner (the app, via `ui::explorer`) decides to act on. The
@@ -284,6 +289,15 @@ pub enum Event {
     /// live on the App). See [`Self::thumbnail_candidates`] for exactly
     /// which entries qualify and when this fires.
     ThumbnailsNeeded(Vec<ThumbCandidate>),
+    /// Alt+Enter / the context menu's "Properties" (Stage 13): open the
+    /// properties dialog for the current selection. Carries each selected
+    /// entry's `Location` paired with the [`FileEntry`] snapshot already
+    /// sitting in this view's own `entries` at the moment of the request —
+    /// the dialog's name/mime/modified/permissions rows read straight from
+    /// that snapshot (App has no `Backend` round trip to make for data this
+    /// view already has in memory); only the live size count is fetched
+    /// fresh, by `App`, via `core::fs::size::run`.
+    PropertiesRequested(Vec<(Location, FileEntry)>),
 }
 
 /// One thumbnail candidate bubbled via [`Event::ThumbnailsNeeded`] —
@@ -1051,6 +1065,12 @@ impl DirectoryView {
                     }
                 }
             }
+
+            // ── Stage 13: properties ─────────────────────────────────────
+            Message::MenuPropertiesRequested => {
+                self.menu_open = false;
+                (Task::none(), self.properties_event())
+            }
         }
     }
 
@@ -1359,6 +1379,9 @@ impl DirectoryView {
 
             // ── Stage 10: undo ────────────────────────────────────────────
             Action::Undo => (Task::none(), Some(Event::UndoRequested)),
+
+            // ── Stage 13: properties ───────────────────────────────────────
+            Action::Properties => (Task::none(), self.properties_event()),
         }
     }
 
@@ -1492,6 +1515,24 @@ impl DirectoryView {
             .selected_names()
             .map(|name| self.location.join(name))
             .collect()
+    }
+
+    /// `Event::PropertiesRequested`'s payload for the current selection —
+    /// shared by `Action::Properties` (Alt+Enter) and
+    /// `Message::MenuPropertiesRequested` (the context menu row), the same
+    /// "one behavior, two input paths" split every other action/menu-row
+    /// pair in this module already takes. `None` when nothing is selected
+    /// — there is nothing to show properties for.
+    fn properties_event(&self) -> Option<Event> {
+        let selected = self.selected_entries();
+        if selected.is_empty() {
+            return None;
+        }
+        let items = selected
+            .iter()
+            .map(|entry| (self.location.join(&entry.name), (*entry).clone()))
+            .collect();
+        Some(Event::PropertiesRequested(items))
     }
 
     /// `Event::OpenTerminal`'s target for "Open in terminal": exactly one
@@ -1878,6 +1919,7 @@ mod tests {
             size: 10,
             modified: None,
             is_symlink: false,
+            mode: None,
         }
     }
 
@@ -1888,6 +1930,7 @@ mod tests {
             size: 0,
             modified: None,
             is_symlink: false,
+            mode: None,
         }
     }
 
@@ -1904,6 +1947,7 @@ mod tests {
             size: 10,
             modified: Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000)),
             is_symlink: false,
+            mode: None,
         }
     }
 
@@ -2430,6 +2474,43 @@ mod tests {
                 assert_eq!(locations, vec![Location::local("/home/a")]);
             }
             other => panic!("expected CutRequested, got {other:?}"),
+        }
+    }
+
+    // ── Stage 13: properties ─────────────────────────────────────────────
+
+    #[test]
+    fn properties_action_bubbles_properties_requested_with_the_selection() {
+        let mut view = listed_view(vec![file("a"), file("b")]);
+        let _ = view.apply_action_for_test(Action::MoveCursorDown);
+        let (_, event) = view.apply_action_for_test(Action::Properties);
+        match event {
+            Some(Event::PropertiesRequested(items)) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].0, Location::local("/home/a"));
+                assert_eq!(items[0].1.name, OsString::from("a"));
+            }
+            other => panic!("expected PropertiesRequested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn properties_with_nothing_selected_is_a_no_op() {
+        let mut view = listed_view(vec![file("a")]);
+        let (_, event) = view.apply_action_for_test(Action::Properties);
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn properties_menu_message_bubbles_the_same_event_and_closes_the_menu() {
+        let mut view = listed_view(vec![file("a"), file("b")]);
+        let _ = view.apply_action_for_test(Action::MoveCursorDown);
+        view.menu_open = true;
+        let (_, event) = view.update(Message::MenuPropertiesRequested);
+        assert!(!view.menu_open());
+        match event {
+            Some(Event::PropertiesRequested(items)) => assert_eq!(items.len(), 1),
+            other => panic!("expected PropertiesRequested, got {other:?}"),
         }
     }
 

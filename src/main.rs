@@ -20,7 +20,8 @@ use iced::{Element, Fill, Size, Subscription, Task, window};
 use saola_theme::{Theme, convert};
 
 use core::clipboard_interop;
-use core::fs::{ops, undo};
+use core::fs::entry::FileEntry;
+use core::fs::{ops, size, undo};
 use core::vfs::Location;
 use saola_files::{cli, config, core, modules, ui};
 
@@ -142,6 +143,18 @@ enum Message {
     /// thumbnail" — unsupported mimetype, decode failure, or the file
     /// simply isn't local; the row keeps its glyph icon.
     ThumbnailReady(Location, SystemTime, Option<core::thumbs::ThumbHandle>),
+    /// The properties dialog's "Close" button, or a click on its own modal
+    /// scrim (Stage 13) — unlike the conflict dialog's scrim, this closes
+    /// it; see `ui::dialogs::properties::Message::CloseRequested`'s doc
+    /// comment for why that's the right default here.
+    Properties(ui::dialogs::properties::Message),
+    /// An event off the properties dialog's live directory-size count
+    /// (`core::fs::size::run`'s stream) — the exact same bounded-bridge/
+    /// `AtomicBool`-cancel shape `Message::OpEvent` already bridges for
+    /// `core::fs::ops`, a different engine for a different, non-mutating
+    /// job (see `core::fs::size`'s module doc comment for why it isn't
+    /// just `ops::count_totals` reused).
+    SizeEvent(size::SizeEvent),
     /// Swallows a click on the conflict dialog's modal scrim — the dialog
     /// must be answered via one of its three buttons, never dismissed by
     /// clicking outside it (there is no sane default resolution to assume).
@@ -284,6 +297,15 @@ struct App {
     /// pre-multiplied into bytes here, so that pure predicate stays the
     /// one place the MiB-to-bytes conversion happens.
     thumbnail_max_mb: u64,
+    /// The properties dialog currently showing, if any (Stage 13) — mirrors
+    /// `pending_conflict`'s split: the pure render-time snapshot
+    /// (`ui::dialogs::properties::Properties`) bundled with the App-owned
+    /// plumbing (`size_request`'s cancel handle) that module has no
+    /// business holding itself.
+    pending_properties: Option<PendingProperties>,
+    /// Monotonic [`size::SizeRequestId`] allocator — one per `App`, the
+    /// same "one shared counter, never per-view" posture as `op_ids`.
+    size_ids: size::SizeIdSource,
 }
 
 /// See `App::pending_conflict`'s doc comment.
@@ -295,6 +317,18 @@ struct PendingConflict {
     /// holds no state of its own (CLAUDE.md's "ui:: is free of app-window
     /// concerns" posture extended to this dialog too).
     apply_to_all: bool,
+}
+
+/// See `App::pending_properties`'s doc comment.
+struct PendingProperties {
+    properties: ui::dialogs::properties::Properties,
+    /// `None` once the size walk finishes/is cancelled (`Self::
+    /// handle_size_event` clears it) — `Some` is also what `App::
+    /// subscription` reads to decide whether to keep the size
+    /// `Subscription` alive, the same "`Option` doubles as the
+    /// subscription gate" shape `active_op`/`active_op_progress` already
+    /// take.
+    size_request: Option<size::SizeRequest>,
 }
 
 impl App {
@@ -361,6 +395,8 @@ impl App {
             thumb_failed: HashMap::new(),
             thumbnails_enabled: config.thumbnails,
             thumbnail_max_mb: config.thumbnail_max_mb,
+            pending_properties: None,
+            size_ids: size::SizeIdSource::default(),
         };
         (
             app,
@@ -442,6 +478,11 @@ impl App {
                 }
                 Task::none()
             }
+            Message::Properties(ui::dialogs::properties::Message::CloseRequested) => {
+                self.close_properties();
+                Task::none()
+            }
+            Message::SizeEvent(event) => self.handle_size_event(event),
         }
     }
 
@@ -550,6 +591,76 @@ impl App {
             choice,
             apply_to_all: pending.apply_to_all,
         });
+    }
+
+    /// `Event::PropertiesRequested`'s handling (Stage 13): opens the
+    /// properties dialog for `items` and kicks off the live size count.
+    /// Replaces (rather than stacks behind) any properties dialog already
+    /// open — cancelling its size walk first via `Self::close_properties`
+    /// — since Alt+Enter/the menu row on a fresh selection obviously means
+    /// "show me *this* selection's properties now", not "queue a second
+    /// dialog". `caps` is resolved once here (not carried by `Event::
+    /// PropertiesRequested` itself) via the same `modules::resolve` every
+    /// other backend-capability check in this file already goes through;
+    /// every item shares one backend, since a `DirectoryView`'s selection
+    /// never spans two locations at once.
+    fn open_properties(&mut self, items: Vec<(Location, FileEntry)>) -> Task<Message> {
+        if items.is_empty() {
+            return Task::none();
+        }
+        self.close_properties();
+
+        let caps = modules::resolve(&items[0].0.scheme)
+            .map(|backend| backend.caps())
+            .unwrap_or_else(core::vfs::Caps::empty);
+        let roots: Vec<Location> = items.iter().map(|(location, _)| location.clone()).collect();
+        let request = size::SizeRequest::new(self.size_ids.alloc(), roots);
+
+        self.pending_properties = Some(PendingProperties {
+            properties: ui::dialogs::properties::Properties::new(items, caps),
+            size_request: Some(request),
+        });
+        Task::none()
+    }
+
+    /// Translates one [`size::SizeEvent`] into the open properties
+    /// dialog's live size row — mirrors `Self::handle_op_event`'s "replace
+    /// the whole readout, never accumulate deltas" posture. A no-op if the
+    /// dialog was closed before this landed (the size walk's own task keeps
+    /// running until its next cancel-flag check either way — see
+    /// `core::fs::size`'s module doc comment).
+    fn handle_size_event(&mut self, event: size::SizeEvent) -> Task<Message> {
+        let Some(pending) = self.pending_properties.as_mut() else {
+            return Task::none();
+        };
+        match event {
+            size::SizeEvent::Progress { files, bytes } => {
+                pending.properties.size_files = files;
+                pending.properties.size_bytes = bytes;
+            }
+            size::SizeEvent::Finished { files, bytes }
+            | size::SizeEvent::Cancelled { files, bytes } => {
+                pending.properties.size_files = files;
+                pending.properties.size_bytes = bytes;
+                pending.properties.size_done = true;
+                pending.size_request = None;
+            }
+        }
+        Task::none()
+    }
+
+    /// Closes the properties dialog, if one is open — the done criterion's
+    /// "cancels on close" half: a still-running size walk's `SizeRequest::
+    /// request_cancel` is called before the dialog state is dropped, the
+    /// same "cancel, then let the engine notice on its own" posture
+    /// `Message::Progress::CancelRequested`'s handling already takes for a
+    /// running copy/move.
+    fn close_properties(&mut self) {
+        if let Some(pending) = self.pending_properties.take()
+            && let Some(request) = pending.size_request
+        {
+            request.request_cancel();
+        }
     }
 
     /// `Event::PasteRequested`'s handling: the internal clipboard
@@ -755,6 +866,7 @@ impl App {
             }
             ui::dirview::Event::UndoRequested => self.start_undo(),
             ui::dirview::Event::ThumbnailsNeeded(candidates) => self.request_thumbnails(candidates),
+            ui::dirview::Event::PropertiesRequested(items) => self.open_properties(items),
         }
     }
 
@@ -917,7 +1029,13 @@ impl App {
         // the keyboard at a time" posture `DirectoryView::handle_keyboard`
         // already takes for its own path-editor/rename/menu guards, just
         // one level up.
-        let keyboard = if self.trash_active {
+        // Stage 13: the properties dialog is App-level chrome, not a
+        // `DirectoryView` overlay (no `menu_open`-style flag on the view
+        // itself to guard through) — gated here the same way `trash_active`
+        // already is, for the same reason: arrow keys/Delete/etc must not
+        // reach the (invisible, behind the dialog) directory view while
+        // it's open.
+        let keyboard = if self.trash_active || self.pending_properties.is_some() {
             Subscription::none()
         } else {
             iced::keyboard::listen().map(|event| {
@@ -963,7 +1081,18 @@ impl App {
         let undo_toast = ui::dialogs::undo_toast::subscription(self.undo_toast.is_some())
             .map(Message::UndoToast);
 
-        Subscription::batch([keyboard, watch, mounts, ops, undo_toast])
+        // Stage 13: the properties dialog's live size count, if one is
+        // still running — same "identified by the request's own `Hash`,
+        // torn down the moment the field goes back to `None`" posture as
+        // `ops` above, just for `size::SizeRequest` instead of `OpRequest`.
+        let size_sub = self
+            .pending_properties
+            .as_ref()
+            .and_then(|pending| pending.size_request.as_ref())
+            .map(|request| ui::dialogs::properties::subscription(request).map(Message::SizeEvent))
+            .unwrap_or_else(Subscription::none);
+
+        Subscription::batch([keyboard, watch, mounts, ops, undo_toast, size_sub])
     }
 
     fn theme(&self) -> iced::Theme {
@@ -1046,6 +1175,37 @@ impl App {
             (None, None) => body,
         };
 
+        // The properties dialog (Stage 13) is a modal too, but — unlike the
+        // conflict dialog — has a sane dismiss default (there's no decision
+        // to force), so its scrim closes it instead of swallowing the
+        // click into a no-op.
+        let with_properties: Element<'_, Message> = match &self.pending_properties {
+            Some(pending) => {
+                let scrim = iced::widget::mouse_area(
+                    iced::widget::container(iced::widget::Space::new())
+                        .style(saola_theme::style::container::scrim(
+                            t,
+                            saola_theme::style::container::ScrimKind::Modal,
+                        ))
+                        .width(Fill)
+                        .height(Fill),
+                )
+                .on_press(Message::Properties(
+                    ui::dialogs::properties::Message::CloseRequested,
+                ));
+                let dialog = iced::widget::container(
+                    ui::dialogs::properties::view(t, &self.mime_db, &pending.properties)
+                        .map(Message::Properties),
+                )
+                .width(Fill)
+                .height(Fill)
+                .align_x(iced::alignment::Horizontal::Center)
+                .align_y(iced::alignment::Vertical::Center);
+                iced::widget::stack![with_progress, scrim, dialog].into()
+            }
+            None => with_progress,
+        };
+
         // The conflict dialog is a true modal: stacked over everything
         // else with a scrim that swallows clicks (`Message::Noop` — see
         // its doc comment) rather than closing on an outside click, since
@@ -1075,9 +1235,9 @@ impl App {
                 .height(Fill)
                 .align_x(iced::alignment::Horizontal::Center)
                 .align_y(iced::alignment::Vertical::Center);
-                iced::widget::stack![with_progress, scrim, dialog].into()
+                iced::widget::stack![with_properties, scrim, dialog].into()
             }
-            None => with_progress,
+            None => with_properties,
         };
 
         ui::window::view(t, "Files", with_conflict, Message::Window)

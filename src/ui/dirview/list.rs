@@ -19,6 +19,7 @@ use saola_theme::{ColorExt, Surface, Theme, convert, style};
 
 use crate::config::SortKey;
 use crate::core::fs::entry::{EntryKind, FileEntry};
+use crate::core::fs::format::{format_system_time, human_size};
 use crate::core::mime::MimeDb;
 use crate::core::thumbs::ThumbCache;
 
@@ -393,78 +394,9 @@ fn size_text(entry: &FileEntry) -> String {
     }
 }
 
-fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    if bytes < 1024 {
-        return format!("{bytes} B");
-    }
-    let mut size = bytes as f64;
-    let mut unit = 0usize;
-    while size >= 1024.0 && unit + 1 < UNITS.len() {
-        size /= 1024.0;
-        unit += 1;
-    }
-    let label = UNITS.get(unit).copied().unwrap_or("TB");
-    format!("{size:.1} {label}")
-}
-
 fn date_text(entry: &FileEntry) -> String {
     match entry.modified {
         Some(time) => format_system_time(time),
         None => String::new(),
-    }
-}
-
-/// A minimal, dependency-free "YYYY-MM-DD HH:MM" formatter for
-/// `SystemTime`. Not a general calendar library — just enough to label a
-/// list row; a real date/time crate can replace this if a later stage
-/// needs more (relative "2 days ago" phrasing, locale-aware formats, …).
-fn format_system_time(time: std::time::SystemTime) -> String {
-    let Ok(duration) = time.duration_since(std::time::UNIX_EPOCH) else {
-        return String::new(); // times before 1970 aren't worth a crate; blank is honest
-    };
-    let secs = duration.as_secs();
-    let days = (secs / 86_400) as i64;
-    let time_of_day = secs % 86_400;
-    let (hour, minute) = (time_of_day / 3600, (time_of_day % 3600) / 60);
-    let (year, month, day) = civil_from_days(days);
-    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}")
-}
-
-/// Howard Hinnant's `civil_from_days`: days-since-1970-01-01 (proleptic
-/// Gregorian) -> `(year, month, day)`. A well-known, correct, allocation-
-/// and dependency-free algorithm; see
-/// <http://howardhinnant.github.io/date_algorithms.html>.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn civil_from_days_matches_known_dates() {
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
-        assert_eq!(civil_from_days(10_957), (2000, 1, 1));
-        assert_eq!(civil_from_days(-1), (1969, 12, 31));
-    }
-
-    #[test]
-    fn human_size_scales_units() {
-        assert_eq!(human_size(0), "0 B");
-        assert_eq!(human_size(1023), "1023 B");
-        assert_eq!(human_size(1024), "1.0 KB");
-        assert_eq!(human_size(1024 * 1024 * 3), "3.0 MB");
     }
 }

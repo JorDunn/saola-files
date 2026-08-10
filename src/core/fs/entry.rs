@@ -42,6 +42,19 @@ pub struct FileEntry {
     /// color (style guide: mimetype/kind differentiation is glyph shape
     /// only).
     pub is_symlink: bool,
+    /// Unix permission bits (`st_mode & 0o7777`), when the backend can
+    /// report them. `modules::local` always sets this (a plain
+    /// `PermissionsExt::mode()` read, already available from the same
+    /// `symlink_metadata`/`DirEntry::metadata` call that builds the rest of
+    /// this struct); a future non-Unix or protocol backend that has no such
+    /// concept (or chooses not to expose it) leaves this `None`, and
+    /// `ui::dialogs::properties` renders no permissions row rather than
+    /// fabricating one. **Read-only today**: `Caps::SET_PERMISSIONS` is
+    /// still "a future trait method — no backend sets this bit yet" (see
+    /// that flag's own doc comment) — this field exists so the properties
+    /// dialog has real data to *show*, not because anything can change it
+    /// yet.
+    pub mode: Option<u32>,
 }
 
 impl FileEntry {
@@ -68,6 +81,7 @@ mod tests {
             size: 0,
             modified: None,
             is_symlink: false,
+            mode: None,
         };
 
         // The bytes survive untouched in the model...
@@ -86,6 +100,7 @@ mod tests {
             size: 1024,
             modified: None,
             is_symlink: false,
+            mode: None,
         };
         assert_eq!(entry.display_name(), "résumé.pdf");
     }

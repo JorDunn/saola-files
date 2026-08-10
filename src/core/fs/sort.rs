@@ -132,6 +132,7 @@ mod tests {
             modified: modified
                 .map(|secs| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)),
             is_symlink: false,
+            mode: None,
         }
     }
 
@@ -142,6 +143,7 @@ mod tests {
             size: 0,
             modified: None,
             is_symlink: false,
+            mode: None,
         }
     }
 
