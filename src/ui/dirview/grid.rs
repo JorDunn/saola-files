@@ -4,15 +4,24 @@
 //! "no virtualized list widget, never build 100k Elements" rule applies to
 //! every directory view, not just the list.
 //!
-//! Column count is a fixed placeholder ([`GRID_COLUMNS`]), not derived from
-//! the viewport's actual measured width — but only because nobody has done
-//! it yet, not because iced can't. The mechanism is proven and in this
-//! codebase: `iced::widget::responsive` hands its closure the container's
-//! real laid-out `Size`, which is exactly how `list.rs` sizes its flexible
-//! name column. Replacing the constant means calling the tile-row math from
-//! inside such a closure; the virtualization below doesn't care where "how
-//! many tiles per row" comes from, so nothing under this line has to move.
-//! Noted as the follow-up; out of scope for this stage.
+//! Column count is **measured**, not fixed: [`column_count`] works out how
+//! many `sizes.grid_tile`-wide tiles fit in a real width, and `view` calls
+//! it from inside an `iced::widget::responsive` closure — the same
+//! mechanism `list.rs` uses to size its flexible name column, adopted here
+//! now that it's proven. The virtualization below doesn't care where "how
+//! many tiles per row" comes from, so it reads that one number and nothing
+//! else changed.
+//!
+//! One number per frame is the rule that matters: the row builder, the
+//! `div_ceil` total-row count and both spacers all take the *same*
+//! `columns` value, or the spacer heights would describe a grid with a
+//! different shape than the one being drawn and the view would drift out of
+//! sync with its own scroll offset.
+//!
+//! `update()` needs the count too (Up/Down move the cursor by a whole tile
+//! row) and can't see the closure's `Size`, so it goes through
+//! [`columns_for_scroll`] instead — same arithmetic, width taken from the
+//! last reported scroll viewport.
 
 use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Center, Element, Fill, Length};
@@ -26,20 +35,101 @@ use crate::core::thumbs::ThumbCache;
 use super::rename::RENAME_INPUT_ID;
 use super::{DirectoryView, Message, row_icon, thumbnail_for};
 
-/// Tiles per row. See the module docs — this is a placeholder, not a
-/// layout measurement. `pub(super)` so `DirectoryView::row_step` (the
-/// Up/Down/PageUp/PageDown cursor math) can step by a full visual row in
-/// grid mode instead of by one item at a time.
-pub(super) const GRID_COLUMNS: usize = 6;
+/// The width `columns_for_scroll` assumes before any scroll viewport has
+/// been reported — the grid's analogue of `INITIAL_ROWS` below, and used
+/// only by the update-side path (`view` always has a real measurement).
+///
+/// 866 px is roughly what this view's content area works out to at the
+/// app's default 1100×720 window, once the window border, the island gaps
+/// and the 200 px sidebar are taken out; it is the same measured number
+/// `list.rs`'s own budget test pins against, and is deliberately expressed
+/// as a *width* rather than as a column count so the fallback still tracks
+/// a `grid_tile`/`grid_tile_gap` token change instead of freezing whatever
+/// count today's tokens happen to yield.
+const INITIAL_GRID_WIDTH: f32 = 866.0;
 
 /// Extra rows rendered above/below the on-screen band, same purpose as
-/// `list.rs`'s `OVERSCAN_ROWS` but in units of tile-rows (each covers
-/// `GRID_COLUMNS` entries, so a smaller row-overscan already covers plenty
-/// of entries).
+/// `list.rs`'s `OVERSCAN_ROWS` but in units of tile-rows (each covers a
+/// full row of tiles, so a smaller row-overscan already covers plenty of
+/// entries).
 const OVERSCAN_ROWS: usize = 2;
 
 /// Tile-rows rendered before the first `Scrolled` event arrives.
 const INITIAL_ROWS: usize = 6;
+
+/// How many `tile`-wide tiles fit across `width` — the number that used to
+/// be a hardcoded 6.
+///
+/// Every term is read straight off `view`'s layout below:
+///
+/// - the tile band's outer `column` carries `.padding(grid_tile_gap)`, a
+///   uniform inset, so one `gap` is spent on each side: `width - 2 × gap`
+///   is what a row of tiles actually gets.
+/// - each row carries `.spacing(grid_tile_gap)`, which falls in the `n - 1`
+///   seams *between* n tiles, not around them.
+/// - each tile is exactly `Length::Fixed(grid_tile)` wide.
+///
+/// So n tiles fit when `n × tile + (n − 1) × gap ≤ width − 2 × gap`, which
+/// rearranges to `n ≤ (width − gap) / (tile + gap)` — the floor of that
+/// fraction, which is what this returns.
+///
+/// Nothing is subtracted for the scrollbar, deliberately, for the reason
+/// `list.rs::name_unit_budget` spells out in full: iced's default
+/// `Scrollable` reserves no layout width for its bar (this file never sets
+/// `.spacing()` on the scrollable, which is what would turn the overlay
+/// into a reserved gutter), so subtracting a guessed bar width would be
+/// paying for space that was never taken.
+///
+/// No-panic saturation, in the order it applies (CLAUDE.md's no-panic rule
+/// reaching into layout):
+///
+/// - a non-positive `tile + gap` (degenerate tokens) would divide by zero,
+///   so it short-circuits to one column before the division happens —
+///   otherwise `inf as usize` would saturate to `usize::MAX` and the row
+///   builder would try to slice a wildly out-of-range range (it would
+///   survive that, `get(..)` returns `None`, but the row count arithmetic
+///   would be nonsense).
+/// - a negative or NaN quotient goes through `as usize`, which in Rust
+///   2021+ saturates to 0 rather than being UB, and then `.max(1)` lifts it
+///   to a single column — a window squeezed narrower than one tile still
+///   renders one tile per row (clipped by the viewport, which is the honest
+///   outcome) rather than dividing by zero further down `div_ceil`.
+///
+/// Pure function of three `f32`s, testable below without a `Theme` or a
+/// renderer — the same posture `list.rs::name_unit_budget` takes.
+pub(super) fn column_count(width: f32, tile: f32, gap: f32) -> usize {
+    let step = tile + gap;
+    if step <= 0.0 {
+        return 1;
+    }
+    (((width - gap) / step).floor() as usize).max(1)
+}
+
+/// Tiles per row for the update-side cursor math
+/// (`DirectoryView::row_step`, which steps Up/Down by a whole visual row in
+/// grid mode).
+///
+/// `update()` never sees the `responsive` closure's `Size`, so the width
+/// comes from the last scroll viewport instead: iced's `Scrollable`
+/// republishes `on_scroll` on `RedrawRequested` whenever its bounds change,
+/// so this is stale for at most one frame after a resize — and a one-frame
+/// stale column count costs, at worst, one arrow key landing a row off
+/// before the next redraw corrects it. `None` (nothing has been laid out
+/// yet) falls back to [`INITIAL_GRID_WIDTH`].
+///
+/// The tokens come from `saola_theme::tokens::Sizes::default()` rather than
+/// from a `Theme` because `update()` has no `Theme` to read (the same
+/// constraint `mod.rs`'s `PAGE_ROWS`/`THUMB_ROW_HEIGHT_GUESS` document) —
+/// but unlike those two this is not a guess: `App` builds exactly one
+/// theme, `Theme::saola()`, whose `sizes` field *is* `Sizes::default()`, so
+/// these are the same numbers `view` reads from `&Theme` a few lines below.
+/// If saola-files ever grows runtime theming, this is the call site that
+/// has to start taking a `&Theme` instead.
+pub(super) fn columns_for_scroll(scroll: Option<scrollable::Viewport>) -> usize {
+    let sizes = saola_theme::tokens::Sizes::default();
+    let width = scroll.map_or(INITIAL_GRID_WIDTH, |viewport| viewport.bounds().width);
+    column_count(width, sizes.grid_tile, sizes.grid_tile_gap)
+}
 
 pub(super) fn view<'a>(
     state: &'a DirectoryView,
@@ -59,47 +149,68 @@ pub(super) fn view<'a>(
         return empty_state(t, message);
     }
 
-    let total = state.visible.len();
-    let tile_row_height = t.sizes.grid_tile + t.sizes.grid_tile_label + t.sizes.grid_tile_gap;
-    let total_rows = total.div_ceil(GRID_COLUMNS);
-    let (first_row, last_row) = visible_row_range(state, tile_row_height, total_rows);
+    // `responsive` is how a widget learns its own width in iced 0.14: the
+    // closure runs *inside* `Widget::layout`, after limits are known, and
+    // is handed the `Size` this container actually got — the only place in
+    // a `view()` where a real pixel width exists, and so the only place
+    // `column_count` can be asked an honest question. Same mechanism and
+    // same two rules as `list.rs::view` (see its comment in full): the
+    // closure is `Fn`, re-run on every relayout, and everything it captures
+    // is a shared reference, which is `Copy`; and it returns the same tree
+    // shape every run (one `scrollable`, always), so the scrollable's
+    // widget state — including its offset — is carried across a resize
+    // instead of being torn down and reset to the top.
+    iced::widget::responsive(move |size| {
+        // One column count per frame, read once here and handed to
+        // everything below it. The row builder, `div_ceil` and both spacers
+        // must agree or the spacer heights describe a differently-shaped
+        // grid than the one being drawn — see the module docs.
+        let columns = column_count(size.width, t.sizes.grid_tile, t.sizes.grid_tile_gap);
 
-    let before = Space::new().height(tile_row_height * first_row as f32);
-    let after = Space::new().height(tile_row_height * total_rows.saturating_sub(last_row) as f32);
+        let total = state.visible.len();
+        let tile_row_height = t.sizes.grid_tile + t.sizes.grid_tile_label + t.sizes.grid_tile_gap;
+        let total_rows = total.div_ceil(columns);
+        let (first_row, last_row) = visible_row_range(state, tile_row_height, total_rows);
 
-    let rows = (first_row..last_row).map(|row_index| {
-        let start = row_index * GRID_COLUMNS;
-        let end = start.saturating_add(GRID_COLUMNS).min(total);
-        let tiles = state
-            .visible
-            .get(start..end)
-            .unwrap_or(&[])
-            .iter()
-            .enumerate()
-            .filter_map(|(offset, &entry_index)| {
-                state
-                    .entries
-                    .get(entry_index)
-                    .map(|entry| tile(state, t, mime_db, thumb_cache, start + offset, entry))
-            });
-        row(tiles).spacing(t.sizes.grid_tile_gap).into()
-    });
+        let before = Space::new().height(tile_row_height * first_row as f32);
+        let after =
+            Space::new().height(tile_row_height * total_rows.saturating_sub(last_row) as f32);
 
-    let body_column = column(
-        std::iter::once(before.into())
-            .chain(rows)
-            .chain(std::iter::once(after.into())),
-    )
-    .spacing(t.sizes.grid_tile_gap)
-    .padding(t.sizes.grid_tile_gap)
-    .width(Fill);
+        let rows = (first_row..last_row).map(move |row_index| {
+            let start = row_index.saturating_mul(columns);
+            let end = start.saturating_add(columns).min(total);
+            let tiles = state
+                .visible
+                .get(start..end)
+                .unwrap_or(&[])
+                .iter()
+                .enumerate()
+                .filter_map(|(offset, &entry_index)| {
+                    state
+                        .entries
+                        .get(entry_index)
+                        .map(|entry| tile(state, t, mime_db, thumb_cache, start + offset, entry))
+                });
+            row(tiles).spacing(t.sizes.grid_tile_gap).into()
+        });
 
-    scrollable(body_column)
-        .on_scroll(Message::Scrolled)
-        .style(style::scrollable::rest(t, Surface::Paper))
-        .width(Fill)
-        .height(Fill)
-        .into()
+        let body_column = column(
+            std::iter::once(before.into())
+                .chain(rows)
+                .chain(std::iter::once(after.into())),
+        )
+        .spacing(t.sizes.grid_tile_gap)
+        .padding(t.sizes.grid_tile_gap)
+        .width(Fill);
+
+        scrollable(body_column)
+            .on_scroll(Message::Scrolled)
+            .style(style::scrollable::rest(t, Surface::Paper))
+            .width(Fill)
+            .height(Fill)
+            .into()
+    })
+    .into()
 }
 
 /// Which band of tile-rows is on (or near) screen — the grid-row analogue
@@ -308,15 +419,102 @@ fn empty_state_owned<'a>(t: &'a Theme, message: String) -> Element<'a, Message> 
 mod tests {
     use super::*;
 
+    /// Today's tokens, spelled out once: `sizes.grid_tile` 96,
+    /// `sizes.grid_tile_gap` 12.
+    fn columns(width: f32) -> usize {
+        column_count(width, 96.0, 12.0)
+    }
+
     #[test]
     fn div_ceil_matches_expected_row_counts() {
-        // Sanity check on the constant this module's whole virtualization
-        // scheme rests on — a change to `GRID_COLUMNS` should still round
-        // row counts up, not down (a trailing partial row must still get
-        // its own spacer-bracketed row).
-        assert_eq!(7usize.div_ceil(GRID_COLUMNS), 2);
-        assert_eq!(GRID_COLUMNS.div_ceil(GRID_COLUMNS), 1);
-        assert_eq!(0usize.div_ceil(GRID_COLUMNS), 0);
+        // Sanity check on the arithmetic this module's whole virtualization
+        // scheme rests on — whatever the measured column count turns out to
+        // be, row counts must round *up*, not down (a trailing partial row
+        // must still get its own spacer-bracketed row). Parametrized by the
+        // measured count now that there's no constant to test against.
+        let n = columns(INITIAL_GRID_WIDTH);
+        assert_eq!((n + 1).div_ceil(n), 2);
+        assert_eq!(n.div_ceil(n), 1);
+        assert_eq!(0usize.div_ceil(n), 0);
+        // And the same three shapes at a much narrower width, where `n` is
+        // a completely different number.
+        let narrow = columns(300.0);
+        assert!(narrow < n);
+        assert_eq!((narrow + 1).div_ceil(narrow), 2);
+        assert_eq!(narrow.div_ceil(narrow), 1);
+    }
+
+    #[test]
+    fn column_count_at_todays_tokens() {
+        // `n ≤ (width − gap) / (tile + gap)`, floored — see
+        // `column_count`'s doc comment for where each term comes from.
+        //
+        // 866 px is the content width at the app's default 1100×720 window
+        // (the same measured number `list.rs`'s budget test pins against,
+        // and this module's `INITIAL_GRID_WIDTH`):
+        // (866 − 12) / 108 = 7.90 → 7 tiles, spending
+        // 7×96 + 6×12 + 2×12 = 768 of the 866, with 98 px to spare — not
+        // quite an eighth tile, which is exactly what the floor says.
+        assert_eq!(columns(866.0), 7);
+        assert_eq!(columns(INITIAL_GRID_WIDTH), 7);
+        // A niri column halved: (435 − 12) / 108 = 3.9 → 3.
+        assert_eq!(columns(435.0), 3);
+        // Fullscreen on a 2560-logical-px output, roughly:
+        // (2326 − 12) / 108 = 21.4 → 21.
+        assert_eq!(columns(2326.0), 21);
+        // The exact boundary: 7 tiles need 7×96 + 6×12 + 2×12 = 768 px, so
+        // 768 fits 7 and one pixel less fits only 6. An off-by-one in the
+        // padding/spacing accounting would show up right here.
+        assert_eq!(columns(768.0), 7);
+        assert_eq!(columns(767.0), 6);
+    }
+
+    #[test]
+    fn column_count_never_falls_below_one() {
+        // A window squeezed under a single tile still draws one tile per
+        // row (clipped by the viewport — the honest outcome) rather than
+        // returning 0, which would make `div_ceil` divide by zero and take
+        // the app down. CLAUDE.md's no-panic rule reaching into layout.
+        assert_eq!(columns(100.0), 1);
+        assert_eq!(columns(0.0), 1);
+        assert_eq!(columns(-500.0), 1);
+        assert_eq!(columns(f32::NAN), 1);
+        // Degenerate tokens: a zero (or negative) tile+gap step would
+        // divide by zero, so it short-circuits before the division.
+        assert_eq!(column_count(866.0, 0.0, 0.0), 1);
+        assert_eq!(column_count(866.0, -96.0, -12.0), 1);
+    }
+
+    #[test]
+    fn column_count_grows_with_the_window() {
+        // Wider has to mean more tiles per row, or the whole change does
+        // nothing on resize — and never fewer, which would mean the
+        // arithmetic isn't monotonic in width.
+        assert!(columns(435.0) < columns(866.0));
+        assert!(columns(866.0) < columns(1732.0));
+        assert!(columns(1732.0) < columns(2326.0));
+        // Monotonic across a sweep, not just at the sampled pairs.
+        let mut previous = 0usize;
+        for step in 0..200 {
+            let n = columns(step as f32 * 25.0);
+            assert!(n >= previous, "column count shrank at width {}", step * 25);
+            previous = n;
+        }
+    }
+
+    #[test]
+    fn columns_for_scroll_falls_back_to_the_initial_window() {
+        // The update-side path, before any viewport has been reported: it
+        // must agree with what `view` would compute at the same width, and
+        // must never be the old hardcoded placeholder by coincidence of
+        // reading a stale constant.
+        assert_eq!(
+            columns_for_scroll(None),
+            columns(INITIAL_GRID_WIDTH),
+            "the pre-layout fallback has to be the measured count at the \
+             default window, not a number of its own"
+        );
+        assert!(columns_for_scroll(None) >= 1);
     }
 
     #[test]

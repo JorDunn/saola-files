@@ -1418,15 +1418,21 @@ impl DirectoryView {
     }
 
     /// How many `visible` positions one Up/Down/PageUp/PageDown step
-    /// covers: one item in list view, one full tile-row (`grid::
-    /// GRID_COLUMNS` items) in grid view — so "Down" always means "the
-    /// next thing spatially below", not "the next name alphabetically",
-    /// regardless of presentation. Left/Right (grid-only) always step by
-    /// exactly one, independent of this.
+    /// covers: one item in list view, one full tile-row in grid view — so
+    /// "Down" always means "the next thing spatially below", not "the next
+    /// name alphabetically", regardless of presentation. Left/Right
+    /// (grid-only) always step by exactly one, independent of this.
+    ///
+    /// The grid arm asks `grid::columns_for_scroll` rather than reading a
+    /// constant, so a resized window moves the cursor by however many tiles
+    /// are *actually* on a row now. `update()` can't see the `responsive`
+    /// closure's measured `Size` that `grid::view` uses, so that helper
+    /// takes the width from `self.scroll` instead — see its doc comment for
+    /// the one-frame staleness that buys and why it's harmless.
     fn row_step(&self) -> isize {
         match self.view_mode {
             View::List => 1,
-            View::Grid => grid::GRID_COLUMNS as isize,
+            View::Grid => grid::columns_for_scroll(self.scroll) as isize,
         }
     }
 
@@ -2395,7 +2401,12 @@ mod tests {
         let mut cfg = config();
         cfg.view = View::Grid;
         let mut view = DirectoryView::new(Location::local("/home"), &cfg);
-        let names: Vec<_> = (0..(grid::GRID_COLUMNS * 2))
+        // No scroll viewport has been reported in a headless test, so the
+        // step is whatever `columns_for_scroll` falls back to — asked here
+        // rather than assumed, so this test keeps testing *stepping by a
+        // row* even after a token change moves how wide a row is.
+        let columns = grid::columns_for_scroll(None);
+        let names: Vec<_> = (0..(columns * 2))
             .map(|i| file(&format!("f{i:02}")))
             .collect();
         let _ = view.update(Message::Listed(Location::local("/home"), Ok(names)));
@@ -2403,10 +2414,10 @@ mod tests {
         let _ = view.apply_action_for_test(Action::MoveCursorDown);
         assert_eq!(view.selection.cursor(), Some(0));
         let _ = view.apply_action_for_test(Action::MoveCursorDown);
-        assert_eq!(view.selection.cursor(), Some(grid::GRID_COLUMNS));
+        assert_eq!(view.selection.cursor(), Some(columns));
 
         let _ = view.apply_action_for_test(Action::MoveCursorRight);
-        assert_eq!(view.selection.cursor(), Some(grid::GRID_COLUMNS + 1));
+        assert_eq!(view.selection.cursor(), Some(columns + 1));
     }
 
     #[test]
