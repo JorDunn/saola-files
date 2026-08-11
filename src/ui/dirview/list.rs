@@ -40,6 +40,43 @@ const INITIAL_ROWS: usize = 64;
 const SIZE_COLUMN: f32 = 84.0;
 const DATE_COLUMN: f32 = 168.0;
 
+/// How many *width units* of filename fit in the name column at a given
+/// list width — the list's analogue of the grid's fixed-tile budget, except
+/// that here the column is `Fill`, so the number has to come from a real
+/// measurement rather than a token.
+///
+/// Every subtraction below is one thing the row actually spends its width
+/// on, read straight off `entry_row`'s layout:
+///
+/// - `2.0 * pill_gap` — the row's own `padding([0, pill_gap])`, one gap on
+///   each side.
+/// - `SIZE_COLUMN` and `DATE_COLUMN` — the two fixed columns, which take
+///   their width before the `Fill` name column sees any.
+/// - `icon_row` — the glyph (or thumbnail) box at the head of the name cell.
+/// - one more `pill_gap` — the name row's `.spacing(pill_gap)` between that
+///   icon and the label itself.
+///
+/// Nothing is subtracted for the scrollbar, deliberately: iced's default
+/// `Scrollable` reserves no layout width for its bar (this file never sets
+/// `.spacing()` on the scrollable, which is what would turn the overlay into
+/// a reserved gutter), so the bar floats over the tail of the date column
+/// and never over the name. Subtracting a guessed scrollbar width here would
+/// be a magic number paying for space that was never taken.
+///
+/// Squeezing the window narrower than the two fixed columns makes
+/// `available` negative. That is fine and upstream-documented: `unit_budget`
+/// saturates a negative through `as usize` to 0 and then clamps to its floor
+/// of 4, so the worst case is every name eliding down to three narrow
+/// characters plus the `…` — never a panic, never a budget of 0 that would
+/// render every label as a lone ellipsis.
+///
+/// Pure function of four `f32`s, which is what makes it testable below
+/// without a `Theme` or a renderer — the same posture `grid.rs` takes.
+fn name_unit_budget(list_width: f32, font: f32, pill_gap: f32, icon_row: f32) -> usize {
+    let available = list_width - 2.0 * pill_gap - SIZE_COLUMN - DATE_COLUMN - icon_row - pill_gap;
+    saola_theme::overflow::unit_budget(available, font)
+}
+
 pub(super) fn view<'a>(
     state: &'a DirectoryView,
     t: &'a Theme,
@@ -62,43 +99,67 @@ pub(super) fn view<'a>(
         return empty_state(t, message);
     }
 
-    let row_height = t.sizes.list_row;
-    let total = state.visible.len();
-    let (first, last) = visible_range(state, row_height, total);
+    // `responsive` is how a widget learns its own width in iced 0.14: the
+    // closure runs *inside* `Widget::layout`, after limits are known, and is
+    // handed the `Size` this container actually got. That is the only place
+    // in a `view()` where a real pixel width exists, and it is why the name
+    // budget can be a measurement instead of a guess.
+    //
+    // Two things this closure must honour. It is `Fn`, not `FnOnce` — iced
+    // re-runs it on every relayout — so everything it captures is captured
+    // by value, which is free here: `&DirectoryView`, `&Theme`, `&MimeDb`
+    // and `&ThumbCache` are all shared references, and shared references are
+    // `Copy`. And it must return the *same tree shape* every run
+    // (`column![header, scrollable]`, always): `Responsive::diff` defers to
+    // the ordinary `diff_children`, so a stable shape means the scrollable's
+    // widget state — including the scroll offset — is matched up and carried
+    // across a resize instead of being torn down and reset to the top.
+    iced::widget::responsive(move |size| {
+        let units = name_unit_budget(
+            size.width,
+            t.typography.size.body,
+            t.sizes.pill_gap,
+            t.sizes.icon_row,
+        );
 
-    let before = Space::new().height(row_height * first as f32);
-    let after = Space::new().height(row_height * total.saturating_sub(last) as f32);
+        let row_height = t.sizes.list_row;
+        let total = state.visible.len();
+        let (first, last) = visible_range(state, row_height, total);
 
-    let rows = state
-        .visible
-        .get(first..last)
-        .unwrap_or(&[])
-        .iter()
-        .enumerate()
-        .filter_map(|(offset, &entry_index)| {
-            state
-                .entries
-                .get(entry_index)
-                .map(|entry| entry_row(state, t, mime_db, thumb_cache, first + offset, entry))
-        });
+        let before = Space::new().height(row_height * first as f32);
+        let after = Space::new().height(row_height * total.saturating_sub(last) as f32);
 
-    let body_column = column(
-        std::iter::once(before.into())
-            .chain(rows)
-            .chain(std::iter::once(after.into())),
-    )
-    .width(Fill);
+        let rows = state
+            .visible
+            .get(first..last)
+            .unwrap_or(&[])
+            .iter()
+            .enumerate()
+            .filter_map(|(offset, &entry_index)| {
+                state.entries.get(entry_index).map(|entry| {
+                    entry_row(state, t, mime_db, thumb_cache, first + offset, entry, units)
+                })
+            });
 
-    let body = scrollable(body_column)
-        .on_scroll(Message::Scrolled)
-        .style(style::scrollable::rest(t, Surface::Paper))
-        .width(Fill)
-        .height(Fill);
+        let body_column = column(
+            std::iter::once(before.into())
+                .chain(rows)
+                .chain(std::iter::once(after.into())),
+        )
+        .width(Fill);
 
-    column![header_row(state, t), body]
-        .width(Fill)
-        .height(Fill)
-        .into()
+        let body = scrollable(body_column)
+            .on_scroll(Message::Scrolled)
+            .style(style::scrollable::rest(t, Surface::Paper))
+            .width(Fill)
+            .height(Fill);
+
+        column![header_row(state, t), body]
+            .width(Fill)
+            .height(Fill)
+            .into()
+    })
+    .into()
 }
 
 /// Which slice of `visible` is on (or near) screen, from the last known
@@ -210,6 +271,7 @@ fn entry_row<'a>(
     thumb_cache: &'a ThumbCache,
     visible_index: usize,
     entry: &'a FileEntry,
+    units: usize,
 ) -> Element<'a, Message> {
     // Stage 8: a row mid-inline-rename swaps its label for a `text_input`
     // and stops being a clickable button entirely (there is nothing sane
@@ -256,9 +318,37 @@ fn entry_row<'a>(
         .into(),
     };
 
-    let name = text(entry.display_name().into_owned())
-        .size(t.typography.size.body)
-        .font(convert::ui_font(t));
+    // Two belts for one job, because each covers what the other can't (the
+    // same pairing `grid.rs::tile` draws, for the same reasons).
+    //
+    // `truncate` is the style guide's honest answer to a name that doesn't
+    // fit (§7: cut at a width limit, exactly one `…` — one glyph, never
+    // three dots — and no motion), spending the budget in UAX #11 width
+    // units so a CJK or emoji name lands at about the same pixel width as a
+    // Latin one instead of running twice as long. What a unit-counted
+    // budget still can't see is the spread *within* narrow characters
+    // (`mmmm` vs `llll`), so a wide-for-its-count name can paint a little
+    // past where the budget said it would.
+    //
+    // `Wrapping::None` is the hard guarantee for exactly that residue, and
+    // here it is the belt that actually matters: a name long enough to wrap
+    // made the row taller than `sizes.list_row`, and every spacer offset in
+    // `view()` above is computed from that height being fixed — so a
+    // wrapped row didn't just look wrong, it walked the whole virtualized
+    // list out of sync with its own scroll position. That was a real layout
+    // bug, not a cosmetic one. A few pixels of horizontal lean into the
+    // size column's left margin is the cost, and it is the cheap one.
+    //
+    // Only the *rendering* is shortened: `entry.name` is untouched, so
+    // selection, the rename target match, and the sort all still key off
+    // the real `OsString`. Nothing downstream ever sees the elided string.
+    let name = text(saola_theme::overflow::truncate(
+        &entry.display_name(),
+        units,
+    ))
+    .size(t.typography.size.body)
+    .font(convert::ui_font(t))
+    .wrapping(iced::widget::text::Wrapping::None);
 
     let name_row = row![icon, name]
         .spacing(t.sizes.pill_gap)
@@ -399,5 +489,103 @@ fn date_text(entry: &FileEntry) -> String {
     match entry.modified {
         Some(time) => format_system_time(time),
         None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Today's tokens, spelled out once: `typography.size.body` 13.5,
+    /// `sizes.pill_gap` 8, `sizes.icon_row` 16.
+    fn budget(width: f32) -> usize {
+        name_unit_budget(width, 13.5, 8.0, 16.0)
+    }
+
+    #[test]
+    fn name_budget_at_todays_tokens() {
+        // 866 px is roughly what the list content area works out to at the
+        // default 1100×720 window, once the window border, the island gaps
+        // and the 200 px sidebar are taken out. It is a *representative*
+        // width for pinning arithmetic, not a contract — the whole point of
+        // `responsive` is that the runtime budget comes from the measured
+        // size, so no chrome token here can drift the feature out of true;
+        // it can only drift this number.
+        //
+        // available = 866 − 2×8 − 84 − 168 − 16 − 8 = 574
+        // 574 / (13.5 × 0.55) = 77.3, floored to 77 — the value pinned
+        // upstream in saola-theme 0.11.0's own tests, so the two agree.
+        assert_eq!(budget(866.0), 77);
+    }
+
+    #[test]
+    fn name_budget_widens_with_the_window() {
+        // Half a niri column against a full one, and one more widening
+        // pair: more width has to buy more name, or the feature does
+        // nothing on resize.
+        assert!(budget(435.0) < budget(866.0));
+        assert!(budget(866.0) < budget(1732.0));
+    }
+
+    #[test]
+    fn name_budget_never_falls_below_the_floor() {
+        // A window squeezed under the fixed columns drives `available`
+        // negative (200 − 16 − 84 − 168 − 8 = −76, and it only gets worse
+        // from there). Upstream saturates that to the floor of 4 rather
+        // than panicking or computing a budget of 0 — CLAUDE.md's no-panic
+        // rule reaching all the way down into layout.
+        assert_eq!(budget(200.0), 4);
+        assert_eq!(budget(0.0), 4);
+        assert_eq!(budget(-50.0), 4);
+    }
+
+    #[test]
+    fn a_narrow_window_elides_every_script_the_same_way() {
+        // 435 px is the list content area of a 667 px window — a third of
+        // a 1706 px niri column, i.e. the app squeezed hard. Not derived
+        // from chrome tokens but *measured*: at that window the on-screen
+        // budget came out 19 units, which brackets the real content width
+        // to [433.1, 440.5), and 435 sits inside it. Deriving it from a
+        // token sum instead was off by a unit — which is the whole argument
+        // for `responsive` measuring the width at runtime rather than any
+        // code adding chrome up in its head.
+        //
+        // available = 435 − 2×8 − 84 − 168 − 16 − 8 = 143
+        // 143 / 7.425 = 19.2 → 19 units. These are the exact names in the
+        // on-screen verification tree at exactly that window width, so the
+        // assertions here and the screenshots claim the same strings.
+        let narrow = budget(435.0);
+        assert_eq!(narrow, 19);
+        let cut = |s: &str| saola_theme::overflow::truncate(s, narrow);
+
+        // Long ASCII: 18 characters of prefix plus the single `…`.
+        assert_eq!(
+            cut(
+                "the-quarterly-financial-report-for-fiscal-year-2026-final-revision-v3-approved-by-the-board-of-directors.txt"
+            ),
+            "the-quarterly-fina…"
+        );
+        // Full-width Japanese spends two units per glyph, so the same
+        // budget buys nine characters instead of eighteen — which is the
+        // point: both land at roughly the same pixel width. The tenth is
+        // dropped rather than squeezed into the leftover unit, so the
+        // result comes in *under* budget, never over.
+        assert_eq!(
+            cut("設定ウィンドウのタイトルはとても長いファイル名です.txt"),
+            "設定ウィンドウのタ…"
+        );
+        // Three deer are six units before a single Latin character is
+        // spent, which is exactly the accounting that keeps an emoji name
+        // from running off the end of the column.
+        assert_eq!(
+            cut("🦌🦌🦌-saola-deer-emoji-filename.txt"),
+            "🦌🦌🦌-saola-deer-…"
+        );
+        // Exactly at the budget: 19 narrow characters is 19 units, and the
+        // cap is inclusive, so this comes back whole — no stray ellipsis on
+        // a name that fits.
+        assert_eq!(cut("exactly-19-units.md"), "exactly-19-units.md");
+        // And a short name is never touched at all.
+        assert_eq!(cut("ok.txt"), "ok.txt");
     }
 }

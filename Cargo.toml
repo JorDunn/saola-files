@@ -54,7 +54,15 @@ iced = { version = "0.14", features = ["tokio", "svg", "image"] }
 # every surface with a width cap gets the fix at once. Narrow-only input is
 # unaffected (for all-narrow text the arithmetic is exactly the old character
 # count), so Latin labels render byte-for-byte as they did at 0.9.0.
-saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.10.0", version = "0.10.0" }
+# Bumped again 2026-08-11 to v0.11.0 for `saola_theme::overflow::unit_budget`
+# — the pixels → width-units conversion that used to live here as grid.rs's
+# private `LABEL_AVG_ADVANCE_EM` + `label_unit_budget`. The list view needs
+# the same arithmetic for its flexible name column, and two surfaces sharing
+# a calibration constant is exactly the "shared helpers go upstream" rule:
+# the 0.55 em average advance and the floor-of-4 rationale now have one home
+# (and one test suite) instead of a copy per view. Behaviour at today's
+# tokens is identical — `unit_budget(96.0, 12.5)` is still 13.
+saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.11.0", version = "0.11.0" }
 
 # Config parsing. Surveyed 2026-08-08: the family standard is hand-walked
 # parsing over a real parser's loose document type. capture (the newest

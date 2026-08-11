@@ -4,14 +4,15 @@
 //! "no virtualized list widget, never build 100k Elements" rule applies to
 //! every directory view, not just the list.
 //!
-//! Column count is a fixed placeholder ([`GRID_COLUMNS`]), not derived
-//! from the viewport's actual measured width: iced 0.14's `view()` has no
-//! way to learn a container's pixel width before layout runs, and wiring
-//! real responsive columns means threading `window::resize` events down
-//! into `DirectoryView` state — out of scope for this stage. A later
-//! stage can replace the constant with that without touching the
-//! virtualization math below (it only cares about "how many tiles per
-//! row", not where that number comes from).
+//! Column count is a fixed placeholder ([`GRID_COLUMNS`]), not derived from
+//! the viewport's actual measured width — but only because nobody has done
+//! it yet, not because iced can't. The mechanism is proven and in this
+//! codebase: `iced::widget::responsive` hands its closure the container's
+//! real laid-out `Size`, which is exactly how `list.rs` sizes its flexible
+//! name column. Replacing the constant means calling the tile-row math from
+//! inside such a closure; the virtualization below doesn't care where "how
+//! many tiles per row" comes from, so nothing under this line has to move.
+//! Noted as the follow-up; out of scope for this stage.
 
 use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Center, Element, Fill, Length};
@@ -39,67 +40,6 @@ const OVERSCAN_ROWS: usize = 2;
 
 /// Tile-rows rendered before the first `Scrolled` event arrives.
 const INITIAL_ROWS: usize = 6;
-
-/// Advance of one *width unit* of the UI sans, as a fraction of the font
-/// size — which is to say the average advance of a narrow character, since
-/// `saola_theme::overflow::truncate` charges a narrow character exactly one
-/// unit and a UAX #11 Wide/Fullwidth one two. That correspondence is the
-/// whole reason the derivation below is unchanged from when this budget was
-/// counted in `char`s: a unit *is* an average narrow advance, so dividing
-/// the tile width by it still answers "how much of this label fits".
-///
-/// An approximation, deliberately: the face is proportional, so an `m` and
-/// an `l` are nowhere near this same width — but the style guide (§7) asks
-/// for a limit "measured in characters, not pixels … approximate under a
-/// proportional face", and iced 0.14's `view()` cannot measure a string
-/// before layout runs anyway. 0.55 em is the usual ballpark for a humanist
-/// sans at mixed-case text; see [`label_unit_budget`] for what it feeds.
-///
-/// Verified on screen 2026-08-10 against the shipped tokens: a 13-unit
-/// Latin label renders ~77 px wide in a 96 px tile — close to the edge with
-/// margin left for wider-than-average strings, which is the calibration
-/// this constant is for.
-///
-/// **What this average does and does not cover.** The *script*-scale error
-/// is no longer ours: a full-width CJK glyph is nearer 1.0 em than 0.55, and
-/// charging it two units (saola-theme 0.10's East-Asian-width budgeting) is
-/// what keeps a Japanese filename inside the same 96 px tile a Latin one
-/// gets, instead of the ~145 px spill into the neighbouring label this view
-/// used to show. What remains is the glyph-scale error within Latin itself —
-/// `mmmmmmmmmmmmm` and `lllllllllllll` are both thirteen units and nowhere
-/// near the same pixel width. That residue is small, bounded, and absorbed
-/// by two things already in place: `Wrapping::None` at the call site (a
-/// wide-for-its-count label is clipped to one line, never wrapped into the
-/// next row's height), and `sizes.grid_tile_gap` between tiles, which gives
-/// an over-average label somewhere to lean without touching its neighbour.
-/// Removing even that would mean measuring with the renderer, which §7
-/// explicitly declines to ask consumers to do.
-const LABEL_AVG_ADVANCE_EM: f32 = 0.55;
-
-/// How many *width units* of filename fit across one tile (see
-/// [`LABEL_AVG_ADVANCE_EM`]: one unit per narrow character, two per
-/// wide/fullwidth one), derived from tokens rather than hardcoded so a token
-/// change carries the label with it.
-///
-/// The `.max(4)` is a floor, not a tuning knob: a degenerate token pair (a
-/// tiny `grid_tile`, a huge font) would otherwise compute a budget of 0 or
-/// 1, and `overflow::truncate` spends the last unit of its budget on the
-/// `…` itself — so every label in the view would collapse to a lone
-/// ellipsis, which reads as a bug rather than as elision. Four leaves at
-/// least three narrow characters (or one wide one) visible.
-///
-/// Pure function of two numbers, which is what makes it testable below
-/// without a `Theme` or a renderer.
-fn label_unit_budget(tile: f32, font: f32) -> usize {
-    let advance = font * LABEL_AVG_ADVANCE_EM;
-    if advance <= 0.0 {
-        return 4;
-    }
-    // `as usize` on a f32 saturates at 0 for negatives and at usize::MAX for
-    // huge values in Rust 2021+ — no UB, no panic, so a nonsense `tile`
-    // can't take the app down (CLAUDE.md's no-panic rule).
-    ((tile / advance).floor() as usize).max(4)
-}
 
 pub(super) fn view<'a>(
     state: &'a DirectoryView,
@@ -235,7 +175,11 @@ fn tile<'a>(
     // budget still can't see is the spread *within* narrow characters
     // (`mmmm` vs `llll` — see `LABEL_AVG_ADVANCE_EM`), so an unusually
     // wide-for-its-count Latin name can still paint a little over the
-    // tile. `Wrapping::None` is the hard guarantee for that residue, and
+    // tile — see `saola_theme::overflow`'s module docs for the full
+    // calibration essay (the 0.55 em average advance, what it does and
+    // doesn't cover); it lives upstream since 0.11.0 because the list view
+    // needs the same arithmetic and a shared constant deserves one home.
+    // `Wrapping::None` is the hard guarantee for that residue, and
     // it is the one that actually matters here: a few pixels of horizontal
     // lean into the tile gap is cosmetic, whereas a second line would push
     // the tile past `grid_tile + grid_tile_label` and break the fixed row
@@ -244,7 +188,8 @@ fn tile<'a>(
     // is the bug this whole change exists to kill. Rendering is what
     // shortens the name; nothing here touches `entry.name`, so rename,
     // selection and the sort still see the real one.
-    let max_units = label_unit_budget(t.sizes.grid_tile, t.typography.size.secondary);
+    let max_units =
+        saola_theme::overflow::unit_budget(t.sizes.grid_tile, t.typography.size.secondary);
     let name = text(saola_theme::overflow::truncate(
         &entry.display_name(),
         max_units,
@@ -377,34 +322,36 @@ mod tests {
     #[test]
     fn label_budget_at_todays_tokens() {
         // `sizes.grid_tile` 96, `typography.size.secondary` 12.5 — the
-        // shipped values at saola-theme 0.10.0. 96 / (12.5 * 0.55) = 13.96,
-        // floored to 13. Unchanged by the move from characters to width
-        // units: a unit is an average narrow advance, which is exactly what
-        // this divides by. Pinned so a token bump that silently halves the
-        // budget shows up here rather than on screen.
-        assert_eq!(label_unit_budget(96.0, 12.5), 13);
+        // shipped values. 96 / (12.5 * 0.55) = 13.96, floored to 13.
+        //
+        // Since saola-theme 0.11.0 the arithmetic lives upstream, so this
+        // now guards two things at once: a *token* bump that silently
+        // halves the budget, and a *calibration* drift upstream (a changed
+        // average advance or floor) that would quietly reshape every label
+        // in this view. Either shows up here rather than on screen.
+        assert_eq!(saola_theme::overflow::unit_budget(96.0, 12.5), 13);
     }
 
     #[test]
-    fn label_budget_never_falls_below_the_floor() {
-        // Degenerate token pairs: a tiny tile, an enormous font, and the
-        // nonsense cases. None may compute a budget small enough that
-        // `truncate` spends the whole thing on the ellipsis, and none may
-        // panic (CLAUDE.md's no-panic rule) — `as usize` saturates rather
-        // than wrapping, and a non-positive advance short-circuits.
-        assert_eq!(label_unit_budget(10.0, 100.0), 4);
-        assert_eq!(label_unit_budget(0.0, 12.5), 4);
-        assert_eq!(label_unit_budget(96.0, 0.0), 4);
-        assert_eq!(label_unit_budget(-96.0, 12.5), 4);
-        assert_eq!(label_unit_budget(96.0, -12.5), 4);
+    fn label_budget_degenerate_tokens_stay_at_the_floor() {
+        // One spot-check that a degenerate token pair (a tiny tile against
+        // an enormous font) still can't produce a budget so small that
+        // `truncate` spends the whole thing on the ellipsis — and can't
+        // panic. The exhaustive cases (zeroes, negatives, both signs) are
+        // upstream's tests now; this only pins that *this* view still sees
+        // that behaviour.
+        assert_eq!(saola_theme::overflow::unit_budget(10.0, 100.0), 4);
     }
 
     #[test]
     fn label_budget_tracks_tile_size() {
-        // A bigger tile earns more units, a smaller one fewer — the point
-        // of deriving this from tokens instead of hardcoding it.
-        assert!(label_unit_budget(192.0, 12.5) > label_unit_budget(96.0, 12.5));
-        assert!(label_unit_budget(64.0, 12.5) < label_unit_budget(96.0, 12.5));
+        // One spot-check that a bigger tile earns more units — the point of
+        // deriving this from tokens instead of hardcoding it. Full
+        // monotonicity is upstream's test.
+        assert!(
+            saola_theme::overflow::unit_budget(192.0, 12.5)
+                > saola_theme::overflow::unit_budget(96.0, 12.5)
+        );
     }
 
     #[test]
@@ -418,9 +365,10 @@ mod tests {
         // and the screenshots are claiming the same thing.
         //
         // The width table itself is saola-theme's business (and tested
-        // there); what this pins is the pairing of *our* token-derived
-        // budget with it, which is the part a token bump could break.
-        let budget = label_unit_budget(96.0, 12.5);
+        // there); what this pins is the pairing of *our* tokens with it,
+        // which is the part a token bump — or an upstream calibration
+        // change to `unit_budget` — could break without anyone noticing.
+        let budget = saola_theme::overflow::unit_budget(96.0, 12.5);
         let cut = |s: &str| saola_theme::overflow::truncate(s, budget);
 
         assert_eq!(cut("a-very-long-ascii-filename.txt"), "a-very-long-…");
