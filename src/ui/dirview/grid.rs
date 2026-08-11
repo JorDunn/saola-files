@@ -40,6 +40,57 @@ const OVERSCAN_ROWS: usize = 2;
 /// Tile-rows rendered before the first `Scrolled` event arrives.
 const INITIAL_ROWS: usize = 6;
 
+/// Average glyph advance of the UI sans, as a fraction of the font size.
+/// An approximation, deliberately: the face is proportional, so an `m` and
+/// an `l` are nowhere near this same width — but the style guide (§7) asks
+/// for a limit "measured in characters, not pixels … approximate under a
+/// proportional face", and iced 0.14's `view()` cannot measure a string
+/// before layout runs anyway. 0.55 em is the usual ballpark for a humanist
+/// sans at mixed-case text; see [`label_char_budget`] for what it feeds.
+///
+/// Verified on screen 2026-08-10 against the shipped tokens: a 13-character
+/// Latin label renders ~77 px wide in a 96 px tile — close to the edge with
+/// margin left for wider-than-average strings, which is the calibration
+/// this constant is for.
+///
+/// **Known limitation, disclosed rather than silently accepted.** One
+/// average cannot describe every script. CJK is full-width — nearer 1.0 em
+/// than 0.55 — so a 13-character CJK name renders roughly 145 px and spills
+/// past its tile into the neighbouring label. That is the style guide's own
+/// documented trade (§7, and `saola_theme::overflow`'s module docs: "a
+/// 50-character cap is not a 50-column cap … the guide blesses the
+/// approximation rather than making every consumer measure glyphs"), so it
+/// is not fixed by re-tuning this number: raising it to 1.0 for CJK's sake
+/// would cut Latin labels to 7 characters and underfill every ordinary
+/// filename. Fixing it properly means charging wide characters more than
+/// one unit of budget (an East-Asian-width table) or measuring with the
+/// renderer — either is a design-language decision for saola-theme to make
+/// once, for every surface, not a local patch here.
+const LABEL_AVG_ADVANCE_EM: f32 = 0.55;
+
+/// How many characters of filename fit across one tile, derived from tokens
+/// rather than hardcoded so a token change carries the label with it.
+///
+/// The `.max(4)` is a floor, not a tuning knob: a degenerate token pair (a
+/// tiny `grid_tile`, a huge font) would otherwise compute a budget of 0 or
+/// 1, and `overflow::truncate` spends the last character of its budget on
+/// the `…` itself — so every label in the view would collapse to a lone
+/// ellipsis, which reads as a bug rather than as elision. Four leaves at
+/// least three real characters visible.
+///
+/// Pure function of two numbers, which is what makes it testable below
+/// without a `Theme` or a renderer.
+fn label_char_budget(tile: f32, font: f32) -> usize {
+    let advance = font * LABEL_AVG_ADVANCE_EM;
+    if advance <= 0.0 {
+        return 4;
+    }
+    // `as usize` on a f32 saturates at 0 for negatives and at usize::MAX for
+    // huge values in Rust 2021+ — no UB, no panic, so a nonsense `tile`
+    // can't take the app down (CLAUDE.md's no-panic rule).
+    ((tile / advance).floor() as usize).max(4)
+}
+
 pub(super) fn view<'a>(
     state: &'a DirectoryView,
     t: &'a Theme,
@@ -164,10 +215,31 @@ fn tile<'a>(
         .into(),
     };
 
-    let name = text(entry.display_name().into_owned())
-        .size(t.typography.size.secondary)
-        .font(convert::ui_font_regular(t))
-        .align_x(iced::alignment::Horizontal::Center);
+    // Two belts for one job, because each covers what the other can't.
+    // `truncate` is the *style guide's* answer to a name that doesn't fit
+    // (§7's default overflow mode: cut at a character limit, exactly one
+    // `…`, never three dots, no motion) — it makes the label honest about
+    // being elided. But a character count is only an approximation of
+    // pixel width under a proportional face, so a wide-glyph name can
+    // still come out over the tile (see `LABEL_AVG_ADVANCE_EM`'s disclosed
+    // limitation). `Wrapping::None` is the hard guarantee for that case,
+    // and it is the one that actually matters here: a horizontal spill is
+    // cosmetic, whereas a second line would push the tile past `grid_tile
+    // + grid_tile_label` and break the fixed row height every spacer
+    // offset in `view()` above is computed from — labels would then drift
+    // out of sync with the scroll position, which is the bug this whole
+    // change exists to kill. Rendering is what shortens the name; nothing
+    // here touches `entry.name`, so rename, selection and the sort still
+    // see the real one.
+    let max_chars = label_char_budget(t.sizes.grid_tile, t.typography.size.secondary);
+    let name = text(saola_theme::overflow::truncate(
+        &entry.display_name(),
+        max_chars,
+    ))
+    .size(t.typography.size.secondary)
+    .font(convert::ui_font_regular(t))
+    .wrapping(iced::widget::text::Wrapping::None)
+    .align_x(iced::alignment::Horizontal::Center);
 
     // `align_x(Center)` on the column, not just on the `name` text: a
     // `text` widget's own `align_x` only positions the glyphs inside the
@@ -287,5 +359,36 @@ mod tests {
         assert_eq!(7usize.div_ceil(GRID_COLUMNS), 2);
         assert_eq!(GRID_COLUMNS.div_ceil(GRID_COLUMNS), 1);
         assert_eq!(0usize.div_ceil(GRID_COLUMNS), 0);
+    }
+
+    #[test]
+    fn label_budget_at_todays_tokens() {
+        // `sizes.grid_tile` 96, `typography.size.secondary` 12.5 — the
+        // shipped values at saola-theme 0.9.0. 96 / (12.5 * 0.55) = 13.96,
+        // floored to 13. Pinned so a token bump that silently halves the
+        // budget shows up here rather than on screen.
+        assert_eq!(label_char_budget(96.0, 12.5), 13);
+    }
+
+    #[test]
+    fn label_budget_never_falls_below_the_floor() {
+        // Degenerate token pairs: a tiny tile, an enormous font, and the
+        // nonsense cases. None may compute a budget small enough that
+        // `truncate` spends the whole thing on the ellipsis, and none may
+        // panic (CLAUDE.md's no-panic rule) — `as usize` saturates rather
+        // than wrapping, and a non-positive advance short-circuits.
+        assert_eq!(label_char_budget(10.0, 100.0), 4);
+        assert_eq!(label_char_budget(0.0, 12.5), 4);
+        assert_eq!(label_char_budget(96.0, 0.0), 4);
+        assert_eq!(label_char_budget(-96.0, 12.5), 4);
+        assert_eq!(label_char_budget(96.0, -12.5), 4);
+    }
+
+    #[test]
+    fn label_budget_tracks_tile_size() {
+        // A bigger tile earns more characters, a smaller one fewer — the
+        // point of deriving this from tokens instead of hardcoding it.
+        assert!(label_char_budget(192.0, 12.5) > label_char_budget(96.0, 12.5));
+        assert!(label_char_budget(64.0, 12.5) < label_char_budget(96.0, 12.5));
     }
 }

@@ -38,7 +38,14 @@ iced = { version = "0.14", features = ["tokio", "svg", "image"] }
 # Never point this at `branch = "main"`; bumping the tag is a deliberate,
 # reviewed change (see CLAUDE.md "Design language").
 # Pinned 2026-08-08 at the same tag the panel and capture use.
-saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.8.0", version = "0.8.0" }
+# Bumped 2026-08-10 to v0.9.0 for `saola_theme::overflow::truncate` — the
+# design language's shared answer to text that doesn't fit (style guide §7's
+# default mode: cut at a character limit, one `…`, no motion). `ui/dirview/
+# grid.rs` calls it on tile labels; before the bump a long filename wrapped
+# and overflowed the fixed tile-row height the grid's virtualization math
+# assumes. Ported into the theme rather than written locally per CLAUDE.md's
+# "if a style is missing, add it to saola-theme — never restyle locally".
+saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.9.0", version = "0.9.0" }
 
 # Config parsing. Surveyed 2026-08-08: the family standard is hand-walked
 # parsing over a real parser's loose document type. capture (the newest
