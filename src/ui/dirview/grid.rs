@@ -40,47 +40,57 @@ const OVERSCAN_ROWS: usize = 2;
 /// Tile-rows rendered before the first `Scrolled` event arrives.
 const INITIAL_ROWS: usize = 6;
 
-/// Average glyph advance of the UI sans, as a fraction of the font size.
+/// Advance of one *width unit* of the UI sans, as a fraction of the font
+/// size — which is to say the average advance of a narrow character, since
+/// `saola_theme::overflow::truncate` charges a narrow character exactly one
+/// unit and a UAX #11 Wide/Fullwidth one two. That correspondence is the
+/// whole reason the derivation below is unchanged from when this budget was
+/// counted in `char`s: a unit *is* an average narrow advance, so dividing
+/// the tile width by it still answers "how much of this label fits".
+///
 /// An approximation, deliberately: the face is proportional, so an `m` and
 /// an `l` are nowhere near this same width — but the style guide (§7) asks
 /// for a limit "measured in characters, not pixels … approximate under a
 /// proportional face", and iced 0.14's `view()` cannot measure a string
 /// before layout runs anyway. 0.55 em is the usual ballpark for a humanist
-/// sans at mixed-case text; see [`label_char_budget`] for what it feeds.
+/// sans at mixed-case text; see [`label_unit_budget`] for what it feeds.
 ///
-/// Verified on screen 2026-08-10 against the shipped tokens: a 13-character
+/// Verified on screen 2026-08-10 against the shipped tokens: a 13-unit
 /// Latin label renders ~77 px wide in a 96 px tile — close to the edge with
 /// margin left for wider-than-average strings, which is the calibration
 /// this constant is for.
 ///
-/// **Known limitation, disclosed rather than silently accepted.** One
-/// average cannot describe every script. CJK is full-width — nearer 1.0 em
-/// than 0.55 — so a 13-character CJK name renders roughly 145 px and spills
-/// past its tile into the neighbouring label. That is the style guide's own
-/// documented trade (§7, and `saola_theme::overflow`'s module docs: "a
-/// 50-character cap is not a 50-column cap … the guide blesses the
-/// approximation rather than making every consumer measure glyphs"), so it
-/// is not fixed by re-tuning this number: raising it to 1.0 for CJK's sake
-/// would cut Latin labels to 7 characters and underfill every ordinary
-/// filename. Fixing it properly means charging wide characters more than
-/// one unit of budget (an East-Asian-width table) or measuring with the
-/// renderer — either is a design-language decision for saola-theme to make
-/// once, for every surface, not a local patch here.
+/// **What this average does and does not cover.** The *script*-scale error
+/// is no longer ours: a full-width CJK glyph is nearer 1.0 em than 0.55, and
+/// charging it two units (saola-theme 0.10's East-Asian-width budgeting) is
+/// what keeps a Japanese filename inside the same 96 px tile a Latin one
+/// gets, instead of the ~145 px spill into the neighbouring label this view
+/// used to show. What remains is the glyph-scale error within Latin itself —
+/// `mmmmmmmmmmmmm` and `lllllllllllll` are both thirteen units and nowhere
+/// near the same pixel width. That residue is small, bounded, and absorbed
+/// by two things already in place: `Wrapping::None` at the call site (a
+/// wide-for-its-count label is clipped to one line, never wrapped into the
+/// next row's height), and `sizes.grid_tile_gap` between tiles, which gives
+/// an over-average label somewhere to lean without touching its neighbour.
+/// Removing even that would mean measuring with the renderer, which §7
+/// explicitly declines to ask consumers to do.
 const LABEL_AVG_ADVANCE_EM: f32 = 0.55;
 
-/// How many characters of filename fit across one tile, derived from tokens
-/// rather than hardcoded so a token change carries the label with it.
+/// How many *width units* of filename fit across one tile (see
+/// [`LABEL_AVG_ADVANCE_EM`]: one unit per narrow character, two per
+/// wide/fullwidth one), derived from tokens rather than hardcoded so a token
+/// change carries the label with it.
 ///
 /// The `.max(4)` is a floor, not a tuning knob: a degenerate token pair (a
 /// tiny `grid_tile`, a huge font) would otherwise compute a budget of 0 or
-/// 1, and `overflow::truncate` spends the last character of its budget on
-/// the `…` itself — so every label in the view would collapse to a lone
+/// 1, and `overflow::truncate` spends the last unit of its budget on the
+/// `…` itself — so every label in the view would collapse to a lone
 /// ellipsis, which reads as a bug rather than as elision. Four leaves at
-/// least three real characters visible.
+/// least three narrow characters (or one wide one) visible.
 ///
 /// Pure function of two numbers, which is what makes it testable below
 /// without a `Theme` or a renderer.
-fn label_char_budget(tile: f32, font: f32) -> usize {
+fn label_unit_budget(tile: f32, font: f32) -> usize {
     let advance = font * LABEL_AVG_ADVANCE_EM;
     if advance <= 0.0 {
         return 4;
@@ -217,24 +227,27 @@ fn tile<'a>(
 
     // Two belts for one job, because each covers what the other can't.
     // `truncate` is the *style guide's* answer to a name that doesn't fit
-    // (§7's default overflow mode: cut at a character limit, exactly one
-    // `…`, never three dots, no motion) — it makes the label honest about
-    // being elided. But a character count is only an approximation of
-    // pixel width under a proportional face, so a wide-glyph name can
-    // still come out over the tile (see `LABEL_AVG_ADVANCE_EM`'s disclosed
-    // limitation). `Wrapping::None` is the hard guarantee for that case,
-    // and it is the one that actually matters here: a horizontal spill is
-    // cosmetic, whereas a second line would push the tile past `grid_tile
-    // + grid_tile_label` and break the fixed row height every spacer
-    // offset in `view()` above is computed from — labels would then drift
-    // out of sync with the scroll position, which is the bug this whole
-    // change exists to kill. Rendering is what shortens the name; nothing
-    // here touches `entry.name`, so rename, selection and the sort still
-    // see the real one.
-    let max_chars = label_char_budget(t.sizes.grid_tile, t.typography.size.secondary);
+    // (§7's default overflow mode: cut at a width limit, exactly one `…`,
+    // never three dots, no motion) — it makes the label honest about being
+    // elided, and since saola-theme 0.10 it counts that limit in UAX #11
+    // width units, so a CJK or emoji name spends its budget twice as fast
+    // as a Latin one and lands at about the same pixel width. What the
+    // budget still can't see is the spread *within* narrow characters
+    // (`mmmm` vs `llll` — see `LABEL_AVG_ADVANCE_EM`), so an unusually
+    // wide-for-its-count Latin name can still paint a little over the
+    // tile. `Wrapping::None` is the hard guarantee for that residue, and
+    // it is the one that actually matters here: a few pixels of horizontal
+    // lean into the tile gap is cosmetic, whereas a second line would push
+    // the tile past `grid_tile + grid_tile_label` and break the fixed row
+    // height every spacer offset in `view()` above is computed from —
+    // labels would then drift out of sync with the scroll position, which
+    // is the bug this whole change exists to kill. Rendering is what
+    // shortens the name; nothing here touches `entry.name`, so rename,
+    // selection and the sort still see the real one.
+    let max_units = label_unit_budget(t.sizes.grid_tile, t.typography.size.secondary);
     let name = text(saola_theme::overflow::truncate(
         &entry.display_name(),
-        max_chars,
+        max_units,
     ))
     .size(t.typography.size.secondary)
     .font(convert::ui_font_regular(t))
@@ -364,10 +377,12 @@ mod tests {
     #[test]
     fn label_budget_at_todays_tokens() {
         // `sizes.grid_tile` 96, `typography.size.secondary` 12.5 — the
-        // shipped values at saola-theme 0.9.0. 96 / (12.5 * 0.55) = 13.96,
-        // floored to 13. Pinned so a token bump that silently halves the
+        // shipped values at saola-theme 0.10.0. 96 / (12.5 * 0.55) = 13.96,
+        // floored to 13. Unchanged by the move from characters to width
+        // units: a unit is an average narrow advance, which is exactly what
+        // this divides by. Pinned so a token bump that silently halves the
         // budget shows up here rather than on screen.
-        assert_eq!(label_char_budget(96.0, 12.5), 13);
+        assert_eq!(label_unit_budget(96.0, 12.5), 13);
     }
 
     #[test]
@@ -377,18 +392,49 @@ mod tests {
         // `truncate` spends the whole thing on the ellipsis, and none may
         // panic (CLAUDE.md's no-panic rule) — `as usize` saturates rather
         // than wrapping, and a non-positive advance short-circuits.
-        assert_eq!(label_char_budget(10.0, 100.0), 4);
-        assert_eq!(label_char_budget(0.0, 12.5), 4);
-        assert_eq!(label_char_budget(96.0, 0.0), 4);
-        assert_eq!(label_char_budget(-96.0, 12.5), 4);
-        assert_eq!(label_char_budget(96.0, -12.5), 4);
+        assert_eq!(label_unit_budget(10.0, 100.0), 4);
+        assert_eq!(label_unit_budget(0.0, 12.5), 4);
+        assert_eq!(label_unit_budget(96.0, 0.0), 4);
+        assert_eq!(label_unit_budget(-96.0, 12.5), 4);
+        assert_eq!(label_unit_budget(96.0, -12.5), 4);
     }
 
     #[test]
     fn label_budget_tracks_tile_size() {
-        // A bigger tile earns more characters, a smaller one fewer — the
-        // point of deriving this from tokens instead of hardcoding it.
-        assert!(label_char_budget(192.0, 12.5) > label_char_budget(96.0, 12.5));
-        assert!(label_char_budget(64.0, 12.5) < label_char_budget(96.0, 12.5));
+        // A bigger tile earns more units, a smaller one fewer — the point
+        // of deriving this from tokens instead of hardcoding it.
+        assert!(label_unit_budget(192.0, 12.5) > label_unit_budget(96.0, 12.5));
+        assert!(label_unit_budget(64.0, 12.5) < label_unit_budget(96.0, 12.5));
+    }
+
+    #[test]
+    fn todays_budget_keeps_every_script_inside_one_tile() {
+        // What the budget buys once `truncate` charges by width unit: 13
+        // units is 12 of prefix plus the `…`, so a Latin name keeps twelve
+        // characters while a full-width one keeps only six — both painting
+        // roughly the same number of pixels, which is the ~145 px CJK spill
+        // into the neighbouring tile shut for good. These are the exact
+        // names in the on-screen verification tree, so the assertions below
+        // and the screenshots are claiming the same thing.
+        //
+        // The width table itself is saola-theme's business (and tested
+        // there); what this pins is the pairing of *our* token-derived
+        // budget with it, which is the part a token bump could break.
+        let budget = label_unit_budget(96.0, 12.5);
+        let cut = |s: &str| saola_theme::overflow::truncate(s, budget);
+
+        assert_eq!(cut("a-very-long-ascii-filename.txt"), "a-very-long-…");
+        assert_eq!(
+            cut("設定ウィンドウのタイトルはとても長いファイル名です.txt"),
+            "設定ウィンド…"
+        );
+        assert_eq!(cut("🦌🦌🦌-saola-deer-emoji-filename.txt"), "🦌🦌🦌-saola…");
+        // Mixed scripts split the same budget between them, rather than one
+        // script's average deciding the whole label.
+        assert_eq!(cut("プロジェクト-final-draft-v2.txt"), "プロジェクト…");
+
+        // A name that already fits comes back untouched — no stray ellipsis
+        // on the common case (13 narrow characters is exactly 13 units).
+        assert_eq!(cut("exactly13.txt"), "exactly13.txt");
     }
 }

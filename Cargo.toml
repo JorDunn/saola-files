@@ -45,7 +45,16 @@ iced = { version = "0.14", features = ["tokio", "svg", "image"] }
 # and overflowed the fixed tile-row height the grid's virtualization math
 # assumes. Ported into the theme rather than written locally per CLAUDE.md's
 # "if a style is missing, add it to saola-theme — never restyle locally".
-saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.9.0", version = "0.9.0" }
+# Bumped again 2026-08-10 to v0.10.0: `truncate`'s budget is now counted in
+# UAX #11 East-Asian *width units* (wide/fullwidth char = 2, narrow = 1,
+# control = 0) instead of raw `char`s. This is the upstream fix for the
+# limitation grid.rs used to disclose — a 13-character CJK label was cut to
+# 13 *characters*, which paints ~145 px in a 96 px tile and spilled into the
+# neighbouring label. Same "add it to saola-theme, never patch locally" rule:
+# every surface with a width cap gets the fix at once. Narrow-only input is
+# unaffected (for all-narrow text the arithmetic is exactly the old character
+# count), so Latin labels render byte-for-byte as they did at 0.9.0.
+saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.10.0", version = "0.10.0" }
 
 # Config parsing. Surveyed 2026-08-08: the family standard is hand-walked
 # parsing over a real parser's loose document type. capture (the newest
