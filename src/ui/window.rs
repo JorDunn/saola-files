@@ -14,8 +14,8 @@
 //!
 //! The window itself is created with `decorations: false, transparent: true`
 //! (see `main.rs`); the compositor-visible shape is whatever we paint, which
-//! is `chrome::window_frame`'s `style::container::paper_window` — 24 px
-//! radius, 2 px ink border. The corners outside that radius stay genuinely
+//! is `chrome::window_frame`'s `style::container::window` (`Surface::Paper`)
+//! — 24 px radius, 2 px ink border. The corners outside that radius stay genuinely
 //! transparent because the app-level `Style` sets a transparent background
 //! via `saola_theme::chrome::transparent_clear` (the hard-won capture
 //! lesson: iced otherwise clears the surface to ink first, and the corners
@@ -23,8 +23,8 @@
 //! full account, now upstream rather than re-derived here).
 
 use iced::{Element, Task, window};
-use saola_theme::Theme;
 use saola_theme::chrome::{self, ResizeEdge};
+use saola_theme::{Surface, Theme};
 
 /// Chrome interactions. The parent wraps these into its own message type via
 /// the `map` closure passed to [`view`].
@@ -79,11 +79,12 @@ pub fn view<'a, M: Clone + 'a>(
 ) -> Element<'a, M> {
     let header = chrome::window_header(
         theme,
+        Surface::Paper,
         title,
         map(Event::Close),
         map(Event::Drag),
         Some(map(Event::ToggleMaximize)),
     );
-    let frame = chrome::window_frame(theme, header, body);
+    let frame = chrome::window_frame(theme, Surface::Paper, header, body);
     chrome::with_resize_grips(frame, move |edge| map(Event::Resize(edge)))
 }
