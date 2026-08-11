@@ -13,9 +13,7 @@
 //! virtualization math below (it only cares about "how many tiles per
 //! row", not where that number comes from).
 
-use iced::widget::{
-    Space, button, column, container, mouse_area, row, scrollable, text, text_input,
-};
+use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Center, Element, Fill, Length};
 use saola_theme::icon;
 use saola_theme::{ColorExt, Surface, Theme, convert, style};
@@ -191,7 +189,11 @@ fn tile<'a>(
     // never aligns it, so the tile's leftover height would otherwise all
     // collect below the label; a `container` hands its child loose limits
     // and *does* align the result.
-    let styled = button(container(content).height(Fill).align_y(Center))
+    // No `mouse_area(...).on_double_click(...)` wrapper — same reasoning
+    // as `list.rs::entry_row`: the button's `on_press` captures every left
+    // press before an outer `MouseArea` could track it, so doubles are
+    // paired app-side in `Message::RowClicked`'s handler instead.
+    button(container(content).height(Fill).align_y(Center))
         .style(style::button::selection_tile(
             t,
             Surface::Paper,
@@ -201,10 +203,7 @@ fn tile<'a>(
         .width(Length::Fixed(t.sizes.grid_tile))
         .height(Length::Fixed(t.sizes.grid_tile + t.sizes.grid_tile_label))
         .padding(t.sizes.pill_gap / 2.0)
-        .on_press(Message::RowClicked(visible_index));
-
-    mouse_area(styled)
-        .on_double_click(Message::RowDoubleClicked(visible_index))
+        .on_press(Message::RowClicked(visible_index))
         .into()
 }
 

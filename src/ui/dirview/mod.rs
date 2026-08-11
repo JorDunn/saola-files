@@ -116,8 +116,18 @@ pub enum Message {
     /// A click on `visible[index]`. Ctrl/Shift come from `self.modifiers`
     /// (tracked via `Message::Keyboard`'s `ModifiersChanged`, since a
     /// mouse click message carries no modifier state of its own).
+    ///
+    /// Double-clicks are detected here in `update`, not in the widget
+    /// tree: the row is a press-capturing `button` (it must be, for the
+    /// themed hover/press styling — see `list.rs::entry_row`), and iced's
+    /// `MouseArea` forwards events to its child *first* and returns early
+    /// once the child captures them, so an outer
+    /// `mouse_area(...).on_double_click(...)` around a button with
+    /// `on_press` never sees a single press and can never fire. Instead a
+    /// second plain click on the same row within [`DOUBLE_CLICK_WINDOW`]
+    /// of the last one (`DirectoryView::last_click`, paired by
+    /// [`is_double_click`]) activates the selection.
     RowClicked(usize),
-    RowDoubleClicked(usize),
     HeaderClicked(SortKey),
     Scrolled(scrollable::Viewport),
     Keyboard(keyboard::Event),
@@ -372,6 +382,16 @@ pub struct DirectoryView {
     /// message carries no modifier state of its own, so row clicks read
     /// this to tell a plain click from Ctrl/Shift+click.
     modifiers: keyboard::Modifiers,
+    /// The last *plain* (unmodified) `RowClicked` — `(visible index, when)`
+    /// — consulted by the next one to decide whether the pair is a
+    /// double-click (see `Message::RowClicked`'s doc comment for why this
+    /// lives in `update` rather than in the widget tree). Cleared by
+    /// `recompute_visible` because row indices shift whenever `visible` is
+    /// rebuilt (navigation, sort, watch refresh, hidden toggle) — a stale
+    /// index must never pair with a fresh click on whatever row now sits
+    /// at that position — and by Ctrl/Shift clicks, which are selection
+    /// edits, not activation attempts.
+    last_click: Option<(usize, std::time::Instant)>,
     /// Config-defined `[[action]]`s, cloned once at construction —
     /// `ui::menus`'s context menu filters/renders these by index
     /// (`Message::MenuCustomActionRequested`). Small and static for the
@@ -421,6 +441,7 @@ impl DirectoryView {
             error: None,
             pending_select: None,
             modifiers: keyboard::Modifiers::empty(),
+            last_click: None,
             actions: config.actions.clone(),
             menu_open: false,
             open_with_open: false,
@@ -835,20 +856,31 @@ impl DirectoryView {
                     return (Task::none(), None);
                 };
                 if self.modifiers.control() {
+                    self.last_click = None;
                     self.selection.toggle_click(index, name);
+                    (Task::none(), None)
                 } else if self.modifiers.shift() {
+                    self.last_click = None;
                     self.extend_to(index);
+                    (Task::none(), None)
                 } else {
+                    // The pairing *decision* is the pure `is_double_click`
+                    // (unit-tested with synthetic instants); this arm is
+                    // the thin wrapper that supplies the real clock — the
+                    // same split CLAUDE.md prescribes for env lookups.
+                    let now = std::time::Instant::now();
+                    let is_double = is_double_click(self.last_click, index, now);
                     self.selection.click(index, name);
+                    if is_double {
+                        // Consumed: a third quick click starts a fresh
+                        // pair rather than chaining activations.
+                        self.last_click = None;
+                        (Task::none(), self.activate_selection())
+                    } else {
+                        self.last_click = Some((index, now));
+                        (Task::none(), None)
+                    }
                 }
-                (Task::none(), None)
-            }
-            Message::RowDoubleClicked(index) => {
-                let Some(name) = self.entry_at(index).map(|entry| entry.name.clone()) else {
-                    return (Task::none(), None);
-                };
-                self.selection.click(index, name);
-                (Task::none(), self.activate_selection())
             }
             Message::HeaderClicked(key) => {
                 if self.sort == key {
@@ -1711,6 +1743,10 @@ impl DirectoryView {
     /// `current_cursor_or_before_start`), the same way a fresh view with
     /// no clicks yet has nothing selected.
     fn recompute_visible(&mut self) {
+        // Row indices are about to shift — a recorded half-of-a-double
+        // -click must not pair with a fresh click on whatever entry now
+        // occupies that index (see `last_click`'s doc comment).
+        self.last_click = None;
         let had_cursor = self.selection.cursor().is_some();
         let previous_cursor_name = self
             .selection
@@ -1860,6 +1896,36 @@ pub(super) fn thumbnail_for(
     let modified = entry.modified?;
     let location = state.location.join(&entry.name);
     thumb_cache.get_for(&location, modified)
+}
+
+/// Two plain clicks this close together (and on the same row) are a
+/// double-click. 300 ms is iced's own consecutive-click window —
+/// `iced_core::mouse::Click::is_consecutive` uses `<= 300` ms (plus a 6 px
+/// radius; the app-level analogue of "same place" is "same row index") —
+/// so double-clicking here feels the same as double-clicking in an iced
+/// `text_input`.
+const DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Whether a plain click on `visible[index]` at `now` completes a
+/// double-click with the previously recorded one. Pure — the caller
+/// (`Message::RowClicked`'s handler) supplies `Instant::now()`, so tests
+/// can drive this with synthetic instants instead of sleeping.
+///
+/// `saturating_duration_since` (never panics, clamps to zero) instead of
+/// bare subtraction: `Instant` arithmetic that could underflow is exactly
+/// the kind of "can't happen" the no-panic rule says to make impossible
+/// anyway.
+fn is_double_click(
+    previous: Option<(usize, std::time::Instant)>,
+    index: usize,
+    now: std::time::Instant,
+) -> bool {
+    match previous {
+        Some((last_index, last_time)) => {
+            last_index == index && now.saturating_duration_since(last_time) <= DOUBLE_CLICK_WINDOW
+        }
+        None => false,
+    }
 }
 
 /// `entries[i].name` starts with a dot — the one place `DirectoryView`
@@ -2055,6 +2121,93 @@ mod tests {
             }
             other => panic!("expected Activated, got {other:?}"),
         }
+    }
+
+    // ── Double-click pairing (app-side, see `Message::RowClicked`) ──────
+    //
+    // The pure decision (`is_double_click`) is tested with synthetic
+    // instants — never a real sleep — exactly the "test the argument-
+    // taking half" split CLAUDE.md prescribes for env lookups. The handler
+    // tests below then only rely on "two consecutive `update` calls in
+    // one test run happen within 300 ms of each other", which is safe by
+    // orders of magnitude.
+
+    #[test]
+    fn a_second_click_on_the_same_row_inside_the_window_is_a_double() {
+        let base = std::time::Instant::now();
+        let previous = Some((3, base));
+        assert!(is_double_click(
+            previous,
+            3,
+            base + std::time::Duration::from_millis(120)
+        ));
+        // Boundary is inclusive, matching iced's own `<= 300` ms check.
+        assert!(is_double_click(previous, 3, base + DOUBLE_CLICK_WINDOW));
+    }
+
+    #[test]
+    fn a_slow_or_misaimed_second_click_is_not_a_double() {
+        let base = std::time::Instant::now();
+        let previous = Some((3, base));
+        // Too slow — one past the window.
+        assert!(!is_double_click(
+            previous,
+            3,
+            base + DOUBLE_CLICK_WINDOW + std::time::Duration::from_millis(1)
+        ));
+        // Fast enough, but a different row.
+        assert!(!is_double_click(
+            previous,
+            4,
+            base + std::time::Duration::from_millis(50)
+        ));
+        // Nothing recorded at all (first-ever click).
+        assert!(!is_double_click(None, 3, base));
+    }
+
+    #[test]
+    fn double_clicking_a_directory_row_requests_open_directory() {
+        let mut view = listed_view(vec![dir("docs"), file("readme.txt")]);
+        let (_, first) = view.update(Message::RowClicked(0));
+        assert!(first.is_none(), "a single click must only select");
+        assert!(view.selection.is_selected(OsStr::new("docs")));
+
+        let (_, second) = view.update(Message::RowClicked(0));
+        match second {
+            Some(Event::OpenDirectory(location)) => {
+                assert_eq!(location, Location::local("/home/docs"));
+            }
+            other => panic!("expected OpenDirectory, got {other:?}"),
+        }
+        // The pair is consumed — a third quick click starts over rather
+        // than activating again.
+        assert!(view.last_click.is_none());
+    }
+
+    #[test]
+    fn ctrl_clicks_never_pair_into_an_activation() {
+        let mut view = listed_view(vec![dir("docs")]);
+        view.modifiers = keyboard::Modifiers::CTRL;
+        let (_, first) = view.update(Message::RowClicked(0));
+        let (_, second) = view.update(Message::RowClicked(0));
+        assert!(first.is_none());
+        assert!(second.is_none());
+        assert!(view.last_click.is_none());
+    }
+
+    #[test]
+    fn a_relist_between_clicks_clears_the_pending_pair() {
+        let mut view = listed_view(vec![dir("docs")]);
+        let _ = view.update(Message::RowClicked(0));
+        assert!(view.last_click.is_some());
+        // A refresh/navigation rebuilds `visible` — row indices may now
+        // mean different entries, so the recorded half must be dropped.
+        let _ = view.update(Message::Listed(
+            Location::local("/home"),
+            Ok(vec![dir("docs"), dir("other")]),
+        ));
+        let (_, event) = view.update(Message::RowClicked(0));
+        assert!(event.is_none(), "a stale pre-relist click must not pair");
     }
 
     #[test]

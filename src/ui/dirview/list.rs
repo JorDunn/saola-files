@@ -10,9 +10,7 @@
 //! `ui_font` docs) — the style guide's "tabular numerals on size and date
 //! columns" rule.
 
-use iced::widget::{
-    Space, button, column, container, mouse_area, row, scrollable, text, text_input,
-};
+use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Fill, Length};
 use saola_theme::icon::{self, Icon};
 use saola_theme::{ColorExt, Surface, Theme, convert, style};
@@ -292,7 +290,13 @@ fn entry_row<'a>(
     .align_y(iced::Center)
     .padding([0.0, t.sizes.pill_gap]);
 
-    let styled = button(content)
+    // No `mouse_area(...).on_double_click(...)` wrapper: this button's
+    // `on_press` captures every left press over the row (it must — the
+    // themed hover/press styling and press-swallowing both depend on it),
+    // and iced's `MouseArea` forwards events to its child first, so an
+    // outer double-click handler would never see a single press. Doubles
+    // are paired app-side instead — see `Message::RowClicked`'s docs.
+    button(content)
         .style(style::button::list_row(
             t,
             Surface::Paper,
@@ -302,10 +306,7 @@ fn entry_row<'a>(
         .width(Fill)
         .height(t.sizes.list_row)
         .padding(0)
-        .on_press(Message::RowClicked(visible_index));
-
-    mouse_area(styled)
-        .on_double_click(Message::RowDoubleClicked(visible_index))
+        .on_press(Message::RowClicked(visible_index))
         .into()
 }
 
