@@ -295,6 +295,67 @@ pub trait Backend: Send + Sync {
     fn watch(&self, location: &Location) -> Option<BoxStream<'static, DirEvent>>;
 }
 
+/// Lets a pooled connection (`core::remote::RemoteManager`'s `Arc<dyn
+/// Backend>`) stand in anywhere a `Box<dyn Backend>` is expected —
+/// `modules::resolve`'s whole Stage-14 remote path is `Box::new(arc) as
+/// Box<dyn Backend>`, which needs `Arc<dyn Backend>` to itself implement
+/// `Backend` (an unsized coercion needs the pointee to satisfy the trait,
+/// not just wrap something that does). Allowed under the orphan rule
+/// because `Backend` is a local trait even though `Arc` is foreign — every
+/// method just forwards to the shared instance via `Arc::as_ref`, so this
+/// is pure delegation, not a second implementation of anything.
+#[async_trait]
+impl Backend for std::sync::Arc<dyn Backend> {
+    fn scheme(&self) -> &'static str {
+        self.as_ref().scheme()
+    }
+
+    fn caps(&self) -> Caps {
+        self.as_ref().caps()
+    }
+
+    async fn list(&self, location: &Location) -> Result<Vec<FileEntry>, VfsError> {
+        self.as_ref().list(location).await
+    }
+
+    async fn metadata(&self, location: &Location) -> Result<FileEntry, VfsError> {
+        self.as_ref().metadata(location).await
+    }
+
+    async fn read(&self, location: &Location) -> Result<ReadStream, VfsError> {
+        self.as_ref().read(location).await
+    }
+
+    async fn write(&self, location: &Location) -> Result<WriteSink, VfsError> {
+        self.as_ref().write(location).await
+    }
+
+    async fn mkdir(&self, location: &Location) -> Result<(), VfsError> {
+        self.as_ref().mkdir(location).await
+    }
+
+    async fn rename(&self, from: &Location, to: &Location) -> Result<(), VfsError> {
+        self.as_ref().rename(from, to).await
+    }
+
+    async fn remove(&self, location: &Location) -> Result<(), VfsError> {
+        self.as_ref().remove(location).await
+    }
+
+    async fn set_times(
+        &self,
+        location: &Location,
+        accessed: Option<SystemTime>,
+        modified: Option<SystemTime>,
+    ) -> Result<(), VfsError> {
+        self.as_ref().set_times(location, accessed, modified).await
+    }
+
+    fn watch(&self, location: &Location) -> Option<BoxStream<'static, DirEvent>> {
+        self.as_ref().watch(location)
+    }
+}
+
 /// An in-memory [`Backend`] for UI tests (selection, directory-view state
 /// machine) that don't want real disk I/O. Directories are seeded up
 /// front via [`FakeBackend::with_dir`]; mutating calls (`mkdir`/`rename`/

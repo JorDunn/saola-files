@@ -45,7 +45,7 @@ pub fn subscription(location: &Location) -> Subscription<Message> {
 }
 
 fn build(location: &Location) -> BoxStream<'static, Message> {
-    let Some(backend) = crate::modules::resolve(&location.scheme) else {
+    let Some(backend) = crate::modules::resolve(location) else {
         return stream::empty().boxed();
     };
     let Some(events) = backend.watch(location) else {

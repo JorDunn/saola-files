@@ -12,11 +12,13 @@ repository = "https://github.com/JorDunn/saola-files"
 # local-only binary). The release/AUR build ships the defaults. Each
 # feature's optional dependencies land in the same PR as its module.
 #
-# "sftp" is reserved here from day one so the CI feature matrix
-# (`--all-features` / `--no-default-features`) exercises both build shapes
-# before the module exists; its `dep:` entries arrive with `modules/sftp.rs`.
+# "sftp" was reserved from day one so the CI feature matrix
+# (`--all-features` / `--no-default-features`) exercised both build shapes
+# before the module existed. Stage 14 gives it real `dep:` entries — see
+# the dated survey comment on `russh`/`russh-sftp` below for the protocol
+# library choice.
 default = ["sftp"]
-sftp = []
+sftp = ["dep:russh", "dep:russh-sftp"]
 
 [dependencies]
 # GUI toolkit. Surveyed 2026-08-08: iced is the only toolkit the Saola
@@ -200,6 +202,102 @@ image = "0.25"
 # — same as the `image` entry above — this is an explicit direct dependency
 # for a crate already in the resolved graph, not a new download.
 png = "0.18"
+
+# `modules::sftp` (Stage 14, `feature = "sftp"`) — the file manager's one
+# remote protocol backend. Surveyed 2026-08-10, three real candidates:
+#
+# 1. **`russh` (chosen)** — a pure-Rust SSH client/server implementation
+#    (Apache-2.0), paired with `russh-sftp` for the SFTP subsystem layered
+#    on top of it. "Pure-Rust SSH" has a real maturity question attached —
+#    it is not the wire-compatible-with-every-openssh-quirk depth that 20+
+#    years of C OpenSSH has, and its crate history is genuinely tangled:
+#    `russh` began as a fork of the abandoned `thrussh` (Pierre-Étienne
+#    Meunier's crate, itself the base a few other forks — `Eugeny/russh`,
+#    now `warp-tech/russh`, is the actively maintained lineage this pins
+#    to), and it depends on an *internal fork* of the `ssh-key` crate
+#    (`internal-russh-forked-ssh-key`, pulled in transitively — not named
+#    directly in this file) rather than upstream `RustCrypto/ssh-key`,
+#    which is a yellow flag for how cleanly it tracks upstream security
+#    fixes. Weighed against that: it's actively maintained (warp-tech, the
+#    Warp terminal company, ships it in production for their own SSH
+#    client), has no `unsafe` FFI surface at all (unlike option 2 below),
+#    integrates directly with the *existing* shared tokio runtime
+#    (CLAUDE.md's "one async runtime" rule — no subprocess, no second
+#    event loop), and — decisively — ships `russh::keys::known_hosts`
+#    (`check_known_hosts_path`/`learn_known_hosts_path`) implementing the
+#    exact OpenSSH `~/.ssh/known_hosts` format (including hashed
+#    `|1|salt|hash` host entries) out of the box, which is precisely the
+#    first-contact host-key verification this stage's done criteria need
+#    and neither of the alternatives below hands over for free.
+#
+# 2. **`openssh-sftp-client` + a spawned system `ssh`** — shells out to the
+#    user's real, already-configured OpenSSH client (`ssh -s sftp`, or
+#    `ssh -oBatchMode -oControlMaster` for connection reuse) and speaks
+#    SFTP over its stdio. This is the PLAN.md-documented fallback and the
+#    *safer* choice in one specific sense: it inherits OpenSSH's own
+#    `~/.ssh/config` (Host aliases, ProxyJump, IdentityFile selection —
+#    all the configuration Jordan may already have tuned) and its
+#    already-battle-tested known_hosts/host-key UX for free, since it's
+#    the same `ssh` binary a terminal `ssh` invocation would use. It loses
+#    on two fronts that matter more for *this* stage specifically: (a)
+#    first-contact host-key trust becomes an *interactive TTY prompt on
+#    the spawned child's stderr* (OpenSSH's `StrictHostKeyChecking=ask`
+#    talks to a controlling terminal, not a pipe) — making it prompt
+#    through *our* GUI dialog instead of a native terminal means either
+#    setting `StrictHostKeyChecking=no` (silently trusts every host key,
+#    unacceptable) or re-implementing the known_hosts dance ourselves
+#    anyway via `ssh-keyscan`/manual file parsing, which is most of
+#    option 1's own host-key code with none of its channel plumbing; and
+#    (b) password auth has the same problem — batch-mode `ssh` refuses to
+#    prompt on a non-TTY, so password auth would need `sshpass`-style
+#    stdin injection (fragile, and `sshpass` itself warns its own approach
+#    is insecure) or an askpass helper script, both meaningfully more
+#    moving parts than `russh::client::Handle::authenticate_password`
+#    being an ordinary async method call. **This remains the documented
+#    fallback design** (`modules/sftp.rs`'s own module doc comment notes
+#    where to cut over) if `russh`'s maturity becomes a real operational
+#    problem later — the module boundary (CLAUDE.md: "the app doesn't
+#    care") means switching backends never touches `core::vfs::Backend`'s
+#    trait shape, `core::remote::RemoteManager`, or `ui::dialogs::connect`.
+#
+# 3. **`thrussh` directly** — the abandoned ancestor `russh` itself forked
+#    from; last published years ago, no realistic path to fixes for
+#    anything found since. Ruled out immediately; not a real candidate,
+#    just the historical reason `russh`'s own git history looks the way
+#    it does.
+#
+# `default-features = false` on `russh`, keeping only `flate2` (its own
+# default) back on explicitly — SFTP over a real network genuinely
+# benefits from transport compression the way local disk I/O never does;
+# the other opt-in features (`legacy-ed25519-pkcs8-parser`, `dsa`,
+# `async-trait`) are all either dead cryptography or a Rust-version compat
+# shim this crate's MSRV doesn't need (native `async fn` in traits, per
+# CLAUDE.md's "iced 0.14 gotchas" section's own posture on avoiding
+# `async_trait` where it isn't required — `core::vfs::Backend` needs it for
+# `dyn`-safety, `russh::client::Handler`/`russh_sftp::client::Handler` do
+# not, since neither is ever boxed as a trait object here).
+russh = { version = "0.52", optional = true, default-features = false, features = [
+    "flate2",
+] }
+
+# The SFTP (SSH File Transfer Protocol) subsystem client, layered on top of
+# an already-authenticated `russh` session (`Channel::request_subsystem(
+# true, "sftp")`, then `SftpSession::new` over that channel's byte stream —
+# see `modules::sftp`'s module doc comment for the full handshake). Same
+# survey/date as `russh` above; the two are a matched pair from the same
+# maintainer (`warp-tech`), not independently chosen. **Disclosed gap**:
+# every path-taking method on `russh_sftp::client::SftpSession` takes
+# `impl Into<String>`, not raw bytes — unlike `modules::local` (which
+# preserves non-UTF8 filenames losslessly via `OsStrExt`/`symlink_metadata`,
+# see that module's own tests), a remote filename that isn't valid UTF-8
+# cannot round-trip through this crate's API at all. CLAUDE.md's OsString
+# discipline is honored everywhere *this app's own code* touches a path
+# (`core::vfs::Location::path` stays `PathBuf` end-to-end, converted to the
+# wire string at exactly one point — `modules::sftp::wire_path`, sibling to
+# `Location::Display`'s own single `to_string_lossy` call site); the gap is
+# strictly inside the third-party crate's wire encoding, disclosed here and
+# in that module's doc comment rather than silently accepted.
+russh-sftp = { version = "2.4", optional = true, default-features = true }
 
 [dev-dependencies]
 # `modules::local`'s unit tests call `LocalBackend` methods directly (not

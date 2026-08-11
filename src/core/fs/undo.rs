@@ -130,7 +130,7 @@ pub fn can_undo_rename(from: &Location, to: &Location) -> bool {
     if from.scheme != to.scheme || from.authority != to.authority {
         return false;
     }
-    crate::modules::resolve(&from.scheme)
+    crate::modules::resolve(from)
         .map(|backend| backend.caps().contains(Caps::RENAME_IN_PLACE))
         .unwrap_or(false)
 }
@@ -224,7 +224,7 @@ pub async fn apply(entry: UndoEntry) -> Result<(), String> {
 /// (backends are cheap to construct — `modules::resolve`'s own doc
 /// comment) rather than threading one through from the push site.
 async fn rename_back(from: &Location, to: &Location) -> Result<(), String> {
-    let Some(backend) = crate::modules::resolve(&from.scheme) else {
+    let Some(backend) = crate::modules::resolve(from) else {
         return Err(format!("no backend for scheme \"{}\"", from.scheme));
     };
     backend
@@ -234,7 +234,7 @@ async fn rename_back(from: &Location, to: &Location) -> Result<(), String> {
 }
 
 async fn remove_one(location: &Location) -> Result<(), String> {
-    let Some(backend) = crate::modules::resolve(&location.scheme) else {
+    let Some(backend) = crate::modules::resolve(location) else {
         return Err(format!("no backend for scheme \"{}\"", location.scheme));
     };
     backend

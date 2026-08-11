@@ -294,7 +294,7 @@ async fn execute(request: OpRequest, mut tx: mpsc::Sender<OpEvent>) {
     if is_move {
         for source in request.sources {
             let fast = same_backend(&source, &request.dest_dir)
-                .then(|| crate::modules::resolve(&request.dest_dir.scheme))
+                .then(|| crate::modules::resolve(&request.dest_dir))
                 .flatten()
                 .filter(|backend| backend.caps().contains(Caps::RENAME_IN_PLACE));
             let Some(backend) = fast else {
@@ -321,7 +321,7 @@ async fn execute(request: OpRequest, mut tx: mpsc::Sender<OpEvent>) {
         return;
     }
 
-    let Some(dest_backend) = crate::modules::resolve(&request.dest_dir.scheme) else {
+    let Some(dest_backend) = crate::modules::resolve(&request.dest_dir) else {
         let err = VfsError::Other {
             message: format!("no backend for scheme \"{}\"", request.dest_dir.scheme),
         };
@@ -419,7 +419,7 @@ impl ExecContext {
                 return;
             }
 
-            let Some(source_backend) = crate::modules::resolve(&source.scheme) else {
+            let Some(source_backend) = crate::modules::resolve(&source) else {
                 self.errors.push((
                     source.clone(),
                     VfsError::Other {
@@ -776,7 +776,7 @@ fn count_one<'a>(
     bytes: &'a mut u64,
 ) -> BoxFuture<'a, ()> {
     Box::pin(async move {
-        let Some(backend) = crate::modules::resolve(&source.scheme) else {
+        let Some(backend) = crate::modules::resolve(source) else {
             return;
         };
         let Ok(meta) = backend.metadata(source).await else {

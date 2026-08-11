@@ -25,6 +25,8 @@ use core::fs::{ops, size, undo};
 use core::vfs::Location;
 use saola_files::{cli, config, core, modules, ui};
 
+use core::remote;
+
 /// The App-owned decoded-thumbnail LRU's capacity (Stage 11 — CLAUDE.md's
 /// "~512-handle LRU"). A plain implementation constant, the same posture
 /// `modules::local`'s `CHANNEL_CAPACITY`/`WATCH_CHANNEL_CAPACITY` already
@@ -155,6 +157,15 @@ enum Message {
     /// job (see `core::fs::size`'s module doc comment for why it isn't
     /// just `ops::count_totals` reused).
     SizeEvent(size::SizeEvent),
+    /// The connect dialog's own messages (Stage 14) — URI field, saved-
+    /// server picks, the host-key/auth prompt buttons and fields.
+    Connect(ui::dialogs::connect::Message),
+    /// An event off a running connect attempt's stream
+    /// (`core::remote::connect`'s `Subscription`, bridged by `ui::dialogs::
+    /// connect::subscription`) — the same "translate the raw event into
+    /// App/dialog state, the dialog module never sees it directly" split
+    /// `Message::OpEvent`/`Message::SizeEvent` already establish.
+    ConnectEvent(remote::ConnectEvent),
     /// Swallows a click on the conflict dialog's modal scrim — the dialog
     /// must be answered via one of its three buttons, never dismissed by
     /// clicking outside it (there is no sane default resolution to assume).
@@ -306,6 +317,22 @@ struct App {
     /// Monotonic [`size::SizeRequestId`] allocator — one per `App`, the
     /// same "one shared counter, never per-view" posture as `op_ids`.
     size_ids: size::SizeIdSource,
+    /// The connection manager for remote backends (Stage 14) — a shared
+    /// cache like `mime_db`/`thumb_cache`, never per-view. Its pool is
+    /// published globally at construction (`Self::new`'s
+    /// `remote.install_global()` call) so `modules::resolve` can reach it
+    /// from deep inside `core::fs::ops`/`ui::dirview` — see `core::
+    /// remote`'s own module doc comment for the full reasoning.
+    remote: remote::RemoteManager,
+    /// Monotonic [`remote::ConnectId`] allocator — one per `App`, the same
+    /// posture `op_ids`/`size_ids` already take.
+    connect_ids: remote::ConnectIdSource,
+    /// The connect dialog currently showing, if any (Stage 14) — mirrors
+    /// `pending_properties`'s split: the pure render-time snapshot
+    /// (`ui::dialogs::connect::Connect`) bundled with the App-owned
+    /// plumbing (the in-flight `ConnectRequest` and the two prompt reply
+    /// channels) that module has no business holding itself.
+    pending_connect: Option<PendingConnect>,
 }
 
 /// See `App::pending_conflict`'s doc comment.
@@ -329,6 +356,26 @@ struct PendingProperties {
     /// subscription gate" shape `active_op`/`active_op_progress` already
     /// take.
     size_request: Option<size::SizeRequest>,
+}
+
+/// See `App::pending_connect`'s doc comment.
+struct PendingConnect {
+    connect: ui::dialogs::connect::Connect,
+    /// `None` once the attempt reaches a terminal state (`Connected` or
+    /// `Failed`) — clearing it is what stops `App::subscription`'s
+    /// `connect_sub` binding, the same "`Option` doubles as the
+    /// subscription gate" shape `active_op`/`pending_properties.
+    /// size_request` already take.
+    request: Option<remote::ConnectRequest>,
+    /// Set while `connect.phase` is `Phase::HostKey` — the reply channel
+    /// `Message::Connect(connect::Message::HostKeyDecided(..))`'s handler
+    /// sends the human's answer down. CLAUDE.md's capacity-1 reply-channel
+    /// pattern (`core::fs::ops`'s conflict prompts).
+    host_key_reply: Option<futures::channel::mpsc::Sender<bool>>,
+    /// Set while `connect.phase` is `Phase::Auth` — same pattern as
+    /// `host_key_reply`, for `Message::Connect(connect::Message::
+    /// AuthSubmitted/AuthSkipped)`.
+    auth_reply: Option<futures::channel::mpsc::Sender<Option<String>>>,
 }
 
 impl App {
@@ -397,7 +444,15 @@ impl App {
             thumbnail_max_mb: config.thumbnail_max_mb,
             pending_properties: None,
             size_ids: size::SizeIdSource::default(),
+            remote: remote::RemoteManager::new(),
+            connect_ids: remote::ConnectIdSource::default(),
+            pending_connect: None,
         };
+        // Stage 14: publish this `App`'s `RemoteManager` pool for
+        // `modules::resolve` to reach — see that function's own doc
+        // comment and `core::remote`'s module docs for why this is safe
+        // (single-instance app) and why it happens exactly once, here.
+        app.remote.install_global();
         (
             app,
             task.map(|m| Message::Explorer(ui::explorer::Message::Directory(m))),
@@ -411,6 +466,9 @@ impl App {
                 match self.sidebar.update(inner) {
                     Some(ui::sidebar::Event::OpenDirectory(location)) => {
                         self.navigate_active(location)
+                    }
+                    Some(ui::sidebar::Event::ConnectRequested) => {
+                        self.open_connect_dialog(None, false)
                     }
                     None => Task::none(),
                 }
@@ -483,6 +541,8 @@ impl App {
                 Task::none()
             }
             Message::SizeEvent(event) => self.handle_size_event(event),
+            Message::Connect(inner) => self.handle_connect_message(inner),
+            Message::ConnectEvent(event) => self.handle_connect_event(event),
         }
     }
 
@@ -610,7 +670,7 @@ impl App {
         }
         self.close_properties();
 
-        let caps = modules::resolve(&items[0].0.scheme)
+        let caps = modules::resolve(&items[0].0)
             .map(|backend| backend.caps())
             .unwrap_or_else(core::vfs::Caps::empty);
         let roots: Vec<Location> = items.iter().map(|(location, _)| location.clone()).collect();
@@ -660,6 +720,211 @@ impl App {
             && let Some(request) = pending.size_request
         {
             request.request_cancel();
+        }
+    }
+
+    /// `sidebar::Event::ConnectRequested`'s handling and `Self::
+    /// navigate_active`'s auto-connect path (Stage 14): opens the connect
+    /// dialog. `prefill_uri` seeds the URI field (a clicked sidebar server
+    /// row's own location, stringified — `None` for the sidebar's plain
+    /// "Connect to Server…" button, which starts blank). `auto_start`
+    /// skips straight past `Phase::Entering` into `Self::start_connect` —
+    /// the sidebar-row path, where there's nothing left for the human to
+    /// type; the "Connect to Server…" button path leaves `Phase::Entering`
+    /// showing so the human can actually enter something. Replaces
+    /// (rather than stacks behind) any connect dialog already open,
+    /// cancelling its in-flight attempt first — same posture `Self::
+    /// open_properties` already takes for a second properties request.
+    fn open_connect_dialog(
+        &mut self,
+        prefill_uri: Option<String>,
+        auto_start: bool,
+    ) -> Task<Message> {
+        self.close_connect_dialog();
+
+        let uri = prefill_uri.unwrap_or_default();
+        // The saved-servers list the dialog offers to pick from is read
+        // straight off the sidebar's already-built `Place` list (filtered
+        // to `PlaceKind::Server`) rather than a second copy of `Config::
+        // servers` kept on `App` — `core::places::build` already turned
+        // each `SavedServer` into exactly the `(label, uri)` pair this
+        // dialog wants to show, and re-deriving it here keeps there being
+        // one source of truth for "what servers does this session know
+        // about".
+        let servers: Vec<config::SavedServer> = self
+            .sidebar
+            .places()
+            .iter()
+            .filter(|place| place.kind == core::places::PlaceKind::Server)
+            .map(|place| config::SavedServer {
+                name: place.label.clone(),
+                uri: place.location.to_string(),
+            })
+            .collect();
+
+        self.pending_connect = Some(PendingConnect {
+            connect: ui::dialogs::connect::Connect::new(uri.clone(), servers),
+            request: None,
+            host_key_reply: None,
+            auth_reply: None,
+        });
+
+        if auto_start {
+            self.start_connect(uri)
+        } else {
+            Task::none()
+        }
+    }
+
+    /// Submits `uri` as a [`remote::ConnectRequest`] and moves the open
+    /// connect dialog into `Phase::Connecting` — `ui::dialogs::connect::
+    /// Message::ConnectRequested`'s handling, and `Self::
+    /// open_connect_dialog`'s auto-start path. A `uri` that doesn't parse
+    /// to a remote location (`Location::parse` degrades anything without
+    /// a recognized `scheme://` prefix to a bare local path — see that
+    /// function's own doc comment) fails immediately with a worded
+    /// `Phase::Failed`, before ever touching `core::remote` — there is
+    /// nothing for a connection manager to connect *to* for a plain local
+    /// path.
+    fn start_connect(&mut self, uri: String) -> Task<Message> {
+        let location = Location::parse(&uri);
+        let Some(pending) = self.pending_connect.as_mut() else {
+            return Task::none();
+        };
+        if location.is_local() {
+            pending.connect.phase = ui::dialogs::connect::Phase::Failed(
+                "Enter a server URI, e.g. sftp://user@host/path".to_owned(),
+            );
+            return Task::none();
+        }
+
+        let id = self.connect_ids.alloc();
+        pending.connect.phase = ui::dialogs::connect::Phase::Connecting;
+        pending.request = Some(remote::ConnectRequest::new(id, location));
+        Task::none()
+    }
+
+    /// Closes the connect dialog, if one is open — cancels any in-flight
+    /// `ConnectRequest` first (same "cancel, then let the engine notice on
+    /// its own" posture `Self::close_properties`/`Message::Progress::
+    /// CancelRequested` already take), and `try_send`s a negative answer
+    /// down whichever prompt reply channel is currently open. A dropped
+    /// reply sender would eventually make the awaiting `.await` on the
+    /// handshake task's side fail too, but doing it explicitly here means
+    /// that task notices immediately rather than only on its next poll.
+    fn close_connect_dialog(&mut self) {
+        let Some(pending) = self.pending_connect.take() else {
+            return;
+        };
+        if let Some(request) = pending.request {
+            request.request_cancel();
+        }
+        if let Some(mut reply) = pending.host_key_reply {
+            let _ = reply.try_send(false);
+        }
+        if let Some(mut reply) = pending.auth_reply {
+            let _ = reply.try_send(None);
+        }
+    }
+
+    /// `Message::Connect`'s handling — every button/field in `ui::dialogs::
+    /// connect` funnels through here.
+    fn handle_connect_message(&mut self, message: ui::dialogs::connect::Message) -> Task<Message> {
+        use ui::dialogs::connect::{Message as ConnectMessage, Phase};
+        match message {
+            ConnectMessage::UriChanged(uri) | ConnectMessage::ServerPicked(uri) => {
+                if let Some(pending) = self.pending_connect.as_mut() {
+                    pending.connect.uri = uri;
+                }
+                Task::none()
+            }
+            ConnectMessage::ConnectRequested => {
+                let uri = self
+                    .pending_connect
+                    .as_ref()
+                    .map(|pending| pending.connect.uri.clone())
+                    .unwrap_or_default();
+                self.start_connect(uri)
+            }
+            ConnectMessage::CancelRequested => {
+                self.close_connect_dialog();
+                Task::none()
+            }
+            ConnectMessage::HostKeyDecided(trust) => {
+                if let Some(pending) = self.pending_connect.as_mut()
+                    && let Some(mut reply) = pending.host_key_reply.take()
+                {
+                    let _ = reply.try_send(trust);
+                    pending.connect.phase = Phase::Connecting;
+                }
+                Task::none()
+            }
+            ConnectMessage::AuthInputChanged(input) => {
+                if let Some(pending) = self.pending_connect.as_mut()
+                    && let Phase::Auth(_, buffer) = &mut pending.connect.phase
+                {
+                    *buffer = input;
+                }
+                Task::none()
+            }
+            ConnectMessage::AuthSubmitted => {
+                if let Some(pending) = self.pending_connect.as_mut() {
+                    let answer = match &pending.connect.phase {
+                        Phase::Auth(_, buffer) => Some(buffer.clone()),
+                        _ => None,
+                    };
+                    if let Some(mut reply) = pending.auth_reply.take() {
+                        let _ = reply.try_send(answer);
+                        pending.connect.phase = Phase::Connecting;
+                    }
+                }
+                Task::none()
+            }
+            ConnectMessage::AuthSkipped => {
+                if let Some(pending) = self.pending_connect.as_mut()
+                    && let Some(mut reply) = pending.auth_reply.take()
+                {
+                    let _ = reply.try_send(None);
+                    pending.connect.phase = Phase::Connecting;
+                }
+                Task::none()
+            }
+        }
+    }
+
+    /// `Message::ConnectEvent`'s handling — translates one raw
+    /// `remote::ConnectEvent` into the open connect dialog's state,
+    /// mirroring `Self::handle_op_event`/`Self::handle_size_event`'s
+    /// identical split.
+    fn handle_connect_event(&mut self, event: remote::ConnectEvent) -> Task<Message> {
+        let Some(pending) = self.pending_connect.as_mut() else {
+            return Task::none();
+        };
+        match event {
+            remote::ConnectEvent::HostKeyPrompt { prompt, reply } => {
+                pending.host_key_reply = Some(reply);
+                pending.connect.phase = ui::dialogs::connect::Phase::HostKey(prompt);
+                Task::none()
+            }
+            remote::ConnectEvent::AuthPrompt { stage, reply } => {
+                pending.auth_reply = Some(reply);
+                pending.connect.phase = ui::dialogs::connect::Phase::Auth(stage, String::new());
+                Task::none()
+            }
+            remote::ConnectEvent::Connected => {
+                // Registration into the pool already happened inside
+                // `core::remote::connect` *before* this event was sent
+                // (see its own doc comment) — `Self::navigate_active`'s
+                // `self.remote.pooled(..)` check is guaranteed to find it.
+                let location = Location::parse(&pending.connect.uri);
+                self.pending_connect = None;
+                self.navigate_active(location)
+            }
+            remote::ConnectEvent::Failed(err) => {
+                pending.request = None;
+                pending.connect.phase = ui::dialogs::connect::Phase::Failed(err.to_string());
+                Task::none()
+            }
         }
     }
 
@@ -787,6 +1052,19 @@ impl App {
             return trash_task(self.trash_view.load());
         }
         self.trash_active = false;
+
+        // Stage 14: a remote location this session hasn't connected to
+        // yet (a sidebar server row, or a manually-typed `sftp://…`
+        // breadcrumb) has no live session for `modules::resolve` to hand
+        // back — opening the connect dialog (auto-started, no "enter a
+        // URI" step needed since we already have one) is what a plain
+        // `view.navigate(location)` would otherwise fail against with a
+        // bare "no backend" error. An *already*-pooled remote location
+        // (this session already connected to this exact server) skips
+        // straight through to the ordinary navigate below, same as local.
+        if !location.is_local() && self.remote.pooled(&location).is_none() {
+            return self.open_connect_dialog(Some(location.to_string()), true);
+        }
 
         let Some(view) = self.views.get_mut(self.active) else {
             return Task::none();
@@ -1035,7 +1313,10 @@ impl App {
         // already is, for the same reason: arrow keys/Delete/etc must not
         // reach the (invisible, behind the dialog) directory view while
         // it's open.
-        let keyboard = if self.trash_active || self.pending_properties.is_some() {
+        // Stage 14: the connect dialog is the same kind of App-level modal
+        // as properties — gated here for the identical reason.
+        let dialog_open = self.pending_properties.is_some() || self.pending_connect.is_some();
+        let keyboard = if self.trash_active || dialog_open {
             Subscription::none()
         } else {
             iced::keyboard::listen().map(|event| {
@@ -1092,7 +1373,26 @@ impl App {
             .map(|request| ui::dialogs::properties::subscription(request).map(Message::SizeEvent))
             .unwrap_or_else(Subscription::none);
 
-        Subscription::batch([keyboard, watch, mounts, ops, undo_toast, size_sub])
+        // Stage 14: the connect dialog's in-flight handshake, if one is
+        // running — same "identified by the request's own `Hash`, torn
+        // down the moment the field goes back to `None`" posture as `ops`/
+        // `size_sub` above, just for `remote::ConnectRequest`.
+        let connect_sub = self
+            .pending_connect
+            .as_ref()
+            .and_then(|pending| pending.request.as_ref())
+            .map(|request| ui::dialogs::connect::subscription(request).map(Message::ConnectEvent))
+            .unwrap_or_else(Subscription::none);
+
+        Subscription::batch([
+            keyboard,
+            watch,
+            mounts,
+            ops,
+            undo_toast,
+            size_sub,
+            connect_sub,
+        ])
     }
 
     fn theme(&self) -> iced::Theme {
@@ -1206,6 +1506,37 @@ impl App {
             None => with_progress,
         };
 
+        // The connect dialog (Stage 14) is a modal with the same "sane
+        // dismiss default" posture as properties: its scrim closes it
+        // (`Self::close_connect_dialog`'s cancel-and-clear, not a Noop
+        // swallow) — there's always a reasonable "never mind" for a
+        // connect attempt, unlike the conflict dialog's forced decision.
+        let with_connect: Element<'_, Message> = match &self.pending_connect {
+            Some(pending) => {
+                let scrim = iced::widget::mouse_area(
+                    iced::widget::container(iced::widget::Space::new())
+                        .style(saola_theme::style::container::scrim(
+                            t,
+                            saola_theme::style::container::ScrimKind::Modal,
+                        ))
+                        .width(Fill)
+                        .height(Fill),
+                )
+                .on_press(Message::Connect(
+                    ui::dialogs::connect::Message::CancelRequested,
+                ));
+                let dialog = iced::widget::container(
+                    ui::dialogs::connect::view(t, &pending.connect).map(Message::Connect),
+                )
+                .width(Fill)
+                .height(Fill)
+                .align_x(iced::alignment::Horizontal::Center)
+                .align_y(iced::alignment::Vertical::Center);
+                iced::widget::stack![with_properties, scrim, dialog].into()
+            }
+            None => with_properties,
+        };
+
         // The conflict dialog is a true modal: stacked over everything
         // else with a scrim that swallows clicks (`Message::Noop` — see
         // its doc comment) rather than closing on an outside click, since
@@ -1235,9 +1566,9 @@ impl App {
                 .height(Fill)
                 .align_x(iced::alignment::Horizontal::Center)
                 .align_y(iced::alignment::Vertical::Center);
-                iced::widget::stack![with_properties, scrim, dialog].into()
+                iced::widget::stack![with_connect, scrim, dialog].into()
             }
-            None => with_properties,
+            None => with_connect,
         };
 
         ui::window::view(t, "Files", with_conflict, Message::Window)
@@ -1308,7 +1639,7 @@ async fn delete_one(
     location: Location,
     force_permanent: bool,
 ) -> Result<Option<core::fs::trash::TrashId>, (Location, String)> {
-    let Some(backend) = modules::resolve(&location.scheme) else {
+    let Some(backend) = modules::resolve(&location) else {
         return Err((
             location.clone(),
             format!("no backend for scheme \"{}\"", location.scheme),

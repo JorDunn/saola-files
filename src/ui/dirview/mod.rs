@@ -484,7 +484,7 @@ impl DirectoryView {
     /// fresh per call) so this is a plain accessor, not something cached
     /// on the view.
     pub fn caps(&self) -> Caps {
-        crate::modules::resolve(&self.location.scheme)
+        crate::modules::resolve(&self.location)
             .map(|backend| backend.caps())
             .unwrap_or(Caps::empty())
     }
@@ -577,7 +577,7 @@ impl DirectoryView {
 
         let task = Task::perform(
             async move {
-                let Some(backend) = crate::modules::resolve(&probed.scheme) else {
+                let Some(backend) = crate::modules::resolve(&probed) else {
                     let listing = list_with_fallback(&fallback).await;
                     return (fallback, None, listing);
                 };
@@ -695,7 +695,7 @@ impl DirectoryView {
         let location_for_message = self.location.clone();
         Task::perform(
             async move {
-                let backend = crate::modules::resolve(&location_for_task.scheme);
+                let backend = crate::modules::resolve(&location_for_task);
                 match backend {
                     Some(backend) => backend.list(&location_for_task).await,
                     None => Err(VfsError::Other {
@@ -764,7 +764,7 @@ impl DirectoryView {
         let message_location = self.location.clone();
         Task::perform(
             async move {
-                let backend = crate::modules::resolve(&location.scheme);
+                let backend = crate::modules::resolve(&location);
                 let mut results = Vec::with_capacity(to_fetch.len());
                 for name in to_fetch {
                     let entry = match &backend {
@@ -1604,7 +1604,7 @@ impl DirectoryView {
 
         Task::perform(
             async move {
-                let Some(backend) = crate::modules::resolve(&from.scheme) else {
+                let Some(backend) = crate::modules::resolve(&from) else {
                     return Err(VfsError::Other {
                         message: format!("no backend for scheme \"{}\"", from.scheme),
                     });
@@ -1646,7 +1646,7 @@ impl DirectoryView {
 
         Task::perform(
             async move {
-                let Some(backend) = crate::modules::resolve(&location.scheme) else {
+                let Some(backend) = crate::modules::resolve(&location) else {
                     return Err(VfsError::Other {
                         message: format!("no backend for scheme \"{}\"", location.scheme),
                     });
@@ -1874,7 +1874,7 @@ fn is_hidden(entry: &FileEntry) -> bool {
 /// `open_target`'s "no backend for this scheme" fallback path: list
 /// `fallback` directly rather than leaving the view permanently empty.
 async fn list_with_fallback(fallback: &Location) -> Result<Vec<FileEntry>, VfsError> {
-    match crate::modules::resolve(&fallback.scheme) {
+    match crate::modules::resolve(fallback) {
         Some(backend) => backend.list(fallback).await,
         None => Err(VfsError::Other {
             message: format!("no backend for scheme \"{}\"", fallback.scheme),

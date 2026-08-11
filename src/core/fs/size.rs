@@ -189,7 +189,7 @@ fn walk<'a>(
         if cancel.load(Ordering::Relaxed) {
             return;
         }
-        let Some(backend) = crate::modules::resolve(&location.scheme) else {
+        let Some(backend) = crate::modules::resolve(location) else {
             return;
         };
         let Ok(meta) = backend.metadata(location).await else {

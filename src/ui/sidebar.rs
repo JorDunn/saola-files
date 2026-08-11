@@ -39,6 +39,11 @@ pub enum Message {
     PlaceClicked(Location),
     MountClicked(Location),
     MountsUpdated(Vec<Mount>),
+    /// The "Connect to Server…" row at the foot of the places column
+    /// (Stage 14) — bubbles straight to `Event::ConnectRequested`; unlike
+    /// `PlaceClicked`/`MountClicked` there's no `Location` to carry yet,
+    /// the human hasn't typed one.
+    ConnectClicked,
 }
 
 /// What the sidebar asks its owner to do — the same "the view only ever
@@ -47,6 +52,8 @@ pub enum Message {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     OpenDirectory(Location),
+    /// Stage 14: open `ui::dialogs::connect`'s URI-entry dialog.
+    ConnectRequested,
 }
 
 /// The sidebar's state: the (rare-to-change) place list plus the
@@ -83,6 +90,7 @@ impl Sidebar {
                 self.mounts = mounts;
                 None
             }
+            Message::ConnectClicked => Some(Event::ConnectRequested),
         }
     }
 
@@ -103,6 +111,12 @@ impl Sidebar {
                 mount_row(t, mount, location == *current)
             }));
         }
+
+        // Stage 14: always present (unlike the "Removable" section, which
+        // only renders when there's live mount data) — this is how a human
+        // reaches `ui::dialogs::connect`'s URI entry in the first place,
+        // not a live feed with a "nothing to show" empty case.
+        rows.push(connect_row(t));
 
         let content = column(rows).width(Fill);
 
@@ -170,6 +184,20 @@ fn place_row<'a>(t: &'a Theme, place: &'a Place, selected: bool) -> Element<'a, 
         &place.label,
         selected,
         Message::PlaceClicked(place.location.clone()),
+    )
+}
+
+/// The "Connect to Server…" row (Stage 14) — same `row_button` recipe as
+/// every place/mount row, but never draws selected (there is no
+/// `Location` for it to match `current` against) and its `on_press`
+/// carries no location at all.
+fn connect_row<'a>(t: &'a Theme) -> Element<'a, Message> {
+    row_button(
+        t,
+        Icon::Globe,
+        "Connect to Server…",
+        false,
+        Message::ConnectClicked,
     )
 }
 
@@ -274,6 +302,13 @@ mod tests {
             event,
             Some(Event::OpenDirectory(Location::local("/media/usb")))
         );
+    }
+
+    #[test]
+    fn connect_clicked_bubbles_a_connect_requested_event() {
+        let mut sidebar = Sidebar::new(vec![]);
+        let event = sidebar.update(Message::ConnectClicked);
+        assert_eq!(event, Some(Event::ConnectRequested));
     }
 
     #[test]
