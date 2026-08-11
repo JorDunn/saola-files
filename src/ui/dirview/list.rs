@@ -77,6 +77,31 @@ fn name_unit_budget(list_width: f32, font: f32, pill_gap: f32, icon_row: f32) ->
     saola_theme::overflow::unit_budget(available, font)
 }
 
+/// How many *width units* of a failed rename's message fit where the date
+/// normally sits (`renaming_row`'s trailing cell).
+///
+/// Unlike [`name_unit_budget`] this one needs no measurement and no
+/// `responsive`: the cell is `container(..).width(Length::Fixed(
+/// DATE_COLUMN))`, a fixed 168 px whatever the window does. Nothing is
+/// subtracted from it — that container carries no padding of its own, and
+/// the row's `padding([0, pill_gap])` sits *outside* all three columns, so
+/// the full 168 px is the cell's to spend.
+///
+/// `font` is the caller's `typography.size.secondary`, which is what the
+/// trailing text is actually set at (the same size the date it replaces
+/// uses, so a row mid-rename doesn't change type size when a submit
+/// fails). It's set in the *mono* face, whose advance runs a little wider
+/// than the 0.55 em average `unit_budget` is calibrated on for the
+/// proportional UI face; there is no mono-specific budget upstream yet, and
+/// inventing a local fudge factor would be exactly the local restyling
+/// CLAUDE.md forbids, so the residue is left to `Wrapping::None` at the
+/// call site — see the note there.
+///
+/// Pure function of one `f32`, testable without a `Theme` or a renderer.
+fn error_unit_budget(font: f32) -> usize {
+    saola_theme::overflow::unit_budget(DATE_COLUMN, font)
+}
+
 pub(super) fn view<'a>(
     state: &'a DirectoryView,
     t: &'a Theme,
@@ -431,10 +456,37 @@ fn renaming_row<'a>(
         .spacing(t.sizes.pill_gap)
         .align_y(iced::Center);
 
-    let trailing_text = rename.error.clone().unwrap_or_else(|| date_text(entry));
+    // A rename error is arbitrary-length prose about an arbitrary-length
+    // path ("<location> already exists", "<location> is a folder" — see
+    // `VfsError`'s `Display`), and it lands in a cell sized for a 16-
+    // character timestamp. Untruncated it wrapped to two or three lines,
+    // which pushed this row past `sizes.list_row` and put every spacer
+    // offset in `view()` out by the difference — the same fixed-row-height
+    // contract the name column's truncation protects, broken from the
+    // other end of the row.
+    //
+    // So: the same two belts, for the same two reasons (see `entry_row`'s
+    // long note). `truncate` is §7's honest elision — one `…`, no motion,
+    // budget counted in width units; `Wrapping::None` is the hard
+    // one-line guarantee covering what a unit budget can't see. The date
+    // is left alone: `format_system_time` is a fixed 16 characters, well
+    // inside the budget, so running it through `truncate` would only cost
+    // an allocation.
+    //
+    // Severity stays carried by wording, never color (CLAUDE.md: three
+    // colors, never a fourth) — an elided message is still the same
+    // message, and the full one is one keystroke away since the field
+    // stays open to retry.
+    let trailing_text = match &rename.error {
+        Some(error) => {
+            saola_theme::overflow::truncate(error, error_unit_budget(t.typography.size.secondary))
+        }
+        None => date_text(entry),
+    };
     let trailing = text(trailing_text)
         .size(t.typography.size.secondary)
-        .font(convert::mono_font(t));
+        .font(convert::mono_font(t))
+        .wrapping(iced::widget::text::Wrapping::None);
     let size = text(size_text(entry))
         .size(t.typography.size.secondary)
         .font(convert::mono_font(t));
@@ -537,6 +589,55 @@ mod tests {
         assert_eq!(budget(200.0), 4);
         assert_eq!(budget(0.0), 4);
         assert_eq!(budget(-50.0), 4);
+    }
+
+    #[test]
+    fn rename_error_budget_at_todays_tokens() {
+        // `DATE_COLUMN` 168, `typography.size.secondary` 12.5 — the
+        // shipped values. 168 / (12.5 × 0.55) = 24.4, floored to 24.
+        //
+        // Fixed, not measured: this cell doesn't grow with the window, so
+        // unlike the name budget there's nothing here for `responsive` to
+        // do. What this pins is the pairing of *our* column width with
+        // upstream's calibration — a `DATE_COLUMN` change, a token bump, or
+        // an upstream drift in `unit_budget`'s average advance/floor all
+        // surface here rather than on screen.
+        assert_eq!(error_unit_budget(12.5), 24);
+        // A wider column buys more message; a degenerate font size still
+        // lands on upstream's floor rather than panicking or budgeting 0.
+        assert!(saola_theme::overflow::unit_budget(336.0, 12.5) > error_unit_budget(12.5));
+        assert_eq!(error_unit_budget(0.0), 4);
+        assert_eq!(error_unit_budget(-12.5), 4);
+    }
+
+    #[test]
+    fn a_long_rename_error_elides_inside_the_date_column() {
+        // The real message a colliding rename produces: `VfsError::
+        // AlreadyExists`'s `Display` is "{location} already exists", and
+        // `location` is a whole absolute path (`modules::local::io_error`
+        // words it against the `from` `Location`). At 24 units that's 23
+        // characters of path plus the single `…` — the reader sees where
+        // the failure is about, not a three-line wrap.
+        let cut = |s: &str| saola_theme::overflow::truncate(s, error_unit_budget(12.5));
+
+        assert_eq!(
+            cut("/home/jordan/Documents/notes/report-2026-final.txt already exists"),
+            "/home/jordan/Documents/…"
+        );
+        // `VfsError::IsADirectory` — what renaming a file onto an existing
+        // folder produces, and the message the on-screen verification of
+        // this change actually shows.
+        assert_eq!(
+            cut("/home/jordan/Documents/notes/ok.txt is a folder"),
+            "/home/jordan/Documents/…"
+        );
+        // `submit_rename`'s own locally-worded rejection is short enough to
+        // survive whole — no stray ellipsis on the common case.
+        assert_eq!(cut("Enter a valid name"), "Enter a valid name");
+        // And the date this cell normally shows (a fixed 16 characters
+        // from `format_system_time`) is comfortably inside the same budget,
+        // which is why `renaming_row` doesn't bother truncating it.
+        assert_eq!(cut("2026-08-11 09:41"), "2026-08-11 09:41");
     }
 
     #[test]
