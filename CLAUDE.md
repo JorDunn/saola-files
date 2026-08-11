@@ -17,6 +17,29 @@ cargo build --no-default-features                          # CI gate — local-o
 cargo run                                                  # needs a Wayland session (niri)
 ```
 
+## Live GUI verification (proven recipe — use it, don't re-derive)
+
+When a change needs proof in the running app (not just tests), Jordan's live
+niri session can be driven directly; opening a window on screen is fine.
+
+1. Build a scratch directory tree under the session scratchpad (never the
+   repo) and launch against it: `target/debug/saola-files <dir>` in a
+   background Bash call.
+2. Find the window with `niri msg --json windows` (app-id contains "saola");
+   `niri msg action fullscreen-window --id <ID>` makes coordinates
+   predictable. `niri msg --json outputs` gives logical size + scale.
+3. Screenshot with `grim shot.png` and **Read the PNG — look at it**; map
+   screenshot pixels to pointer coordinates by comparing the image size to
+   the output's logical size (scale factor).
+4. Inject input with `ydotool` (daemon is enabled):
+   `ydotool mousemove --absolute -x X -y Y`, `ydotool click 0xC0` (left),
+   `ydotool click --repeat 2 --next-delay 80 0xC0` (double).
+5. Screenshot again and verify the *content* changed as claimed —
+   before/after pairs are the evidence. Then kill the app.
+
+Never use `slurp` (blocks waiting for a human). Two windows with the same
+app-id means a stale instance survived — kill both and relaunch.
+
 ## Architecture
 
 Single binary crate, three layers with a hard import rule: `core/` never
