@@ -134,11 +134,12 @@ pub(super) fn columns_for_scroll(scroll: Option<scrollable::Viewport>) -> usize 
 pub(super) fn view<'a>(
     state: &'a DirectoryView,
     t: &'a Theme,
+    s: Surface,
     mime_db: &'a MimeDb,
     thumb_cache: &'a ThumbCache,
 ) -> Element<'a, Message> {
     if let Some(err) = &state.error {
-        return empty_state_owned(t, err.to_string());
+        return empty_state_owned(t, s, err.to_string());
     }
     if state.entries.is_empty() {
         let message = if state.loading {
@@ -146,7 +147,7 @@ pub(super) fn view<'a>(
         } else {
             "This folder is empty"
         };
-        return empty_state(t, message);
+        return empty_state(t, s, message);
     }
 
     // `responsive` is how a widget learns its own width in iced 0.14: the
@@ -189,7 +190,7 @@ pub(super) fn view<'a>(
                     state
                         .entries
                         .get(entry_index)
-                        .map(|entry| tile(state, t, mime_db, thumb_cache, start + offset, entry))
+                        .map(|entry| tile(state, t, s, mime_db, thumb_cache, start + offset, entry))
                 });
             row(tiles).spacing(t.sizes.grid_tile_gap).into()
         });
@@ -205,7 +206,7 @@ pub(super) fn view<'a>(
 
         scrollable(body_column)
             .on_scroll(Message::Scrolled)
-            .style(style::scrollable::rest(t, Surface::Paper))
+            .style(style::scrollable::rest(t, s))
             .width(Fill)
             .height(Fill)
             .into()
@@ -236,6 +237,7 @@ fn visible_row_range(state: &DirectoryView, row_height: f32, total_rows: usize) 
 fn tile<'a>(
     state: &'a DirectoryView,
     t: &'a Theme,
+    s: Surface,
     mime_db: &'a MimeDb,
     thumb_cache: &'a ThumbCache,
     visible_index: usize,
@@ -246,7 +248,7 @@ fn tile<'a>(
     if let Some(rename) = state.rename_state()
         && rename.original == entry.name
     {
-        return renaming_tile(t, mime_db, entry, rename);
+        return renaming_tile(t, s, mime_db, entry, rename);
     }
 
     let selected = state.selection.is_selected(&entry.name);
@@ -257,11 +259,13 @@ fn tile<'a>(
     // not-selected, never hover, at this call site. Stage 11: a cached
     // thumbnail (regular files only) replaces the glyph square — see
     // `list.rs::entry_row`'s identical swap and `thumbnail_for`'s own doc
-    // comment for exactly what qualifies.
+    // comment for exactly what qualifies. As there, the selected arm is
+    // `palette.paper` on either ground: a selected tile is filled
+    // terracotta, whose foreground is ivory whatever the window is drawn on.
     let icon_color = if selected {
         t.palette.paper
     } else {
-        t.on_paper.primary
+        t.on(s).primary
     };
     let glyph: Element<'a, Message> = match thumbnail_for(state, thumb_cache, entry) {
         Some(handle) => iced::widget::image(handle.handle())
@@ -335,12 +339,7 @@ fn tile<'a>(
     // press before an outer `MouseArea` could track it, so doubles are
     // paired app-side in `Message::RowClicked`'s handler instead.
     button(container(content).height(Fill).align_y(Center))
-        .style(style::button::selection_tile(
-            t,
-            Surface::Paper,
-            selected,
-            has_cursor,
-        ))
+        .style(style::button::selection_tile(t, s, selected, has_cursor))
         .width(Length::Fixed(t.sizes.grid_tile))
         .height(Length::Fixed(t.sizes.grid_tile + t.sizes.grid_tile_label))
         .padding(t.sizes.pill_gap / 2.0)
@@ -358,6 +357,7 @@ fn tile<'a>(
 /// practice; not blocking for this stage.
 fn renaming_tile<'a>(
     t: &'a Theme,
+    s: Surface,
     mime_db: &'a MimeDb,
     entry: &'a FileEntry,
     rename: &'a super::rename::RenameState,
@@ -365,14 +365,14 @@ fn renaming_tile<'a>(
     let glyph = icon::icon(
         row_icon(entry, mime_db),
         t.sizes.icon_bare,
-        t.on_paper.primary.into_iced(),
+        t.on(s).primary.into_iced(),
     );
 
     let field = text_input("Name", &rename.buffer)
         .id(RENAME_INPUT_ID)
         .on_input(Message::RenameChanged)
         .on_submit(Message::RenameSubmitted)
-        .style(style::text_input::rest(t, Surface::Paper))
+        .style(style::text_input::rest(t, s))
         .font(convert::ui_font(t))
         .size(t.typography.size.secondary);
 
@@ -397,16 +397,16 @@ fn renaming_tile<'a>(
         .into()
 }
 
-fn empty_state<'a>(t: &'a Theme, message: &'a str) -> Element<'a, Message> {
-    saola_theme::widget::empty_state(t, Surface::Paper, message)
+fn empty_state<'a>(t: &'a Theme, s: Surface, message: &'a str) -> Element<'a, Message> {
+    saola_theme::widget::empty_state(t, s, message)
 }
 
-fn empty_state_owned<'a>(t: &'a Theme, message: String) -> Element<'a, Message> {
+fn empty_state_owned<'a>(t: &'a Theme, s: Surface, message: String) -> Element<'a, Message> {
     container(
         text(message)
             .size(t.typography.size.secondary)
             .font(convert::ui_font_regular(t))
-            .color(t.on_paper.tertiary.into_iced()),
+            .color(t.on(s).tertiary.into_iced()),
     )
     .width(Fill)
     .height(Fill)

@@ -81,9 +81,11 @@ one coherent PR each, CI green throughout.
 - Three colors, never a fourth: ink `#0C0A00`, paper `#FFFFF0`, terracotta
   `#C67139`. No danger/success/warning color — severity is carried by
   wording. Mimetype differentiation is **glyph shape only, never hue**.
-- This app is a window: `Surface::Paper`, `container::paper_window` (24 px
-  radius, 2 px border, window shadow), self-drawn 46 px header
-  (`sizes.window_header`). **No minimise button** — niri has no taskbar.
+- This app is a window: `container::window(t, s)` (24 px radius, 2 px
+  border, window shadow), self-drawn 46 px header (`sizes.window_header`).
+  The surface is the `surface` config knob (default `Surface::Paper`),
+  threaded from `App` through every view. **No minimise button** — niri has
+  no taskbar.
 - Icons are Lucide outline, 24×24 viewBox, `stroke-width="2.75"` baked into
   the asset, tinted at draw time. Copy the panel's `src/icons.rs` pattern
   (Icon enum + `include_bytes!` + stroke-width asset tests).
@@ -106,6 +108,10 @@ one coherent PR each, CI green throughout.
   `$SAOLA_CONFIG_DIR` > `$XDG_CONFIG_HOME/saola` > `~/.config/saola` (empty
   env vars count as unset). No file → silent defaults; unparseable → one
   warning + defaults, still start; one bad knob → warn on that knob only.
+  The window's ground is one of those knobs — `surface = "paper"|"ink"`,
+  default paper, resolved to a `saola_theme::Surface` once on `App` and
+  threaded through window/explorer; popovers, the undo toast and the four
+  modal dialogs never follow it (their surfaces are spec-pinned).
 - **Signal, never poll:** inotify for local watching; backends that can't
   signal declare it via `Caps` and the UI refreshes on navigate instead.
   Nothing ticks without a documented exception.

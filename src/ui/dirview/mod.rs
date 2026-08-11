@@ -60,7 +60,7 @@ use std::time::SystemTime;
 use futures::SinkExt;
 use iced::widget::scrollable;
 use iced::{Element, Subscription, Task, keyboard};
-use saola_theme::Theme;
+use saola_theme::{Surface, Theme};
 
 use crate::config::{Config, CustomAction, SortKey, View};
 use crate::core::apps::AppsDb;
@@ -1106,17 +1106,22 @@ impl DirectoryView {
         }
     }
 
+    /// `s` is the window's ground (`files.toml`'s `surface` knob), threaded
+    /// in from `ui::explorer`. It reaches the listing only: `menus::overlay`
+    /// deliberately never sees it, because a popover is always ink by the
+    /// style guide no matter what the window under it is drawn on.
     pub fn view<'a>(
         &'a self,
         theme: &'a Theme,
+        s: Surface,
         mime_db: &'a MimeDb,
         thumb_cache: &'a ThumbCache,
         apps_db: &'a AppsDb,
         clipboard_has_contents: bool,
     ) -> Element<'a, Message> {
         let content = match self.view_mode {
-            View::List => list::view(self, theme, mime_db, thumb_cache),
-            View::Grid => grid::view(self, theme, mime_db, thumb_cache),
+            View::List => list::view(self, theme, s, mime_db, thumb_cache),
+            View::Grid => grid::view(self, theme, s, mime_db, thumb_cache),
         };
         menus::overlay(
             theme,

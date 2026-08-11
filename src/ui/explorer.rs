@@ -21,7 +21,7 @@
 
 use iced::widget::{column, row};
 use iced::{Element, Fill};
-use saola_theme::Theme;
+use saola_theme::{Surface, Theme};
 
 use crate::core::apps::AppsDb;
 use crate::core::mime::MimeDb;
@@ -44,6 +44,12 @@ pub enum Message {
 /// `DirectoryView`) with its toolbar, lifting messages into the caller's
 /// `M` via `map`.
 ///
+/// `s` is the window's ground (`files.toml`'s `surface` knob, resolved on
+/// `App` at startup): every region composed here — sidebar, toolbar,
+/// listing — is anchored to the window frame, so all three follow it
+/// together. It is render context, not state: a portal embedding this seam
+/// passes whatever surface *its* own window is drawn on.
+///
 /// `mime_db`/`thumb_cache`/`apps_db` are the App-level shared caches
 /// (CLAUDE.md: "Shared caches (thumbs, mime, apps, …) live on the App,
 /// never per-view"), threaded straight through to `active.view` for row
@@ -62,18 +68,21 @@ pub enum Message {
 /// `Message::Directory` constructors used per-subtree are plain `Fn`s and
 /// have no such restriction.
 // Stage 11 pushed this from 7 params to 8 (`thumb_cache` joined the other
-// App-owned shared caches this seam threads straight through — see the
-// doc comment just below). `clippy::too_many_arguments`'s default
-// threshold is 7; every one of these is a distinct, differently-typed
-// shared cache or piece of render state this function's own doc comment
-// already explains the purpose of, so bundling them into a single
-// "context" struct would be indirection for its own sake (CLAUDE.md:
-// "prefer explicit code over clever abstraction") rather than a real
-// simplification — every call site would still have to name each field
-// individually to build it.
+// App-owned shared caches this seam threads straight through), and the
+// `surface` knob makes 9 (`s`, the window's ground — see the doc comment
+// just below). `clippy::too_many_arguments`'s default threshold is 7;
+// every one of these is a distinct, differently-typed shared cache or
+// piece of render context — `theme` and `s` together are *how to draw*,
+// the caches are *what to draw from* — and this function's own doc
+// comment already explains the purpose of each, so bundling them into a
+// single "context" struct would be indirection for its own sake
+// (CLAUDE.md: "prefer explicit code over clever abstraction") rather than
+// a real simplification — every call site would still have to name each
+// field individually to build it.
 #[allow(clippy::too_many_arguments)]
 pub fn view<'a, M: 'a>(
     theme: &'a Theme,
+    s: Surface,
     sidebar: &'a Sidebar,
     active: &'a DirectoryView,
     mime_db: &'a MimeDb,
@@ -82,23 +91,31 @@ pub fn view<'a, M: 'a>(
     clipboard_has_contents: bool,
     map: impl Fn(Message) -> M + 'a,
 ) -> Element<'a, M> {
-    let sidebar_view: Element<'a, Message> =
-        sidebar.view(theme, active.location()).map(Message::Sidebar);
+    let sidebar_view: Element<'a, Message> = sidebar
+        .view(theme, s, active.location())
+        .map(Message::Sidebar);
 
     // Region geometry lives here, in the one place that knows all three
     // regions exist. `sizes.island_gap` ("gap between islands") is the gap
     // token the panel already uses between its own free-standing chrome
     // surfaces, and that is exactly the job here: the places sidebar and
     // the toolbar are two inset chrome islands, the directory listing is
-    // the paper ground they float on. One token, used as the gap *between*
+    // the window's own ground they float on. One token, used as the gap *between*
     // the regions (row `spacing`), the gap between toolbar and listing
     // (column `spacing`), and the inset from the window's own edges (row
     // `padding`), so every seam in the window measures the same.
     let gap = theme.sizes.island_gap;
 
     let directory: Element<'a, dirview::Message> = column![
-        header::view(theme, active),
-        active.view(theme, mime_db, thumb_cache, apps_db, clipboard_has_contents)
+        header::view(theme, s, active),
+        active.view(
+            theme,
+            s,
+            mime_db,
+            thumb_cache,
+            apps_db,
+            clipboard_has_contents
+        )
     ]
     .spacing(gap)
     .width(Fill)

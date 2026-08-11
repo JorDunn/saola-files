@@ -97,18 +97,23 @@ impl Sidebar {
     /// `current` is the active `DirectoryView`'s location — the row (place
     /// or mount) that matches it draws selected, the same terracotta §6
     /// list-row treatment `ui::dirview::list`'s selected rows use.
-    pub fn view<'a>(&'a self, t: &'a Theme, current: &Location) -> Element<'a, Message> {
+    pub fn view<'a>(
+        &'a self,
+        t: &'a Theme,
+        s: Surface,
+        current: &Location,
+    ) -> Element<'a, Message> {
         let mut rows: Vec<Element<'a, Message>> = self
             .places
             .iter()
-            .map(|place| place_row(t, place, place.location == *current))
+            .map(|place| place_row(t, s, place, place.location == *current))
             .collect();
 
         if !self.mounts.is_empty() {
-            rows.push(widget::section_label(t, Surface::Paper, "REMOVABLE"));
+            rows.push(widget::section_label(t, s, "REMOVABLE"));
             rows.extend(self.mounts.iter().map(|mount| {
                 let location = Location::local(mount.mount_point.clone());
-                mount_row(t, mount, location == *current)
+                mount_row(t, s, mount, location == *current)
             }));
         }
 
@@ -116,21 +121,23 @@ impl Sidebar {
         // only renders when there's live mount data) — this is how a human
         // reaches `ui::dialogs::connect`'s URI entry in the first place,
         // not a live feed with a "nothing to show" empty case.
-        rows.push(connect_row(t));
+        rows.push(connect_row(t, s));
 
         let content = column(rows).width(Fill);
 
         // Region separation by *ground*, not by a line: `style::container::
         // inset` (Stage 12 — the upstreamed promotion of the pending
         // `container::tile`-at-`radii.inset` gap this call site used to
-        // flag) is `on_paper.fill_subtle` (ink at 4%) at `radii.inset`
+        // flag) is `on(s).fill_subtle` (the window's own foreground at 4%)
+        // at `radii.inset`
         // (20px, the style guide §4 "Inset panels, media rows | 18–22px"
         // tier — `container::tile`'s own `radii.tile`, 13px, is for *icon*
         // tiles, one size class down from a window-scale panel like this
         // one). The places column sits one alpha step below the file
-        // listing's plain paper, the same way the quick-settings popover's
+        // listing's plain ground, the same way the quick-settings popover's
         // media row sits below its popover — keeping the three-colour rule
-        // intact (a step of ink, not a fourth hue) while making "sidebar"
+        // intact (a step of the ground's own foreground, not a fourth hue)
+        // while making "sidebar"
         // and "files" read as two zones rather than one continuous sheet.
         //
         // `ui::explorer` (and `main.rs`'s trash composition) is what insets
@@ -141,11 +148,11 @@ impl Sidebar {
         // `SIDEBAR_WIDTH` local constant.
         container(
             scrollable(content)
-                .style(style::scrollable::rest(t, Surface::Paper))
+                .style(style::scrollable::rest(t, s))
                 .width(Fill)
                 .height(Fill),
         )
-        .style(style::container::inset(t, Surface::Paper))
+        .style(style::container::inset(t, s))
         .padding(t.sizes.pill_gap)
         .width(t.sizes.window_sidebar)
         .height(Fill)
@@ -177,9 +184,15 @@ fn mounts_stream() -> impl iced::futures::Stream<Item = Message> {
     UdisksMounts.watch().map(Message::MountsUpdated)
 }
 
-fn place_row<'a>(t: &'a Theme, place: &'a Place, selected: bool) -> Element<'a, Message> {
+fn place_row<'a>(
+    t: &'a Theme,
+    s: Surface,
+    place: &'a Place,
+    selected: bool,
+) -> Element<'a, Message> {
     row_button(
         t,
+        s,
         crate::icons::for_place(place.kind),
         &place.label,
         selected,
@@ -191,9 +204,10 @@ fn place_row<'a>(t: &'a Theme, place: &'a Place, selected: bool) -> Element<'a, 
 /// every place/mount row, but never draws selected (there is no
 /// `Location` for it to match `current` against) and its `on_press`
 /// carries no location at all.
-fn connect_row<'a>(t: &'a Theme) -> Element<'a, Message> {
+fn connect_row<'a>(t: &'a Theme, s: Surface) -> Element<'a, Message> {
     row_button(
         t,
+        s,
         Icon::Globe,
         "Connect to Server…",
         false,
@@ -201,9 +215,15 @@ fn connect_row<'a>(t: &'a Theme) -> Element<'a, Message> {
     )
 }
 
-fn mount_row<'a>(t: &'a Theme, mount: &'a Mount, selected: bool) -> Element<'a, Message> {
+fn mount_row<'a>(
+    t: &'a Theme,
+    s: Surface,
+    mount: &'a Mount,
+    selected: bool,
+) -> Element<'a, Message> {
     row_button(
         t,
+        s,
         crate::icons::for_mount(mount.removable),
         &mount.label,
         selected,
@@ -213,6 +233,7 @@ fn mount_row<'a>(t: &'a Theme, mount: &'a Mount, selected: bool) -> Element<'a, 
 
 fn row_button<'a>(
     t: &'a Theme,
+    s: Surface,
     glyph: Icon,
     label: &'a str,
     selected: bool,
@@ -223,10 +244,12 @@ fn row_button<'a>(
     // not re-evaluated per `button::Status`, so the selected/unselected
     // split has to be decided by the caller rather than left to hover
     // state.
+    // Selected means a terracotta-filled row, whose foreground is ivory on
+    // either ground — so that arm is `palette.paper`, not a role read.
     let icon_color = if selected {
         t.palette.paper
     } else {
-        t.on_paper.primary
+        t.on(s).primary
     };
     // `.height(Fill)` is load-bearing, not decoration. An iced `button`
     // lays its content out at the padding's top-left corner and never
@@ -256,7 +279,7 @@ fn row_button<'a>(
     // so `focused` is always `false` — `list_row`'s fourth parameter, which
     // draws the keyboard-focus ring `ui::dirview::list`'s own rows use.
     button(content)
-        .style(style::button::list_row(t, Surface::Paper, selected, false))
+        .style(style::button::list_row(t, s, selected, false))
         .width(Fill)
         .height(t.sizes.list_row)
         .padding([0.0, t.sizes.pill_gap])

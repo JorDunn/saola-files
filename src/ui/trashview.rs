@@ -233,18 +233,22 @@ impl TrashView {
         Task::perform(run_blocking(trash::empty), Message::EmptyResult)
     }
 
-    pub fn view<'a>(&'a self, t: &'a Theme) -> Element<'a, Message> {
-        let toolbar_row = toolbar(t, self.items.is_empty(), self.confirming_empty);
+    /// `s` is the window's ground (`files.toml`'s `surface` knob). The trash
+    /// browser is composed outside `ui::explorer` — directly in `main.rs`,
+    /// see that composition's comment — so it is handed the same surface
+    /// separately rather than inheriting it through the portal seam.
+    pub fn view<'a>(&'a self, t: &'a Theme, s: Surface) -> Element<'a, Message> {
+        let toolbar_row = toolbar(t, s, self.items.is_empty(), self.confirming_empty);
 
         let body: Element<'a, Message> = if let Some(err) = &self.error {
-            saola_theme::widget::empty_state(t, Surface::Paper, err)
+            saola_theme::widget::empty_state(t, s, err)
         } else if self.items.is_empty() {
             let message = if self.loading {
                 "Loading…"
             } else {
                 "Trash is empty"
             };
-            saola_theme::widget::empty_state(t, Surface::Paper, message)
+            saola_theme::widget::empty_state(t, s, message)
         } else {
             // `responsive` is how a widget learns its own width in iced
             // 0.14: the closure runs *inside* `Widget::layout`, after
@@ -255,7 +259,7 @@ impl TrashView {
             // posture as `ui::dirview::list::view`; see its comment for the
             // two rules the closure has to honour (it is `Fn`, re-run on
             // every relayout, and everything it captures — `&TrashView`,
-            // `&Theme` — is a shared reference, which is `Copy`; and it
+            // `&Theme`, and a `Copy` `Surface` — is cheap to copy; and it
             // returns the same tree shape every run, so the scrollable's
             // widget state, including its offset, survives a resize).
             //
@@ -280,10 +284,10 @@ impl TrashView {
                     .items
                     .iter()
                     .enumerate()
-                    .map(|(index, item)| item_row(t, index, item, name_units, path_units))
+                    .map(|(index, item)| item_row(t, s, index, item, name_units, path_units))
                     .collect();
                 scrollable(column(rows).width(Fill))
-                    .style(style::scrollable::rest(t, Surface::Paper))
+                    .style(style::scrollable::rest(t, s))
                     .width(Fill)
                     .height(Fill)
                     .into()
@@ -324,22 +328,23 @@ where
     }
 }
 
-fn toolbar<'a>(t: &'a Theme, items_empty: bool, confirming: bool) -> Element<'a, Message> {
+fn toolbar<'a>(
+    t: &'a Theme,
+    s: Surface,
+    items_empty: bool,
+    confirming: bool,
+) -> Element<'a, Message> {
     if confirming {
-        return confirm_strip(t);
+        return confirm_strip(t, s);
     }
 
     let title = text("Trash")
         .size(t.typography.size.dialog_title)
         .font(convert::display_font(t))
-        .color(t.on_paper.primary.into_iced());
+        .color(t.on(s).primary.into_iced());
 
     let empty_content = row![
-        icon::icon(
-            Icon::Trash2,
-            t.sizes.icon_row,
-            t.on_paper.primary.into_iced()
-        ),
+        icon::icon(Icon::Trash2, t.sizes.icon_row, t.on(s).primary.into_iced()),
         text("Empty Trash")
             .size(t.typography.size.body)
             .font(convert::ui_font(t)),
@@ -347,7 +352,7 @@ fn toolbar<'a>(t: &'a Theme, items_empty: bool, confirming: bool) -> Element<'a,
     .spacing(t.sizes.pill_gap)
     .align_y(Center);
     let mut empty_button = button(empty_content)
-        .style(style::button::rest(t, Surface::Paper))
+        .style(style::button::rest(t, s))
         .padding(t.paddings.pill_button);
     if !items_empty {
         empty_button = empty_button.on_press(Message::EmptyRequested);
@@ -355,13 +360,13 @@ fn toolbar<'a>(t: &'a Theme, items_empty: bool, confirming: bool) -> Element<'a,
 
     // The trash browser's toolbar is the same chrome region `ui::header`'s
     // is, so it takes the same recessed `style::container::inset` ground
-    // (Stage 12) rather than sitting on the listing's paper.
+    // (Stage 12) rather than sitting on the listing's plain surface.
     container(
         row![title, Space::new().width(Fill), empty_button]
             .align_y(Center)
             .width(Fill),
     )
-    .style(style::container::inset(t, Surface::Paper))
+    .style(style::container::inset(t, s))
     .width(Fill)
     .height(t.sizes.window_header)
     .padding([0.0, t.sizes.pill_gap])
@@ -376,18 +381,18 @@ fn toolbar<'a>(t: &'a Theme, items_empty: bool, confirming: bool) -> Element<'a,
 /// per-conflict data). `App` never sees this state at all — it's entirely
 /// local to `TrashView`, the same "self-contained per-surface state"
 /// posture `DirectoryView`'s own inline-rename state takes.
-fn confirm_strip<'a>(t: &'a Theme) -> Element<'a, Message> {
+fn confirm_strip<'a>(t: &'a Theme, s: Surface) -> Element<'a, Message> {
     let label = text("Permanently delete everything in the trash?")
         .size(t.typography.size.body)
         .font(convert::ui_font(t))
-        .color(t.on_paper.primary.into_iced());
+        .color(t.on(s).primary.into_iced());
 
     let cancel = button(
         text("Cancel")
             .size(t.typography.size.body)
             .font(convert::ui_font(t)),
     )
-    .style(style::button::rest(t, Surface::Paper))
+    .style(style::button::rest(t, s))
     .padding(t.paddings.pill_button)
     .on_press(Message::EmptyCancelClicked);
 
@@ -396,7 +401,7 @@ fn confirm_strip<'a>(t: &'a Theme) -> Element<'a, Message> {
             .size(t.typography.size.body)
             .font(convert::ui_font(t)),
     )
-    .style(style::button::rest(t, Surface::Paper))
+    .style(style::button::rest(t, s))
     .padding(t.paddings.pill_button)
     .on_press(Message::EmptyConfirmClicked);
 
@@ -409,7 +414,7 @@ fn confirm_strip<'a>(t: &'a Theme) -> Element<'a, Message> {
             .spacing(t.sizes.pill_gap)
             .align_y(Center),
     )
-    .style(style::container::inset(t, Surface::Paper))
+    .style(style::container::inset(t, s))
     .width(Fill)
     .height(t.sizes.window_header)
     .padding([0.0, t.sizes.pill_gap])
@@ -425,6 +430,7 @@ fn confirm_strip<'a>(t: &'a Theme) -> Element<'a, Message> {
 /// same measurement.
 fn item_row<'a>(
     t: &'a Theme,
+    s: Surface,
     index: usize,
     item: &'a TrashedItem,
     name_units: usize,
@@ -437,7 +443,7 @@ fn item_row<'a>(
     } else {
         Icon::File
     };
-    let icon = icon::icon(glyph, t.sizes.icon_row, t.on_paper.primary.into_iced());
+    let icon = icon::icon(glyph, t.sizes.icon_row, t.on(s).primary.into_iced());
 
     let name = item
         .original_path
@@ -478,20 +484,20 @@ fn item_row<'a>(
     ))
     .size(t.typography.size.secondary)
     .font(convert::mono_font(t))
-    .color(t.on_paper.secondary.into_iced())
+    .color(t.on(s).secondary.into_iced())
     .wrapping(iced::widget::text::Wrapping::None);
     let labels = column![name_text, original].spacing(2.0).width(Fill);
 
     let date = text(item.deletion_date.clone())
         .size(t.typography.size.secondary)
         .font(convert::mono_font(t))
-        .color(t.on_paper.secondary.into_iced());
+        .color(t.on(s).secondary.into_iced());
 
     let restore_content = row![
         icon::icon(
             Icon::RotateCcw,
             t.sizes.icon_row,
-            t.on_paper.primary.into_iced()
+            t.on(s).primary.into_iced()
         ),
         text("Restore")
             .size(t.typography.size.label)
@@ -500,7 +506,7 @@ fn item_row<'a>(
     .spacing(t.sizes.gap_tight)
     .align_y(Center);
     let restore = button(restore_content)
-        .style(style::button::bare(t, Surface::Paper))
+        .style(style::button::bare(t, s))
         .padding(t.paddings.strip)
         .width(Length::Fixed(RESTORE_COLUMN))
         .on_press(Message::RestoreRequested(index));

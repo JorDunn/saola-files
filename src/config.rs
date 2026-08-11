@@ -26,6 +26,7 @@
 //!
 //! ```toml
 //! terminal = "alacritty"
+//! surface = "ink"
 //! view = "grid"
 //! sort = "modified"
 //! sort-descending = true
@@ -50,6 +51,34 @@ use toml::Table;
 
 /// Default cap on the size of files we'll generate thumbnails for, in MiB.
 const DEFAULT_THUMBNAIL_MAX_MB: u64 = 64;
+
+/// Which of the design language's two grounds the *window* is drawn on:
+/// ivory paper (the default) or ink. A local enum rather than
+/// `saola_theme::Surface` on purpose — this module stays std+toml-only, so
+/// the theme crate never leaks into config parsing; `main.rs` converts it
+/// to a `Surface` once at startup.
+///
+/// The knob moves the window chrome and everything anchored to it (header,
+/// sidebar, toolbar, listing). It deliberately does **not** move the
+/// popovers/context menus (always ink), the undo toast (always ink) or the
+/// four modal dialog cards (always ivory) — those surfaces are pinned by
+/// the style guide, not by taste.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WindowSurface {
+    #[default]
+    Paper,
+    Ink,
+}
+
+impl WindowSurface {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "paper" => Some(Self::Paper),
+            "ink" => Some(Self::Ink),
+            _ => None,
+        }
+    }
+}
 
 /// How a directory is presented. Lives here because it's a config knob;
 /// the directory view (Stage 3) consumes it.
@@ -117,6 +146,8 @@ pub struct Config {
     /// entries. `None` falls through to `$TERMINAL`, then `alacritty` — the
     /// chain lives at the point of use (core/apps.rs, Stage 6), not here.
     pub terminal: Option<String>,
+    /// Which ground the window draws on. See [`WindowSurface`].
+    pub surface: WindowSurface,
     pub view: View,
     pub sort: SortKey,
     pub sort_descending: bool,
@@ -132,6 +163,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             terminal: None,
+            surface: WindowSurface::default(),
             view: View::default(),
             sort: SortKey::default(),
             sort_descending: false,
@@ -204,6 +236,10 @@ impl Config {
 
         let terminal = read_str(&body, "terminal").map(str::to_owned);
 
+        let surface = read_str(&body, "surface")
+            .and_then(|value| match_or_warn(value, "surface", WindowSurface::parse))
+            .unwrap_or_default();
+
         let view = read_str(&body, "view")
             .and_then(|value| match_or_warn(value, "view", View::parse))
             .unwrap_or_default();
@@ -224,6 +260,7 @@ impl Config {
 
         Ok(Config {
             terminal,
+            surface,
             view,
             sort,
             sort_descending,
@@ -482,6 +519,19 @@ mod tests {
         assert_eq!(config.terminal.as_deref(), Some("foot"));
         // Wrong type falls through like an absent knob.
         assert_eq!(Config::parse("terminal = 3").unwrap().terminal, None);
+    }
+
+    #[test]
+    fn surface_knob() {
+        assert_eq!(
+            Config::parse("surface = \"ink\"").unwrap().surface,
+            WindowSurface::Ink
+        );
+        // Unrecognized value warns and keeps the default; the rest of the
+        // document still parses.
+        let config = Config::parse("surface = \"vellum\"\nshow-hidden = true").unwrap();
+        assert_eq!(config.surface, WindowSurface::Paper);
+        assert!(config.show_hidden);
     }
 
     #[test]

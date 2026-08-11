@@ -105,6 +105,7 @@ fn error_unit_budget(font: f32) -> usize {
 pub(super) fn view<'a>(
     state: &'a DirectoryView,
     t: &'a Theme,
+    s: Surface,
     mime_db: &'a MimeDb,
     thumb_cache: &'a ThumbCache,
 ) -> Element<'a, Message> {
@@ -113,7 +114,7 @@ pub(super) fn view<'a>(
         // can consume into a `text` widget directly — a `&str` borrowing
         // this temporary can't outlive this function, but the returned
         // `Element<'a, _>` must.
-        return empty_state_owned(t, err.to_string());
+        return empty_state_owned(t, s, err.to_string());
     }
     if state.entries.is_empty() {
         let message = if state.loading {
@@ -121,7 +122,7 @@ pub(super) fn view<'a>(
         } else {
             "This folder is empty"
         };
-        return empty_state(t, message);
+        return empty_state(t, s, message);
     }
 
     // `responsive` is how a widget learns its own width in iced 0.14: the
@@ -134,7 +135,8 @@ pub(super) fn view<'a>(
     // re-runs it on every relayout — so everything it captures is captured
     // by value, which is free here: `&DirectoryView`, `&Theme`, `&MimeDb`
     // and `&ThumbCache` are all shared references, and shared references are
-    // `Copy`. And it must return the *same tree shape* every run
+    // `Copy`; `Surface` is a `Copy` enum for the same reason. And it must
+    // return the *same tree shape* every run
     // (`column![header, scrollable]`, always): `Responsive::diff` defers to
     // the ordinary `diff_children`, so a stable shape means the scrollable's
     // widget state — including the scroll offset — is matched up and carried
@@ -162,7 +164,16 @@ pub(super) fn view<'a>(
             .enumerate()
             .filter_map(|(offset, &entry_index)| {
                 state.entries.get(entry_index).map(|entry| {
-                    entry_row(state, t, mime_db, thumb_cache, first + offset, entry, units)
+                    entry_row(
+                        state,
+                        t,
+                        s,
+                        mime_db,
+                        thumb_cache,
+                        first + offset,
+                        entry,
+                        units,
+                    )
                 })
             });
 
@@ -175,11 +186,11 @@ pub(super) fn view<'a>(
 
         let body = scrollable(body_column)
             .on_scroll(Message::Scrolled)
-            .style(style::scrollable::rest(t, Surface::Paper))
+            .style(style::scrollable::rest(t, s))
             .width(Fill)
             .height(Fill);
 
-        column![header_row(state, t), body]
+        column![header_row(state, t, s), body]
             .width(Fill)
             .height(Fill)
             .into()
@@ -207,15 +218,16 @@ fn visible_range(state: &DirectoryView, row_height: f32, total: usize) -> (usize
     (first.min(last), last)
 }
 
-fn header_row<'a>(state: &'a DirectoryView, t: &'a Theme) -> Element<'a, Message> {
+fn header_row<'a>(state: &'a DirectoryView, t: &'a Theme, s: Surface) -> Element<'a, Message> {
     use iced::alignment::Horizontal;
 
     // Each header is aligned the way its own column's values are (see
     // `entry_row`): Name and Date read left-to-right, Size is right-aligned
     // so the digits line up under each other.
-    let name = header_cell(t, "Name", SortKey::Name, state, Fill, Horizontal::Left);
+    let name = header_cell(t, s, "Name", SortKey::Name, state, Fill, Horizontal::Left);
     let size = header_cell(
         t,
+        s,
         "Size",
         SortKey::Size,
         state,
@@ -224,6 +236,7 @@ fn header_row<'a>(state: &'a DirectoryView, t: &'a Theme) -> Element<'a, Message
     );
     let date = header_cell(
         t,
+        s,
         "Date modified",
         SortKey::Modified,
         state,
@@ -246,6 +259,7 @@ fn header_row<'a>(state: &'a DirectoryView, t: &'a Theme) -> Element<'a, Message
 
 fn header_cell<'a>(
     t: &'a Theme,
+    s: Surface,
     label: &'a str,
     key: SortKey,
     state: &DirectoryView,
@@ -268,7 +282,7 @@ fn header_cell<'a>(
         };
         row![
             name,
-            icon::icon(glyph, t.sizes.icon_row, t.on_paper.secondary.into_iced()),
+            icon::icon(glyph, t.sizes.icon_row, t.on(s).secondary.into_iced()),
         ]
         .spacing(t.sizes.gap_tight)
         .align_y(iced::Center)
@@ -283,15 +297,24 @@ fn header_cell<'a>(
     // hard against the column's left edge. The `container` fills the
     // button's inner width and does the aligning instead.
     button(container(content).width(Fill).align_x(align))
-        .style(style::button::bare(t, Surface::Paper))
+        .style(style::button::bare(t, s))
         .on_press(Message::HeaderClicked(key))
         .width(width)
         .into()
 }
 
+// The `surface` knob pushes this from 7 params to 8, one past clippy's
+// default threshold. `t` and `s` together are "how to draw", the two
+// caches are "what to draw from", and the last three are this row's own
+// coordinates — no two of them are the same kind of thing, so a bundling
+// struct would be indirection for its own sake (CLAUDE.md: "prefer
+// explicit code over clever abstraction"), the same call the sibling
+// `ui::explorer::view` already makes for its own parameter list.
+#[allow(clippy::too_many_arguments)]
 fn entry_row<'a>(
     state: &'a DirectoryView,
     t: &'a Theme,
+    s: Surface,
     mime_db: &'a MimeDb,
     thumb_cache: &'a ThumbCache,
     visible_index: usize,
@@ -306,7 +329,7 @@ fn entry_row<'a>(
     if let Some(rename) = state.rename_state()
         && rename.original == entry.name
     {
-        return renaming_row(t, mime_db, entry, rename);
+        return renaming_row(t, s, mime_db, entry, rename);
     }
 
     let selected = state.selection.is_selected(&entry.name);
@@ -317,11 +340,13 @@ fn entry_row<'a>(
     // split `row_style` below draws the row background/text from); unlike
     // the row's own button chrome it can't also brighten on hover, since
     // an `svg::Style` closure is fixed at build time, not re-evaluated
-    // per `button::Status`.
+    // per `button::Status`. The selected arm is `palette.paper` rather than
+    // a role read on either ground: a selected row is filled terracotta, and
+    // terracotta's foreground is ivory whatever the window is drawn on.
     let icon_color = if selected {
         t.palette.paper
     } else {
-        t.on_paper.primary
+        t.on(s).primary
     };
     // Stage 11: a cached thumbnail (regular files only — see
     // `DirectoryView::thumbnail_candidates`, the only producer of what
@@ -412,12 +437,7 @@ fn entry_row<'a>(
     // outer double-click handler would never see a single press. Doubles
     // are paired app-side instead — see `Message::RowClicked`'s docs.
     button(content)
-        .style(style::button::list_row(
-            t,
-            Surface::Paper,
-            selected,
-            has_cursor,
-        ))
+        .style(style::button::list_row(t, s, selected, has_cursor))
         .width(Fill)
         .height(t.sizes.list_row)
         .padding(0)
@@ -433,6 +453,7 @@ fn entry_row<'a>(
 /// worded inline, never a color change or a modal).
 fn renaming_row<'a>(
     t: &'a Theme,
+    s: Surface,
     mime_db: &'a MimeDb,
     entry: &'a FileEntry,
     rename: &'a super::rename::RenameState,
@@ -440,14 +461,14 @@ fn renaming_row<'a>(
     let icon = icon::icon(
         row_icon(entry, mime_db),
         t.sizes.icon_row,
-        t.on_paper.primary.into_iced(),
+        t.on(s).primary.into_iced(),
     );
 
     let field = text_input("Name", &rename.buffer)
         .id(RENAME_INPUT_ID)
         .on_input(Message::RenameChanged)
         .on_submit(Message::RenameSubmitted)
-        .style(style::text_input::rest(t, Surface::Paper))
+        .style(style::text_input::rest(t, s))
         .font(convert::ui_font(t))
         .size(t.typography.size.body)
         .width(Fill);
@@ -511,16 +532,16 @@ fn renaming_row<'a>(
         .into()
 }
 
-fn empty_state<'a>(t: &'a Theme, message: &'a str) -> Element<'a, Message> {
-    saola_theme::widget::empty_state(t, Surface::Paper, message)
+fn empty_state<'a>(t: &'a Theme, s: Surface, message: &'a str) -> Element<'a, Message> {
+    saola_theme::widget::empty_state(t, s, message)
 }
 
-fn empty_state_owned<'a>(t: &'a Theme, message: String) -> Element<'a, Message> {
+fn empty_state_owned<'a>(t: &'a Theme, s: Surface, message: String) -> Element<'a, Message> {
     container(
         text(message)
             .size(t.typography.size.secondary)
             .font(convert::ui_font_regular(t))
-            .color(t.on_paper.tertiary.into_iced()),
+            .color(t.on(s).tertiary.into_iced()),
     )
     .width(Fill)
     .height(Fill)

@@ -14,8 +14,10 @@
 //!
 //! The window itself is created with `decorations: false, transparent: true`
 //! (see `main.rs`); the compositor-visible shape is whatever we paint, which
-//! is `chrome::window_frame`'s `style::container::window` (`Surface::Paper`)
-//! — 24 px radius, 2 px ink border. The corners outside that radius stay genuinely
+//! is `chrome::window_frame`'s `style::container::window` on whichever
+//! [`Surface`] the app hands us (`files.toml`'s `surface` knob — ivory paper
+//! by default, ink when asked)
+//! — 24 px radius, 2 px border. The corners outside that radius stay genuinely
 //! transparent because the app-level `Style` sets a transparent background
 //! via `saola_theme::chrome::transparent_clear` (the hard-won capture
 //! lesson: iced otherwise clears the surface to ink first, and the corners
@@ -62,29 +64,34 @@ pub fn update<M: Send + 'static>(event: Event) -> Task<M> {
     }
 }
 
-/// The full window: [`chrome::window_frame`]'s paper chrome and
+/// The full window: [`chrome::window_frame`]'s chrome and
 /// `chrome::window_header`'s 46 px header (title, close pill) around `body`,
 /// with [`chrome::with_resize_grips`] stacking the eight invisible
 /// resize regions on top — this window is resizable, so [`Event::ToggleMaximize`]
 /// is always wired (`Some`), unlike saola-capture's fixed-size header, which
 /// passes `None`.
 ///
+/// `s` is the window's ground (`files.toml`'s `surface` knob, resolved on
+/// `App` at startup). Frame and header take it together — they are one
+/// continuous sheet, so they can never disagree.
+///
 /// Generic over the parent's message type: `map` lifts chrome [`Event`]s
 /// into it, so this module never needs to know about app messages.
 pub fn view<'a, M: Clone + 'a>(
     theme: &'a Theme,
+    s: Surface,
     title: &'a str,
     body: Element<'a, M>,
     map: impl Fn(Event) -> M + 'a,
 ) -> Element<'a, M> {
     let header = chrome::window_header(
         theme,
-        Surface::Paper,
+        s,
         title,
         map(Event::Close),
         map(Event::Drag),
         Some(map(Event::ToggleMaximize)),
     );
-    let frame = chrome::window_frame(theme, Surface::Paper, header, body);
+    let frame = chrome::window_frame(theme, s, header, body);
     chrome::with_resize_grips(frame, move |edge| map(Event::Resize(edge)))
 }

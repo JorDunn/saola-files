@@ -29,19 +29,23 @@ pub const PATH_INPUT_ID: &str = "saola-files-breadcrumb-path-input";
 
 /// Renders either the breadcrumb pill trail or (while `state.path_edit()`
 /// is `Some`) the editable field it swaps for.
-pub fn view<'a>(t: &'a Theme, state: &'a DirectoryView) -> Element<'a, dirview::Message> {
+pub fn view<'a>(
+    t: &'a Theme,
+    s: Surface,
+    state: &'a DirectoryView,
+) -> Element<'a, dirview::Message> {
     match state.path_edit() {
-        Some(buffer) => editor(t, buffer),
-        None => pills(t, state.location()),
+        Some(buffer) => editor(t, s, buffer),
+        None => pills(t, s, state.location()),
     }
 }
 
-fn editor<'a>(t: &'a Theme, buffer: &'a str) -> Element<'a, dirview::Message> {
+fn editor<'a>(t: &'a Theme, s: Surface, buffer: &'a str) -> Element<'a, dirview::Message> {
     text_input("scheme://host/path or /a/local/path", buffer)
         .id(PATH_INPUT_ID)
         .on_input(dirview::Message::PathInputChanged)
         .on_submit(dirview::Message::PathSubmitted)
-        .style(style::text_input::rest(t, Surface::Paper))
+        .style(style::text_input::rest(t, s))
         .font(convert::mono_font(t))
         .size(t.typography.size.secondary)
         .width(Fill)
@@ -56,7 +60,7 @@ fn editor<'a>(t: &'a Theme, buffer: &'a str) -> Element<'a, dirview::Message> {
 /// The constructor's contract for the current crumb is `on_press: None`
 /// ("the crumb already standing in should do nothing"), so the last crumb
 /// is no longer clickable — previously it re-navigated to itself.
-fn pills<'a>(t: &'a Theme, location: &'a Location) -> Element<'a, dirview::Message> {
+fn pills<'a>(t: &'a Theme, s: Surface, location: &'a Location) -> Element<'a, dirview::Message> {
     let mut crumbs: Vec<(String, Option<dirview::Message>)> = Vec::new();
 
     let root = Location {
@@ -110,17 +114,17 @@ fn pills<'a>(t: &'a Theme, location: &'a Location) -> Element<'a, dirview::Messa
         ));
     }
 
-    let trail = widget::breadcrumb(t, Surface::Paper, crumbs);
+    let trail = widget::breadcrumb(t, s, crumbs);
 
     // The edit-pencil gives a mouse-only path into `Action::EditPath` —
     // Ctrl+L is the primary trigger, this is parity for anyone not
     // driving the keyboard.
     let edit = widget::icon_button(
         t,
-        Surface::Paper,
+        s,
         Icon::Pencil,
         None,
-        t.on_paper.primary.into_iced(),
+        t.on(s).primary.into_iced(),
         Some(dirview::Message::Action(Action::EditPath)),
     );
 

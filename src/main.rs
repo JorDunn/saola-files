@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use iced::{Element, Fill, Size, Subscription, Task, window};
-use saola_theme::{Theme, convert};
+use saola_theme::{Surface, Theme, convert};
 
 use core::clipboard_interop;
 use core::fs::entry::FileEntry;
@@ -179,6 +179,15 @@ enum Message {
 
 struct App {
     theme: Theme,
+    /// Which ground the window draws on — `files.toml`'s `surface` knob,
+    /// resolved to a `saola_theme::Surface` once in `Self::new` and never
+    /// read back out of `Config`: the same "config knob becomes fixed
+    /// per-surface state" posture `trash_view` and `DirectoryView::new`
+    /// already take for their own config-derived fields. Threaded down
+    /// through `ui::window`/`ui::explorer` to everything anchored to the
+    /// window; the popovers, the undo toast and the four modal dialogs
+    /// never see it (their surfaces are pinned by the style guide).
+    surface: Surface,
     /// The tabs seam (CLAUDE.md: "the app holds `Vec<DirectoryView> +
     /// active`") — Stage 3 only ever shows one.
     views: Vec<ui::dirview::DirectoryView>,
@@ -416,8 +425,18 @@ impl App {
             ui::dirview::DirectoryView::open(fallback, &config)
         };
 
+        // The one-arm translation of the config vocabulary ("paper"/"ink")
+        // into the theme's. `config::WindowSurface` exists precisely so
+        // `config.rs` never has to import saola-theme; this is the single
+        // place the two vocabularies meet.
+        let surface = match config.surface {
+            config::WindowSurface::Paper => Surface::Paper,
+            config::WindowSurface::Ink => Surface::Ink,
+        };
+
         let app = App {
             theme: Theme::saola(),
+            surface,
             views: vec![view],
             active: 0,
             sidebar: ui::sidebar::Sidebar::new(places),
@@ -1415,9 +1434,10 @@ impl App {
         let body: Element<'_, Message> = if self.trash_active {
             let sidebar_view: Element<'_, Message> = self
                 .sidebar
-                .view(t, &core::places::trash_location())
+                .view(t, self.surface, &core::places::trash_location())
                 .map(|m| Message::Explorer(ui::explorer::Message::Sidebar(m)));
-            let trash_column: Element<'_, Message> = self.trash_view.view(t).map(Message::Trash);
+            let trash_column: Element<'_, Message> =
+                self.trash_view.view(t, self.surface).map(Message::Trash);
             // Same region geometry `ui::explorer::view` applies to the
             // ordinary composition (see its comment on `sizes.island_gap`):
             // the sidebar is an inset chrome island either way, so the
@@ -1432,6 +1452,7 @@ impl App {
             match self.views.get(self.active) {
                 Some(view) => ui::explorer::view(
                     t,
+                    self.surface,
                     &self.sidebar,
                     view,
                     &self.mime_db,
@@ -1440,7 +1461,7 @@ impl App {
                     !self.clipboard.is_empty(),
                     Message::Explorer,
                 ),
-                // Degrades to a blank paper surface rather than panicking —
+                // Degrades to a blank window ground rather than panicking —
                 // `active` should always be in range, but the no-panic
                 // rule means "should" isn't good enough.
                 None => iced::widget::Space::new().into(),
@@ -1571,7 +1592,7 @@ impl App {
             None => with_connect,
         };
 
-        ui::window::view(t, "Files", with_conflict, Message::Window)
+        ui::window::view(t, self.surface, "Files", with_conflict, Message::Window)
     }
 }
 
