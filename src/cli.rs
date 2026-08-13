@@ -23,8 +23,14 @@
 //! that has to be *matched* as a flag is inspected as UTF-8.
 //!
 //! Once a running instance exists, a second invocation forwards its target
-//! over D-Bus and exits (Stage 14); until then every invocation opens its
-//! own window.
+//! over D-Bus and exits (Stage 15 — see `integration::dbus`'s module doc
+//! comment for the activation handshake); until then every invocation
+//! opens its own window. `Hash` is derived on [`Cli`] because `App` hands
+//! a clone of it to `Subscription::run_with` as that D-Bus subscription's
+//! identity key (`integration::dbus::subscription`) — it never changes
+//! after startup, so this is just satisfying the bound, not meaningfully
+//! discriminating between different `Cli` values the way `ConnectRequest`'s
+//! by-id `Hash` does.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -38,7 +44,7 @@ pub enum Invocation {
     Help,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct Cli {
     /// The positional PATH or URI to open. Interpretation (directory vs
     /// file vs remote URI) happens against the VFS in Stage 3 — parsing

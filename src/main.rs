@@ -12,6 +12,7 @@
 //! (`src/lib.rs`) — see that file's docs for why the split exists.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -23,7 +24,7 @@ use core::clipboard_interop;
 use core::fs::entry::FileEntry;
 use core::fs::{ops, size, undo};
 use core::vfs::Location;
-use saola_files::{cli, config, core, modules, ui};
+use saola_files::{cli, config, core, integration, modules, ui};
 
 use core::remote;
 
@@ -166,6 +167,19 @@ enum Message {
     /// App/dialog state, the dialog module never sees it directly" split
     /// `Message::OpEvent`/`Message::SizeEvent` already establish.
     ConnectEvent(remote::ConnectEvent),
+    /// A decoded D-Bus call (Stage 15) — `org.freedesktop.FileManager1`/
+    /// `io.saola.Files1`, bridged from `integration::dbus::subscription`
+    /// exactly like every other worker's events above. See `Self::
+    /// handle_dbus_event`.
+    Dbus(integration::dbus::Event),
+    /// `Self::handle_dbus_event`'s `Event::Properties` arm resolved every
+    /// requested location's metadata (Stage 15) — the async half of
+    /// opening the properties dialog for a D-Bus `ShowItemProperties`
+    /// call, mirroring `delete_one`'s per-location `modules::resolve` +
+    /// `Backend::metadata` pattern. A location that failed to resolve is
+    /// simply missing from this list (see `resolve_dbus_properties`'s own
+    /// doc comment) rather than failing the whole call.
+    DbusPropertiesResolved(Vec<(Location, FileEntry)>),
     /// Swallows a click on the conflict dialog's modal scrim — the dialog
     /// must be answered via one of its three buttons, never dismissed by
     /// clicking outside it (there is no sane default resolution to assume).
@@ -342,6 +356,16 @@ struct App {
     /// plumbing (the in-flight `ConnectRequest` and the two prompt reply
     /// channels) that module has no business holding itself.
     pending_connect: Option<PendingConnect>,
+    /// The parsed CLI invocation this process was launched with (Stage
+    /// 15) — kept around (not just consumed at construction, like the
+    /// rest of `Config`/`Cli` — see `Self::new`'s comment on `config`)
+    /// purely to hand a clone to `integration::dbus::subscription` every
+    /// frame as `Subscription::run_with`'s identity key. It never changes
+    /// after `Self::new` sets it: if this process turns out to be a
+    /// *second* instance, that subscription's worker forwards this exact
+    /// value to the already-running primary and exits before `App` ever
+    /// gets to do anything else with it.
+    activation: cli::Cli,
 }
 
 /// See `App::pending_conflict`'s doc comment.
@@ -417,6 +441,13 @@ impl App {
         // "new tab" action that needs the rest of these defaults would
         // resolve `Config::load` again or thread a clone through at that
         // point.
+        //
+        // Cloned *before* the `if let Some(select) = args.select { .. }`
+        // below partially moves `args` apart (Stage 15): `Self::
+        // activation` needs the whole, untouched `Cli` this process was
+        // launched with, for `integration::dbus::subscription` to forward
+        // if this turns out to be a second instance.
+        let activation = args.clone();
         let (view, task) = if let Some(select) = args.select {
             ui::dirview::DirectoryView::open_select(select, fallback, &config)
         } else if let Some(target) = args.target {
@@ -466,6 +497,7 @@ impl App {
             remote: remote::RemoteManager::new(),
             connect_ids: remote::ConnectIdSource::default(),
             pending_connect: None,
+            activation,
         };
         // Stage 14: publish this `App`'s `RemoteManager` pool for
         // `modules::resolve` to reach — see that function's own doc
@@ -562,6 +594,8 @@ impl App {
             Message::SizeEvent(event) => self.handle_size_event(event),
             Message::Connect(inner) => self.handle_connect_message(inner),
             Message::ConnectEvent(event) => self.handle_connect_event(event),
+            Message::Dbus(event) => self.handle_dbus_event(event),
+            Message::DbusPropertiesResolved(items) => self.open_properties(items),
         }
     }
 
@@ -945,6 +979,61 @@ impl App {
                 Task::none()
             }
         }
+    }
+
+    /// `Message::Dbus`'s handling (Stage 15): every `integration::dbus::
+    /// Event` implies "bring the window to front" (see that module's own
+    /// doc comment), so every arm batches `raise_window_task` alongside
+    /// whatever else it does.
+    fn handle_dbus_event(&mut self, event: integration::dbus::Event) -> Task<Message> {
+        use integration::dbus::Event;
+        let raise = raise_window_task();
+        match event {
+            Event::Raise => raise,
+            Event::Browse(location) => Task::batch([raise, self.navigate_active(location)]),
+            Event::Reveal(location) => Task::batch([raise, self.reveal_active(location)]),
+            Event::Properties(locations) => Task::batch([
+                raise,
+                Task::perform(
+                    resolve_dbus_properties(locations),
+                    Message::DbusPropertiesResolved,
+                ),
+            ]),
+        }
+    }
+
+    /// `Event::Reveal`'s handling: lists `location`'s parent and selects
+    /// `location` itself once the listing lands, replaying the exact
+    /// `dirview::Message::TargetResolved` pathway `DirectoryView::
+    /// open_select` already sends through at startup (see that
+    /// constructor's own doc comment) — just built from an *already-
+    /// running* view's location instead of a fresh one, so this reuses
+    /// `DirectoryView::update`'s existing handling rather than adding a
+    /// second way to apply a pending selection.
+    ///
+    /// Degrades to an ordinary browse (`Self::navigate_active`) — no
+    /// selection highlight, just landing in the right place — when there's
+    /// nothing to select (`location` names a bare root, with no filename
+    /// component) or when `location`'s parent is a remote scheme this
+    /// session hasn't connected to yet (routes into the same auto-connect
+    /// dialog `navigate_active` already opens for that case; there's no
+    /// listing to select against until a connection exists).
+    fn reveal_active(&mut self, location: Location) -> Task<Message> {
+        let (Some(parent), Some(name)) = (
+            location.parent(),
+            location.path.file_name().map(|n| n.to_os_string()),
+        ) else {
+            return self.navigate_active(location);
+        };
+        if !parent.is_local() && self.remote.pooled(&parent).is_none() {
+            return self.navigate_active(parent);
+        }
+        directory_task(Task::perform(
+            list_for_reveal(parent, name),
+            |(location, select, result)| {
+                ui::dirview::Message::TargetResolved(location, select, result)
+            },
+        ))
     }
 
     /// `Event::PasteRequested`'s handling: the internal clipboard
@@ -1403,6 +1492,16 @@ impl App {
             .map(|request| ui::dialogs::connect::subscription(request).map(Message::ConnectEvent))
             .unwrap_or_else(Subscription::none);
 
+        // Stage 15: the D-Bus activation surface (`org.freedesktop.
+        // FileManager1`/`io.saola.Files1`) — one for the app's whole
+        // lifetime, the same "keyed by a stable identity, torn down never"
+        // posture `mounts` above already takes, just keyed on `Self::
+        // activation` (which never changes after `Self::new`) rather than
+        // being unconditional. See `integration::dbus::subscription`'s own
+        // doc comment for the full acquire-or-forward handshake this runs.
+        let dbus = Subscription::run_with(self.activation.clone(), integration::dbus::subscription)
+            .map(Message::Dbus);
+
         Subscription::batch([
             keyboard,
             watch,
@@ -1411,6 +1510,7 @@ impl App {
             undo_toast,
             size_sub,
             connect_sub,
+            dbus,
         ])
     }
 
@@ -1609,6 +1709,17 @@ fn directory_message(inner: ui::dirview::Message) -> Message {
     Message::Explorer(ui::explorer::Message::Directory(inner))
 }
 
+/// Brings the app's one window to front — every `integration::dbus::
+/// Event` implies "look at me" (Stage 15: D-Bus activation). `window::
+/// latest()` is the iced 0.14 idiom for "the window this single-window
+/// app happens to have" (CLAUDE.md's "Single-window Tasks" gotcha);
+/// `and_then` only chains into `window::gain_focus` if a window actually
+/// exists, degrading to doing nothing rather than assuming one always
+/// does.
+fn raise_window_task() -> Task<Message> {
+    window::latest().and_then(window::gain_focus)
+}
+
 /// Wraps a `Task<dirview::Message>` into `Task<Message>` — the same
 /// `directory_message` composition, for the `Task::map` call sites in
 /// `App::update`.
@@ -1685,4 +1796,51 @@ async fn delete_one(
         .await
         .map(|()| None)
         .map_err(|err| (location.clone(), err.to_string()))
+}
+
+/// `Self::reveal_active`'s async half (Stage 15): lists `parent` and
+/// pairs the result with `name` in exactly the `(Location, Option<
+/// OsString>, Result<Vec<FileEntry>, VfsError>)` shape `dirview::Message::
+/// TargetResolved` already expects — see that variant's own doc comment.
+/// A `parent` with no backend (an unresolvable scheme, or a remote
+/// authority that raced ahead and dropped its pooled connection between
+/// `reveal_active`'s own check and this call actually running) surfaces as
+/// an ordinary worded `VfsError` the directory view already knows how to
+/// render as its empty state, not a panic or a silently dropped call.
+async fn list_for_reveal(
+    parent: Location,
+    name: OsString,
+) -> (
+    Location,
+    Option<OsString>,
+    Result<Vec<FileEntry>, core::vfs::VfsError>,
+) {
+    let listing = match modules::resolve(&parent) {
+        Some(backend) => backend.list(&parent).await,
+        None => Err(core::vfs::VfsError::Unavailable {
+            message: format!("no backend for scheme \"{}\"", parent.scheme),
+        }),
+    };
+    (parent, Some(name), listing)
+}
+
+/// `Self::handle_dbus_event`'s `Event::Properties` async half (Stage 15):
+/// resolves every requested location's metadata, mirroring `delete_one`'s
+/// per-location `modules::resolve` + `Backend::metadata` pattern. A
+/// location with no backend, or whose `metadata` call fails (removed
+/// between the D-Bus call and this resolving, permission denied, a
+/// dropped remote session), is simply omitted from the result rather than
+/// failing every other item in the same call — `Self::open_properties`
+/// already treats an empty list as a no-op, so a `ShowItemProperties` call
+/// naming only bad paths quietly does nothing instead of erroring.
+async fn resolve_dbus_properties(locations: Vec<Location>) -> Vec<(Location, FileEntry)> {
+    let mut items = Vec::with_capacity(locations.len());
+    for location in locations {
+        if let Some(backend) = modules::resolve(&location)
+            && let Ok(entry) = backend.metadata(&location).await
+        {
+            items.push((location, entry));
+        }
+    }
+    items
 }
