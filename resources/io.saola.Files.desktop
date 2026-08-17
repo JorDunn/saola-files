@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Files
+GenericName=File Manager
+Comment=Browse and manage files
+Exec=saola-files %f
+Icon=io.saola.Files
+Terminal=false
+Categories=System;FileManager;
+MimeType=inode/directory;

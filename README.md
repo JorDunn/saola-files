@@ -56,6 +56,12 @@ immediately — there is never a second window. This is why a second
 `saola-files ~/Downloads` while one is already open just re-navigates the
 existing window instead of opening another.
 
+### Desktop entry
+
+The file `resources/io.saola.Files.desktop` is a desktop entry for Files.
+Install it in `~/.local/share/applications/` for one user, or in
+`/usr/share/applications/` for all users on the system.
+
 ## Configuration
 
 `files.toml`, hand-walked TOML (never `#[derive(Deserialize)]`, so one bad

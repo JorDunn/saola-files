@@ -97,9 +97,13 @@ fn main() -> iced::Result {
         minimizable: false,
         platform_specific: window::settings::PlatformSpecific {
             // iced's own doc on this field: pick an app id matching the
-            // .desktop file's basename — so a future desktop entry must
-            // be named `saola-files.desktop`.
-            application_id: "saola-files".to_string(),
+            // .desktop file's basename and its Icon= key — so the desktop
+            // entry is `resources/io.saola.Files.desktop` and its icon is
+            // named `io.saola.Files`. This is deliberately NOT the D-Bus
+            // name `io.saola.Files1` served in `integration::dbus` — the
+            // trailing `1` there is interface versioning (à la
+            // `org.freedesktop.FileManager1`), not part of this identity.
+            application_id: "io.saola.Files".to_string(),
             ..window::settings::PlatformSpecific::default()
         },
         ..window::Settings::default()

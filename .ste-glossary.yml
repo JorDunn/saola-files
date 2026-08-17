@@ -1,0 +1,21 @@
+name: saola-files
+technical_nouns:
+  - word: file
+    inflections: [files]
+  - word: resources
+  - word: io.saola.Files.desktop
+  - word: io.saola
+  - word: Files.desktop
+  - word: desktop
+  - word: Files
+  - word: applications
+    inflections: [applications/]
+  - word: share
+  - word: user
+    inflections: [users]
+  - word: ~/.local
+  - word: /usr
+technical_verbs:
+  - word: install
+    inflections: [installs, installed, installing]
+preferred_terms: {}
