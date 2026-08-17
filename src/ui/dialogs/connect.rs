@@ -25,7 +25,7 @@
 use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Center, Element, Fill, Length, Subscription};
 use saola_theme::icon::{self, Icon};
-use saola_theme::{ColorExt, Surface, Theme, convert, style, widget};
+use saola_theme::{Chrome, ColorExt, Surface, Theme, convert, style, widget};
 
 use crate::config::SavedServer;
 use crate::core::remote::{AuthStage, ConnectEvent, ConnectRequest, HostKeyPrompt};
@@ -197,7 +197,12 @@ fn entering_body<'a>(t: &'a Theme, connect: &'a Connect) -> Element<'a, Message>
         .spacing(t.sizes.pill_gap)
         .align_y(Center),
     )
-    .style(style::button::emphasis(t, Surface::Paper, true))
+    .style(style::button::emphasis(
+        t,
+        Surface::Paper,
+        Chrome::Window,
+        true,
+    ))
     .padding(t.paddings.dialog_button)
     .on_press(Message::ConnectRequested);
 
@@ -296,7 +301,12 @@ fn host_key_body<'a>(t: &'a Theme, prompt: &'a HostKeyPrompt) -> Element<'a, Mes
             .size(t.typography.size.body)
             .font(convert::ui_font(t)),
     )
-    .style(style::button::emphasis(t, Surface::Paper, true))
+    .style(style::button::emphasis(
+        t,
+        Surface::Paper,
+        Chrome::Window,
+        true,
+    ))
     .padding(t.paddings.dialog_button)
     .on_press(Message::HostKeyDecided(true));
 
@@ -349,7 +359,12 @@ fn auth_body<'a>(t: &'a Theme, stage: &'a AuthStage, input: &'a str) -> Element<
             .size(t.typography.size.body)
             .font(convert::ui_font(t)),
     )
-    .style(style::button::emphasis(t, Surface::Paper, true))
+    .style(style::button::emphasis(
+        t,
+        Surface::Paper,
+        Chrome::Window,
+        true,
+    ))
     .padding(t.paddings.dialog_button)
     .on_press(Message::AuthSubmitted);
 
@@ -400,7 +415,7 @@ fn cancel_labeled_button<'a>(
             .size(t.typography.size.body)
             .font(convert::ui_font(t)),
     )
-    .style(style::button::rest(t, Surface::Paper))
+    .style(style::button::rest(t, Surface::Paper, Chrome::Window))
     .padding(t.paddings.dialog_button)
     .on_press(on_press)
     .into()

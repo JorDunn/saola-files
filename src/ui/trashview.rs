@@ -35,7 +35,7 @@ use std::path::PathBuf;
 use iced::widget::{Space, button, column, container, row, scrollable, text};
 use iced::{Center, Element, Fill, Length, Task};
 use saola_theme::icon::{self, Icon};
-use saola_theme::{ColorExt, Surface, Theme, convert, style};
+use saola_theme::{Chrome, ColorExt, Surface, Theme, convert, style};
 
 use crate::core::fs::entry::EntryKind;
 use crate::core::fs::trash::{self, TrashedItem};
@@ -352,7 +352,7 @@ fn toolbar<'a>(
     .spacing(t.sizes.pill_gap)
     .align_y(Center);
     let mut empty_button = button(empty_content)
-        .style(style::button::rest(t, s))
+        .style(style::button::rest(t, s, Chrome::Window))
         .padding(t.paddings.pill_button);
     if !items_empty {
         empty_button = empty_button.on_press(Message::EmptyRequested);
@@ -392,7 +392,7 @@ fn confirm_strip<'a>(t: &'a Theme, s: Surface) -> Element<'a, Message> {
             .size(t.typography.size.body)
             .font(convert::ui_font(t)),
     )
-    .style(style::button::rest(t, s))
+    .style(style::button::rest(t, s, Chrome::Window))
     .padding(t.paddings.pill_button)
     .on_press(Message::EmptyCancelClicked);
 
@@ -401,7 +401,7 @@ fn confirm_strip<'a>(t: &'a Theme, s: Surface) -> Element<'a, Message> {
             .size(t.typography.size.body)
             .font(convert::ui_font(t)),
     )
-    .style(style::button::rest(t, s))
+    .style(style::button::rest(t, s, Chrome::Window))
     .padding(t.paddings.pill_button)
     .on_press(Message::EmptyConfirmClicked);
 

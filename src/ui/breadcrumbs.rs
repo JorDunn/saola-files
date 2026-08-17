@@ -10,7 +10,7 @@
 
 use std::path::{Component, PathBuf};
 
-use iced::widget::{container, row, scrollable, text_input};
+use iced::widget::{container, row, text_input};
 use iced::{Center, Element, Fill};
 use saola_theme::icon::Icon;
 use saola_theme::{ColorExt, Surface, Theme, convert, style, widget};
@@ -114,27 +114,14 @@ fn pills<'a>(t: &'a Theme, s: Surface, location: &'a Location) -> Element<'a, di
         ));
     }
 
-    // `widget::breadcrumb` (saola-theme, see its own doc comment) builds a
-    // plain `Row` with no width constraint of its own — fine for a shallow
-    // trail, but a deep directory tree's full pill trail can genuinely
-    // exceed the space this toolbar strip has left after the nav
-    // buttons/edit-pencil/view-switcher, and an un-clipped `Row` doesn't
-    // shrink: it just paints over whatever sits to its right. Wrapping it
-    // in a horizontal `scrollable` (the same `style::scrollable::rest`
-    // every other overflowing list in this app already uses — sidebar,
-    // trash, grid, list) turns that overlap into an ordinary scroll
-    // instead. This is a stopgap, not a real fix: the trail doesn't
-    // auto-scroll to the current (rightmost) crumb on navigation, so a
-    // deep path still requires a manual scroll to see where you are. A
-    // real fix (either `widget::breadcrumb` collapsing middle crumbs like
-    // a desktop file picker, or auto-scroll-to-end wired through here)
-    // belongs in saola-theme — see docs/UPSTREAM-THEME-DEBT.md.
-    let trail = scrollable(widget::breadcrumb(t, s, crumbs))
-        .direction(scrollable::Direction::Horizontal(
-            scrollable::Scrollbar::default(),
-        ))
-        .width(Fill)
-        .style(style::scrollable::rest(t, s));
+    // `widget::breadcrumb` (saola-theme 0.13.0) takes the trailing width
+    // budget itself now: it lays the trail out in a horizontal scrollable
+    // anchored to the current (rightmost) crumb, so a deep path no longer
+    // paints over the toolbar controls beside it, and — unlike the earlier
+    // stopgap wrapper this replaced — the trailing crumb is always the one
+    // in view without a manual scroll. This toolbar shares its row with the
+    // nav buttons/edit-pencil/view-switcher, so it passes `Fill`.
+    let trail = widget::breadcrumb(t, s, crumbs, Fill);
 
     // The edit-pencil gives a mouse-only path into `Action::EditPath` —
     // Ctrl+L is the primary trigger, this is parity for anyone not

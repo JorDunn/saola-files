@@ -62,7 +62,15 @@ iced = { version = "0.14", features = ["tokio", "svg", "image"] }
 # the 0.55 em average advance and the floor-of-4 rationale now have one home
 # (and one test suite) instead of a copy per view. Behaviour at today's
 # tokens is identical — `unit_budget(96.0, 12.5)` is still 13.
-saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.12.0", version = "0.12.0" }
+# Bumped 2026-08-17 to v0.13.0 for two breaking changes, both resolving items
+# tracked in docs/UPSTREAM-THEME-DEBT.md: rest-recipe helpers now take a
+# `Chrome` (`Chrome::Shell` for panel/popover-style ink chrome,
+# `Chrome::Window` for controls inside this app's own window) so an
+# unselected control no longer paints a full-opacity ivory pill on an ink
+# window; and `widget::breadcrumb` takes a trailing width budget, replacing
+# this app's stopgap scrollable wrapper (`ui/breadcrumbs.rs`) with the real
+# upstream fix.
+saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.13.0", version = "0.13.0" }
 
 # Config parsing. Surveyed 2026-08-08: the family standard is hand-walked
 # parsing over a real parser's loose document type. capture (the newest

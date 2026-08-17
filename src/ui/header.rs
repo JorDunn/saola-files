@@ -19,7 +19,7 @@
 use iced::widget::{button, container, row, text};
 use iced::{Center, Element, Fill};
 use saola_theme::icon::{self, Icon};
-use saola_theme::{ColorExt, Surface, Theme, convert, style, widget};
+use saola_theme::{Chrome, ColorExt, Surface, Theme, convert, style, widget};
 
 use crate::config::View;
 use crate::core::vfs::Caps;
@@ -131,6 +131,7 @@ fn view_switcher<'a>(t: &'a Theme, s: Surface, mode: View) -> Element<'a, dirvie
     widget::segmented_row_icons(
         t,
         s,
+        Chrome::Window,
         &[(View::List, Icon::List), (View::Grid, Icon::LayoutGrid)],
         &mode,
         |target| {
@@ -168,7 +169,7 @@ fn hidden_toggle<'a>(t: &'a Theme, s: Surface, active: bool) -> Element<'a, dirv
     .spacing(t.sizes.gap_tight)
     .align_y(Center);
     button(content)
-        .style(style::button::emphasis(t, s, active))
+        .style(style::button::emphasis(t, s, Chrome::Window, active))
         .padding(t.paddings.pill_button)
         .on_press(dirview::Message::Action(Action::ToggleHidden))
         .into()

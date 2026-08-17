@@ -12,7 +12,7 @@
 use iced::widget::{button, checkbox, column, container, row, text};
 use iced::{Center, Element, Fill, Length};
 use saola_theme::icon::{self, Icon};
-use saola_theme::{ColorExt, Surface, Theme, convert, style};
+use saola_theme::{Chrome, ColorExt, Surface, Theme, convert, style};
 
 use crate::core::fs::ops::{Conflict, ConflictChoice};
 
@@ -106,7 +106,7 @@ fn choice_button<'a>(
     // wrapping `container` (which does align its child) every label would
     // sit hard against the button's left edge.
     button(container(content).center_x(Fill))
-        .style(style::button::rest(t, Surface::Paper))
+        .style(style::button::rest(t, Surface::Paper, Chrome::Window))
         .padding(t.paddings.dialog_button)
         .width(Fill)
         .on_press(Message::ChoiceSelected(choice))

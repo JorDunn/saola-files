@@ -28,7 +28,7 @@
 
 use iced::widget::{Space, button, column, container, row, text};
 use iced::{Center, Element, Fill, Length, Subscription};
-use saola_theme::{ColorExt, Surface, Theme, convert, style, widget};
+use saola_theme::{Chrome, ColorExt, Surface, Theme, convert, style, widget};
 
 use crate::core::fs::entry::{EntryKind, FileEntry};
 use crate::core::fs::format::{format_system_time, human_size};
@@ -201,7 +201,7 @@ fn footer<'a>(t: &'a Theme) -> Element<'a, Message> {
             .size(t.typography.size.body)
             .font(convert::ui_font(t)),
     )
-    .style(style::button::rest(t, Surface::Paper))
+    .style(style::button::rest(t, Surface::Paper, Chrome::Window))
     .padding(t.paddings.dialog_button)
     .on_press(Message::CloseRequested);
 
