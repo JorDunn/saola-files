@@ -95,6 +95,13 @@ fn main() -> iced::Result {
         decorations: false,
         transparent: true,
         minimizable: false,
+        platform_specific: window::settings::PlatformSpecific {
+            // iced's own doc on this field: pick an app id matching the
+            // .desktop file's basename — so a future desktop entry must
+            // be named `saola-files.desktop`.
+            application_id: "saola-files".to_string(),
+            ..window::settings::PlatformSpecific::default()
+        },
         ..window::Settings::default()
     })
     .window_size(Size::new(1100.0, 720.0))
