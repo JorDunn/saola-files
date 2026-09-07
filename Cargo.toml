@@ -70,7 +70,13 @@ iced = { version = "0.14", features = ["tokio", "svg", "image"] }
 # window; and `widget::breadcrumb` takes a trailing width budget, replacing
 # this app's stopgap scrollable wrapper (`ui/breadcrumbs.rs`) with the real
 # upstream fix.
-saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.13.0", version = "0.13.0" }
+# Bumped again 2026-09-06 to v0.15.0 to track the family's current release.
+# 0.14.0 made the notification card kit alpha-aware — `icon_tile` and
+# `life_rule` now take the card's `alpha` so the tile and countdown rule fade
+# at the same rate as the card they sit on — and gave `toast_alpha` an
+# ease-out entrance. 0.15.0 added `bar_row_container`, `avatar::placeholder`,
+# and their supporting tokens, none of which this app uses yet.
+saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.15.0", version = "0.15.0" }
 
 # Config parsing. Surveyed 2026-08-08: the family standard is hand-walked
 # parsing over a real parser's loose document type. capture (the newest

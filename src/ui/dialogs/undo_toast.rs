@@ -109,6 +109,15 @@ pub fn subscription(has_toast: bool) -> Subscription<Message> {
 /// shell-layer chrome per the style guide, regardless of the paper window
 /// it floats over), so this toast now reads as an ink card rather than a
 /// paper one — a deliberate part of adopting the shared recipe, not a bug.
+///
+/// saola-theme 0.14.0 made the rest of the notification card kit
+/// alpha-aware too: `icon_tile` and `life_rule` now take the same `alpha`
+/// `notification_card` already took, so the tile and the countdown rule
+/// fade out at exactly the rate the card around them does. Before this,
+/// only the card's background/border faded on a timer while the tile and
+/// rule stayed opaque — a toast that was two-thirds faded by eye still had
+/// a solid icon chip and a crisp countdown line, which read as chrome that
+/// outlived the thing it belonged to.
 pub fn view<'a>(t: &'a Theme, toast: &'a Toast, now: Instant) -> Element<'a, Message> {
     let elapsed = now.saturating_duration_since(toast.shown_at);
     let alpha = motion::toast_alpha(t, elapsed);
@@ -119,7 +128,7 @@ pub fn view<'a>(t: &'a Theme, toast: &'a Toast, now: Instant) -> Element<'a, Mes
     let accent_text = t.palette.accent.with_opacity(alpha);
 
     let icon_tile = container(icon::icon(Icon::RotateCcw, t.sizes.icon_row, icon_color))
-        .style(style::notification::icon_tile(t))
+        .style(style::notification::icon_tile(t, alpha))
         .width(t.sizes.icon_tile)
         .height(t.sizes.icon_tile)
         .align_x(Center)
@@ -154,7 +163,7 @@ pub fn view<'a>(t: &'a Theme, toast: &'a Toast, now: Instant) -> Element<'a, Mes
     let life_rule = progress_bar(0.0..=1.0, life)
         .length(Fill)
         .girth(t.sizes.life_rule)
-        .style(style::notification::life_rule(t));
+        .style(style::notification::life_rule(t, alpha));
 
     container(
         iced::widget::column![body, life_rule]
@@ -200,7 +209,11 @@ mod tests {
     // The fade-envelope math itself (`alpha_for`/`fraction`) moved upstream
     // to `saola_theme::motion::toast_alpha`/`fraction` in Stage 12 — that
     // crate's own `motion` test module covers the three-phase envelope now;
-    // this module has no local math left to re-test.
+    // this module has no local math left to re-test. Same story for the
+    // `icon_tile`/`life_rule` alpha wiring added in saola-theme 0.14.0: we
+    // just pass `view()`'s one `alpha` value through to both, so there is
+    // no local fade math here to assert on — only that the value threaded
+    // through is the same `alpha` the card itself uses (see `view` above).
 
     #[test]
     fn subscription_is_none_without_a_toast() {
