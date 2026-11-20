@@ -144,17 +144,20 @@ mod md5 {
         let mut c0: u32 = 0x98badcfe;
         let mut d0: u32 = 0x10325476;
 
-        for chunk in pad(input).chunks_exact(64) {
+        // `as_chunks::<N>()` splits a slice into `&[[u8; N]]` plus a leftover
+        // tail. The chunk size is part of the type, so every `chunk` below is
+        // statically a `&[u8; 64]` and every `word` a `&[u8; 4]` — no length
+        // checks, no indexing, nothing that can panic. `pad` always returns a
+        // multiple of 64 bytes, so the (discarded) tail is empty.
+        let padded = pad(input);
+        let (blocks, _tail) = padded.as_chunks::<64>();
+        for chunk in blocks {
             let mut m = [0u32; 16];
-            for (i, word) in chunk.chunks_exact(4).enumerate() {
-                // `chunks_exact(4)` guarantees each `word` is exactly 4
-                // bytes, so this indexing can't go out of range — but the
-                // no-panic rule still applies to any runtime path, so this
-                // reads via a fixed-size array pattern rather than direct
-                // indexing.
-                if let [b0, b1, b2, b3] = *word {
-                    m[i] = u32::from_le_bytes([b0, b1, b2, b3]);
-                }
+            let (words, _tail) = chunk.as_chunks::<4>();
+            // Pair each of the 16 message words with its little-endian bytes;
+            // `zip` stops at the shorter side, so no index is needed.
+            for (slot, word) in m.iter_mut().zip(words) {
+                *slot = u32::from_le_bytes(*word);
             }
 
             let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);

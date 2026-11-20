@@ -1,2 +1,6 @@
+# Deliberately pinned, not "stable": a floating stable pulled in a newer clippy
+# that turned the lint gate red on 2026-09-06. New lints should arrive only
+# through a reviewed PR that bumps this version. Keep the `toolchain:` inputs
+# in .github/workflows/*.yml in step with it.
 [toolchain]
-channel = "stable"
+channel = "1.100.0"
