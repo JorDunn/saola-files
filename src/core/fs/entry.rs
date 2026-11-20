@@ -49,11 +49,10 @@ pub struct FileEntry {
     /// this struct); a future non-Unix or protocol backend that has no such
     /// concept (or chooses not to expose it) leaves this `None`, and
     /// `ui::dialogs::properties` renders no permissions row rather than
-    /// fabricating one. **Read-only today**: `Caps::SET_PERMISSIONS` is
-    /// still "a future trait method — no backend sets this bit yet" (see
-    /// that flag's own doc comment) — this field exists so the properties
-    /// dialog has real data to *show*, not because anything can change it
-    /// yet.
+    /// fabricating one. **Editing**: backends that set
+    /// `Caps::SET_PERMISSIONS` (local, SFTP) accept `Backend::set_permissions`;
+    /// no UI edits the mode yet, so this field is still only *shown* by the
+    /// properties dialog today.
     pub mode: Option<u32>,
 }
 

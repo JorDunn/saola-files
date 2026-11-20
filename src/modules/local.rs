@@ -1026,6 +1026,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relative_symlink_target_is_stored_verbatim() {
+        let dir = tempdir();
+        let link = dir.join("rel");
+        backend()
+            .symlink(Path::new("../sibling/x"), &Location::local(&link))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            Path::new("../sibling/x")
+        );
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn set_permissions_on_a_symlink_changes_the_target() {
+        let dir = tempdir();
+        let file = dir.join("real");
+        let link = dir.join("link");
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        backend()
+            .set_permissions(&Location::local(&link), 0o600)
+            .await
+            .unwrap();
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o600);
+        cleanup(dir);
+    }
+
+    #[tokio::test]
     async fn symlink_over_an_existing_name_is_already_exists() {
         let dir = tempdir();
         let link = dir.join("taken");

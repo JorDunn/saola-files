@@ -223,10 +223,14 @@ russh-sftp = { version = "2.4", optional = true, default-features = true }
 # 1. **`rustix` (chosen)** — safe wrappers over Linux syscalls; its default
 #    `linux_raw` backend issues the syscall directly, so there is no C
 #    library or build script involved (pure Rust). `fs::statvfs(path)`
-#    returns a plain struct of block counts. Already in the lock file
-#    transitively (1.x via other crates), so no new code is compiled.
-#    `default-features = false` plus `std` + `fs` keeps it to just the
-#    filesystem module.
+#    returns a plain struct of block counts. `statvfs` is not in `std`, so
+#    some crate is needed. rustix 1.x on Linux uses its `linux_raw` backend,
+#    which depends only on `bitflags` and `linux-raw-sys` (no libc, no cc,
+#    no `-sys` crate), so it meets the pure-Rust rule. It was already in the
+#    lock file at 1.1.4 through other crates, so no new crate or version is
+#    compiled. The feature list (`fs`, `std`) documents what this crate
+#    uses; it does not shrink the build, because cargo unifies rustix's
+#    features across every crate that depends on it.
 # 2. **`libc::statvfs`** — works, but needs an `unsafe` block and a
 #    zeroed out-struct, against the no-panic/no-surprise posture here.
 # 3. **`nix`** — safe `statvfs` too, but a larger API surface (and a libc

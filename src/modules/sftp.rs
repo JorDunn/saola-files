@@ -341,15 +341,12 @@ impl Backend for SftpBackend {
             .map_err(|err| sftp_error(location, err))
     }
 
-    /// `target` is stored as written. Argument order follows OpenSSH's
-    /// `sftp-server` (target first, link second), which is the opposite of
-    /// the order the protocol draft names them in; OpenSSH is what nearly
-    /// every server is, and its own `sftp` client sends this order too.
-    /// `russh_sftp`'s `symlink(path, target)` just puts its first argument
-    /// on the wire first, so the target goes first here.
+    /// `target` is stored as written. The argument mapping, and why it
+    /// looks reversed, is documented on [`sftp_symlink_args`].
     async fn symlink(&self, target: &Path, link: &Location) -> Result<(), VfsError> {
+        let (first, second) = sftp_symlink_args(target, link);
         self.sftp
-            .symlink(target.to_string_lossy().into_owned(), wire_path(link))
+            .symlink(first, second)
             .await
             .map_err(|err| sftp_error(link, err))
     }
@@ -421,6 +418,25 @@ fn caps_for(statfs: bool) -> Caps {
     caps
 }
 
+/// The two strings to hand to `SftpSession::symlink(path, target)`, in
+/// that order, so that the target string is the FIRST string on the wire.
+///
+/// Wire fact, read from russh-sftp 2.4.0 source: `symlink(path, target)`
+/// builds `protocol::Symlink { linkpath: path, targetpath: target }`, and
+/// the serializer writes struct fields in declaration order, `linkpath`
+/// then `targetpath`. So the library's parameter named `path` is sent
+/// first, and it is the parameter named `path` that must carry our
+/// *target*. OpenSSH's `sftp-server` (and its own `sftp` client) treat the
+/// first string as the target and the second as the new link, which is the
+/// opposite of the order the protocol draft names them in. Getting this
+/// wrong silently creates a link at the target's path.
+///
+/// Re-verify against the serializer on any russh-sftp upgrade; the test
+/// `symlink_target_string_precedes_the_link_string_on_the_wire` pins it.
+fn sftp_symlink_args(target: &Path, link: &Location) -> (String, String) {
+    (target.to_string_lossy().into_owned(), wire_path(link))
+}
+
 fn unsupported(operation: &str) -> VfsError {
     VfsError::Unsupported {
         operation: operation.to_owned(),
@@ -449,12 +465,14 @@ fn fs_stats_from(raw: &Statvfs) -> FsStats {
 /// Whether the connect-time `fs_info` probe means the server speaks
 /// `statvfs@openssh.com`. `Ok(None)` is the library's "extension not
 /// offered"; a status error (say, permission denied on the probe path)
-/// still proves the server understood the request; a transport error
-/// proves nothing, so it counts as unsupported.
+/// still proves the server understood the request, except
+/// `OP_UNSUPPORTED`, which says it did not; a transport error proves
+/// nothing, so it counts as unsupported.
 fn statfs_probe_supported(probe: &Result<Option<Statvfs>, SftpError>) -> bool {
     match probe {
         Ok(reply) => reply.is_some(),
-        Err(err) => matches!(err, SftpError::Status(_)),
+        Err(SftpError::Status(status)) => status.status_code != StatusCode::OpUnsupported,
+        Err(_) => false,
     }
 }
 
@@ -1117,6 +1135,34 @@ mod tests {
         assert!(!statfs_probe_supported(&Err(SftpError::IO(
             "reset".to_owned()
         ))));
+        let unsupported = SftpError::Status(Status {
+            id: 1,
+            status_code: StatusCode::OpUnsupported,
+            error_message: String::new(),
+            language_tag: String::new(),
+        });
+        assert!(!statfs_probe_supported(&Err(unsupported)));
+    }
+
+    #[test]
+    fn symlink_target_string_precedes_the_link_string_on_the_wire() {
+        use russh_sftp::protocol::Symlink;
+        let (first, second) = sftp_symlink_args(
+            Path::new("the-target"),
+            &Location::parse("sftp://jordan@host/dir/the-link"),
+        );
+        // Built exactly as russh-sftp 2.4.0's `RawSftpSession::symlink`
+        // does: first parameter -> `linkpath`, second -> `targetpath`.
+        let packet = Symlink {
+            id: 7,
+            linkpath: first,
+            targetpath: second,
+        };
+        let bytes = russh_sftp::ser::to_bytes(&packet).unwrap();
+        let find = |needle: &[u8]| bytes.windows(needle.len()).position(|w| w == needle);
+        let target_at = find(b"the-target").unwrap();
+        let link_at = find(b"/dir/the-link").unwrap();
+        assert!(target_at < link_at, "target must be sent first");
     }
 
     #[test]

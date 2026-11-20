@@ -926,14 +926,14 @@ mod tests {
 
     #[tokio::test]
     async fn arc_forwarding_impl_matches_the_inner_backend() {
-        let caps = Caps::SYMLINK | Caps::STATFS;
+        let caps = Caps::SYMLINK | Caps::STATFS | Caps::SET_PERMISSIONS;
         let stats = FsStats {
             total: 9,
             free: 5,
             available: 4,
         };
-        let inner: std::sync::Arc<dyn Backend> =
-            std::sync::Arc::new(FakeBackend::new().with_caps(caps).with_stats(stats));
+        let fake = std::sync::Arc::new(FakeBackend::new().with_caps(caps).with_stats(stats));
+        let inner: std::sync::Arc<dyn Backend> = fake.clone();
         // Calls go through `Backend for Arc<dyn Backend>`, not the inner
         // value directly: a forgotten forwarder would hit the trait's
         // default body and answer `Unsupported` despite the caps.
@@ -944,9 +944,13 @@ mod tests {
             Ok(())
         );
         assert_eq!(Backend::statfs(&inner, &here).await, Ok(stats));
-        assert!(is_unsupported(
-            Backend::set_permissions(&inner, &here, 0o644).await
-        ));
+        // A missed `set_permissions` forwarder would answer `Unsupported`
+        // from the default body and record nothing on the inner fake.
+        assert_eq!(Backend::set_permissions(&inner, &here, 0o644).await, Ok(()));
+        assert!(fake.calls().contains(&FakeCall::SetPermissions {
+            location: here,
+            mode: 0o644,
+        }));
     }
 
     #[test]
