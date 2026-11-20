@@ -41,6 +41,16 @@ const INITIAL_ROWS: usize = 64;
 const SIZE_COLUMN: f32 = 84.0;
 const DATE_COLUMN: f32 = 168.0;
 
+/// The clear space between the right-aligned Size values and the
+/// left-aligned Date values that follow them. It is carved out of the
+/// *inside* of the fixed `SIZE_COLUMN` (a right inset on the cell), so the
+/// column widths, and with them `name_unit_budget`, stay exactly as they
+/// were. Header cells and row cells both take it from here, which is what
+/// keeps their text edges on the same x positions.
+fn size_cell_inset(pill_gap: f32) -> f32 {
+    pill_gap
+}
+
 /// How many *width units* of filename fit in the name column at a given
 /// list width — the list's analogue of the grid's fixed-tile budget, except
 /// that here the column is `Fill`, so the number has to come from a real
@@ -305,7 +315,21 @@ fn header_cell<'a>(
     // cell with an explicit column width would always render its label
     // hard against the column's left edge. The `container` fills the
     // button's inner width and does the aligning instead.
+    //
+    // Horizontal padding is explicit (a right inset on the right-aligned Size column only) rather than
+    // iced's default 10 px each side: a row's cells have no such padding,
+    // and the header has to put its text where the row puts its values.
     button(container(content).width(Fill).align_x(align))
+        .padding(iced::Padding {
+            top: t.sizes.gap_tight,
+            right: if align == iced::alignment::Horizontal::Right {
+                size_cell_inset(t.sizes.pill_gap)
+            } else {
+                0.0
+            },
+            bottom: t.sizes.gap_tight,
+            left: 0.0,
+        })
         .style(style::button::bare(t, s))
         .on_press(Message::HeaderClicked(key))
         .width(width)
@@ -432,6 +456,10 @@ fn entry_row<'a>(
         container(name_row).width(Fill),
         container(size)
             .width(Length::Fixed(SIZE_COLUMN))
+            .padding(iced::Padding {
+                right: size_cell_inset(t.sizes.pill_gap),
+                ..iced::Padding::ZERO
+            })
             .align_x(iced::alignment::Horizontal::Right),
         container(date).width(Length::Fixed(DATE_COLUMN)),
     ]
@@ -526,6 +554,10 @@ fn renaming_row<'a>(
         container(name_row).width(Fill),
         container(size)
             .width(Length::Fixed(SIZE_COLUMN))
+            .padding(iced::Padding {
+                right: size_cell_inset(t.sizes.pill_gap),
+                ..iced::Padding::ZERO
+            })
             .align_x(iced::alignment::Horizontal::Right),
         container(trailing).width(Length::Fixed(DATE_COLUMN)),
     ]
@@ -599,6 +631,20 @@ mod tests {
         // 574 / (13.5 × 0.55) = 77.3, floored to 77 — the value pinned
         // upstream in saola-theme 0.11.0's own tests, so the two agree.
         assert_eq!(budget(866.0), 77);
+    }
+
+    #[test]
+    fn size_inset_leaves_room_for_the_widest_size_and_a_gap() {
+        // The inset lives inside the fixed column, so it must be a real,
+        // non-zero gap (the bug was 0) and must not eat the column: the
+        // widest `human_size` string ("1023.9 KB", 9 chars) at the mono
+        // face's ~0.6 em advance and 12.5 px has to still fit.
+        let gap = size_cell_inset(8.0);
+        assert!(gap > 0.0);
+        assert!(SIZE_COLUMN - gap >= 9.0 * 0.6 * 12.5);
+        // Still a function of the token, so a theme change moves header and
+        // rows together.
+        assert!(size_cell_inset(12.0) > size_cell_inset(8.0));
     }
 
     #[test]
