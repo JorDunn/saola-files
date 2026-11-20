@@ -114,6 +114,18 @@ pub fn used_fraction(stats: &FsStats) -> Option<f32> {
     Some((used as f64 / denominator as f64) as f32)
 }
 
+/// Width of the capacity meter. The theme's meter fills whatever width it is
+/// given, so the bar must bound it.
+///
+/// PENDING TOKEN: this is a size derived from an unrelated token
+/// (`menu_width / 3.0`), not a real one. saola-theme#45 ("Token: width for
+/// the inline capacity meter") asks for the proper token. When that request
+/// closes, bump the saola-theme pin to the release that ships it and replace
+/// this function's body with the token.
+fn meter_width(t: &Theme) -> f32 {
+    t.sizes.menu_width / 3.0
+}
+
 /// The bar. `start` is the left text (from [`start_text`] or
 /// [`trash_text`]); `free` is the right side, `None` to omit it.
 ///
@@ -128,12 +140,8 @@ pub fn view<'a, M: 'a>(
     let end: Element<'a, M> = match free.and_then(|stats| used_fraction(stats).map(|f| (stats, f)))
     {
         Some((stats, fraction)) => {
-            // The theme's meter fills whatever width it is given, so it
-            // needs a bounded container. There is no meter-width token yet
-            // (a gap reported on the PR); a third of a menu's width keeps
-            // it a short rule beside the readout using an existing token.
             let meter = container(widget::capacity_meter(t, s, fraction))
-                .width(Length::Fixed(t.sizes.menu_width / 3.0));
+                .width(Length::Fixed(meter_width(t)));
             row![meter, widget::text::meta(t, s, free_text(stats))]
                 .spacing(t.sizes.pill_gap)
                 .align_y(Alignment::Center)

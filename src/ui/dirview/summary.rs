@@ -21,6 +21,7 @@ use std::collections::HashSet;
 use std::ffi::OsString;
 
 use crate::core::fs::entry::{EntryKind, FileEntry};
+use crate::core::vfs::Location;
 
 use super::Message;
 
@@ -56,13 +57,19 @@ impl SelectionTotals {
         }
     }
 
-    /// One pass over `entries`, counting those whose name is in `selected`.
-    pub fn from_entries(entries: &[FileEntry], selected: &HashSet<&OsString>) -> Self {
+    /// One pass over `rows`, counting those whose name is in `selected`.
+    /// The caller passes only the rows on screen: a name can stay selected
+    /// while the hidden filter holds its row back, and the bar must agree
+    /// with the "of N" it prints (`N` is the visible count).
+    pub fn from_entries<'a>(
+        rows: impl Iterator<Item = &'a FileEntry>,
+        selected: &HashSet<&OsString>,
+    ) -> Self {
         let mut totals = Self::default();
         if selected.is_empty() {
             return totals;
         }
-        for entry in entries.iter().filter(|e| selected.contains(&e.name)) {
+        for entry in rows.filter(|e| selected.contains(&e.name)) {
             totals.add(entry);
         }
         totals
@@ -102,6 +109,19 @@ pub struct Cache {
     /// Bumped whenever a listing or watch batch lands. The app compares it
     /// before and after `update` to know a free-space refresh is due.
     refresh_epoch: u64,
+    /// Set by `recompute_visible`: the set of rows on screen changed (a
+    /// listing, a sort, the hidden toggle), so `totals` must be rebuilt.
+    visible_changed: bool,
+    /// The location a listing last succeeded for. While a reload of that
+    /// same folder is in flight the bar keeps its counts instead of
+    /// blanking to "Loading…".
+    listed_at: Option<Location>,
+}
+
+impl Cache {
+    pub(super) fn mark_visible_changed(&mut self) {
+        self.visible_changed = true;
+    }
 }
 
 /// Messages after which the free space may have changed: a listing landed
@@ -133,17 +153,32 @@ impl super::DirectoryView {
         if refresh_signal {
             self.summary.refresh_epoch = self.summary.refresh_epoch.wrapping_add(1);
         }
+        // Remember which folder has a listing on screen (see `listed_at`).
+        if self.error.is_some() {
+            self.summary.listed_at = None;
+        } else if self.listed && self.summary.listed_at.as_ref() != Some(&self.location) {
+            self.summary.listed_at = Some(self.location.clone());
+        }
         let revision = self.selection.revision();
-        if entries_may_have_changed || revision != self.summary.seen_revision {
+        if entries_may_have_changed
+            || self.summary.visible_changed
+            || revision != self.summary.seen_revision
+        {
             let selected: HashSet<&OsString> = self.selection.selected_names().collect();
-            self.summary.totals = SelectionTotals::from_entries(&self.entries, &selected);
+            let rows = self.visible.iter().filter_map(|&i| self.entries.get(i));
+            self.summary.totals = SelectionTotals::from_entries(rows, &selected);
             self.summary.seen_revision = revision;
+            self.summary.visible_changed = false;
         }
     }
 
     /// The bar's left-hand facts for this view. O(1): everything is cached.
     pub fn summary(&self) -> ViewSummary {
-        let phase = if self.loading {
+        // "Loading…" only when there is nothing for this folder to show yet
+        // (first load, navigation); a reload of the folder already listed
+        // keeps its counts until the new listing lands.
+        let has_listing = self.summary.listed_at.as_ref() == Some(&self.location);
+        let phase = if self.loading && !has_listing {
             Phase::Loading
         } else if self.error.is_some() {
             Phase::Failed
@@ -176,14 +211,14 @@ mod tests {
 
     #[test]
     fn totals_sum_files_and_count_folders_without_sizing_them() {
-        let entries = vec![sized("a", 100), sized("b", 50), dir("d")];
+        let entries = [sized("a", 100), sized("b", 50), dir("d")];
         let (a, b, d) = (
             OsString::from("a"),
             OsString::from("b"),
             OsString::from("d"),
         );
         let selected: HashSet<&OsString> = [&a, &b, &d].into_iter().collect();
-        let totals = SelectionTotals::from_entries(&entries, &selected);
+        let totals = SelectionTotals::from_entries(entries.iter(), &selected);
         assert_eq!(
             totals,
             SelectionTotals {
@@ -197,11 +232,11 @@ mod tests {
 
     #[test]
     fn a_selected_name_that_no_longer_exists_is_not_counted() {
-        let entries = vec![sized("a", 100)];
+        let entries = [sized("a", 100)];
         let (a, gone) = (OsString::from("a"), OsString::from("gone"));
         let selected: HashSet<&OsString> = [&a, &gone].into_iter().collect();
         assert_eq!(
-            SelectionTotals::from_entries(&entries, &selected).count(),
+            SelectionTotals::from_entries(entries.iter(), &selected).count(),
             1
         );
     }
@@ -256,8 +291,9 @@ mod tests {
         assert_eq!((summary.visible, summary.hidden), (1, 2));
         assert_eq!(summary.phase, Phase::Listed);
 
+        // A reload of an already-listed folder keeps its counts.
         view.loading = true;
-        assert_eq!(view.summary().phase, Phase::Loading);
+        assert_eq!(view.summary().phase, Phase::Listed);
         view.loading = false;
         view.error = Some(crate::core::vfs::VfsError::Other {
             message: "x".into(),
@@ -273,5 +309,43 @@ mod tests {
         assert_eq!(view.refresh_epoch(), before, "a click is not a signal");
         let _ = view.update(Message::Listed(Location::local("/home"), Ok(vec![])));
         assert_ne!(view.refresh_epoch(), before, "a listing is");
+    }
+
+    #[test]
+    fn rows_hidden_by_the_filter_are_not_counted_or_summed() {
+        use crate::keymap::Action;
+        let mut view = listed_view(vec![
+            sized("a", 1),
+            sized("b", 2),
+            sized("c", 4),
+            sized(".h1", 100),
+            sized(".h2", 200),
+        ]);
+        let _ = view.update(Message::Action(Action::ToggleHidden)); // show
+        let _ = view.update(Message::Action(Action::SelectAll));
+        assert_eq!(view.summary().selection.count(), 5);
+        assert_eq!(view.summary().selection.bytes, 307);
+
+        // Hide again: the dotfiles stay selected, but the bar must read
+        // "3 of 3", not "5 of 3", and sum only what is on screen.
+        let _ = view.update(Message::Action(Action::ToggleHidden));
+        let summary = view.summary();
+        assert_eq!(summary.visible, 3);
+        assert_eq!(summary.selection.count(), 3);
+        assert_eq!(summary.selection.bytes, 7);
+    }
+
+    #[test]
+    fn a_reload_of_the_shown_folder_keeps_counts_but_a_first_load_does_not() {
+        let mut view = listed_view(vec![file("a"), file("b")]);
+        // F5 on the folder already shown.
+        view.loading = true;
+        assert_eq!(view.summary().phase, Phase::Listed);
+        assert_eq!(view.summary().visible, 2);
+        view.loading = false;
+
+        // Navigation: a different folder with nothing listed yet.
+        let _ = view.navigate(Location::local("/elsewhere"));
+        assert_eq!(view.summary().phase, Phase::Loading);
     }
 }
