@@ -50,7 +50,7 @@ pub enum Message {
     /// The toast's own "Undo" button — the mouse equivalent of Ctrl+Z,
     /// same "one behavior, two input paths" posture every other keymap
     /// `Action` already has a mouse equivalent through
-    /// (`ui::dirview::Message::MenuCopyRequested` and friends).
+    /// (`ui::dirview::menu::Message::CopyRequested` and friends).
     UndoClicked,
 }
 

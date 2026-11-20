@@ -157,6 +157,7 @@ pub struct Config {
     pub confirm_empty_trash: bool,
     pub actions: Vec<CustomAction>,
     pub servers: Vec<SavedServer>,
+    // --- features (alphabetical) ---
 }
 
 impl Default for Config {
@@ -173,6 +174,7 @@ impl Default for Config {
             confirm_empty_trash: true,
             actions: Vec::new(),
             servers: Vec::new(),
+            // --- features (alphabetical) ---
         }
     }
 }
@@ -230,6 +232,11 @@ impl Config {
     /// Parse a `files.toml` document. Returns `Err` **only** for invalid
     /// TOML; every lesser problem warns and defaults per knob. This is the
     /// function the unit tests exercise directly.
+    ///
+    /// A feature's knobs are read by its own `read_<feature>(&Table)`
+    /// function (like `read_actions`/`read_servers` below), which warns
+    /// about its own bad values; this function only calls it, one line
+    /// under the marker, and stores the result in one field.
     pub fn parse(contents: &str) -> Result<Self, ConfigError> {
         let body: Table = contents.parse().map_err(ConfigError)?;
         let defaults = Self::default();
@@ -257,6 +264,7 @@ impl Config {
 
         let actions = read_actions(&body);
         let servers = read_servers(&body);
+        // --- features (alphabetical) ---
 
         Ok(Config {
             terminal,
@@ -270,6 +278,7 @@ impl Config {
             confirm_empty_trash,
             actions,
             servers,
+            // --- features (alphabetical) ---
         })
     }
 }

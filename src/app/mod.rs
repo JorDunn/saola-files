@@ -28,13 +28,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use iced::Task;
+use iced::{Task, keyboard};
 use saola_theme::{Surface, Theme};
 
 use core::fs::entry::FileEntry;
 use core::fs::{ops, size, undo};
 use core::vfs::Location;
+use saola_files::keymap::AppAction;
 use saola_files::{cli, config, core, integration, ui};
+use ui::explorer::{ViewId, ViewIdSource};
 
 use core::remote;
 
@@ -47,6 +49,10 @@ use thumbs::{THUMB_LRU_CAPACITY, THUMB_MAX_CONCURRENT};
 pub(crate) enum Message {
     Window(ui::window::Event),
     Explorer(ui::explorer::Message),
+    /// A raw keyboard event from `iced::keyboard::listen`. Belongs to the
+    /// app, not to a view: `App::update` hands it to the focused view
+    /// (`App::focused`), which resolves it through `keymap.rs`.
+    Keyboard(keyboard::Event),
     /// Stage 8: an event off the active op's progress stream
     /// (`ui::dialogs::progress::subscription`).
     OpEvent(ops::OpEvent),
@@ -131,6 +137,7 @@ pub(crate) enum Message {
     /// has (`ui::menus`'s popover scrim is the same trick, there closing
     /// the menu instead of doing nothing).
     Noop,
+    // --- features (alphabetical) ---
 }
 
 pub(crate) struct App {
@@ -144,13 +151,22 @@ pub(crate) struct App {
     /// window; the popovers, the undo toast and the four modal dialogs
     /// never see it (their surfaces are pinned by the style guide).
     surface: Surface,
-    /// The tabs seam (CLAUDE.md: "the app holds `Vec<DirectoryView> +
-    /// active`") — Stage 3 only ever shows one.
-    views: Vec<ui::dirview::DirectoryView>,
-    active: usize,
+    /// Every open directory view, each paired with its id (the tabs
+    /// seam). The UI shows only the focused one for now. Looked up by id
+    /// (`ui::explorer::find`/`find_mut`), never by position — see
+    /// `ui::explorer`'s module docs, "View ids".
+    views: Vec<(ViewId, ui::dirview::DirectoryView)>,
+    /// The view the window shows and keyboard input goes to.
+    focused: ViewId,
+    /// Mints a fresh [`ViewId`] for every view opened; ids are never
+    /// reused. Only `Self::new` draws from it so far (the first view's id
+    /// is taken before `App` exists), so nothing reads the field yet; the
+    /// tabs and split-pane features will, when they open more views.
+    #[allow(dead_code)]
+    view_ids: ViewIdSource,
     /// The places sidebar (Stage 7) — its own self-contained state
     /// (`core::places::Place`s built once at startup, `core::udisks::
-    /// Mount`s updated live), composed beside `views`/`active` by
+    /// Mount`s updated live), composed beside `views`/`focused` by
     /// `ui::explorer::view` rather than folded into the tabs seam: unlike
     /// a `DirectoryView`, there is exactly one sidebar for the whole app,
     /// not one per tab.
@@ -205,7 +221,7 @@ pub(crate) struct App {
     /// the ordinary explorer body — set by `navigate_active` the moment
     /// the sidebar's Trash place (`core::places::trash_location()`) is
     /// clicked, cleared the moment any other place/mount is. `views`/
-    /// `active` (the tabs seam) are untouched either way: switching into
+    /// `focused` (the tabs seam) are untouched either way: switching into
     /// Trash doesn't navigate the hidden `DirectoryView` anywhere, it's
     /// still pointed at whatever it was showing before, and switching back
     /// out shows exactly that again.
@@ -308,6 +324,7 @@ pub(crate) struct App {
     /// value to the already-running primary and exits before `App` ever
     /// gets to do anything else with it.
     activation: cli::Cli,
+    // --- features (alphabetical) ---
 }
 
 impl App {
@@ -364,11 +381,15 @@ impl App {
             config::WindowSurface::Ink => Surface::Ink,
         };
 
+        let mut view_ids = ViewIdSource::default();
+        let view_id = view_ids.alloc();
+
         let app = App {
             theme: Theme::saola(),
             surface,
-            views: vec![view],
-            active: 0,
+            views: vec![(view_id, view)],
+            focused: view_id,
+            view_ids,
             sidebar: ui::sidebar::Sidebar::new(places),
             mime_db: core::mime::MimeDb::new(),
             apps_db: core::apps::AppsDb::load(),
@@ -397,16 +418,14 @@ impl App {
             connect_ids: remote::ConnectIdSource::default(),
             pending_connect: None,
             activation,
+            // --- features (alphabetical) ---
         };
         // Stage 14: publish this `App`'s `RemoteManager` pool for
         // `modules::resolve` to reach — see that function's own doc
         // comment and `core::remote`'s module docs for why this is safe
         // (single-instance app) and why it happens exactly once, here.
         app.remote.install_global();
-        (
-            app,
-            task.map(|m| Message::Explorer(ui::explorer::Message::Directory(m))),
-        )
+        (app, directory_task(view_id, task))
     }
 
     pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
@@ -423,16 +442,11 @@ impl App {
                     None => Task::none(),
                 }
             }
-            Message::Explorer(ui::explorer::Message::Directory(inner)) => {
-                let Some(view) = self.views.get_mut(self.active) else {
-                    return Task::none();
-                };
-                let (task, event) = view.update(inner);
-                let mut tasks = vec![directory_task(task)];
-                if let Some(event) = event {
-                    tasks.push(self.handle_directory_event(event));
-                }
-                Task::batch(tasks)
+            Message::Explorer(ui::explorer::Message::Directory(id, inner)) => {
+                self.update_view(id, inner)
+            }
+            Message::Keyboard(event) => {
+                self.update_view(self.focused, ui::dirview::Message::Keyboard(event))
             }
             Message::OpEvent(event) => self.handle_op_event(event),
             Message::Progress(ui::dialogs::progress::Message::CancelRequested) => {
@@ -485,6 +499,41 @@ impl App {
             Message::ConnectEvent(event) => self.handle_connect_event(event),
             Message::Dbus(event) => self.handle_dbus_event(event),
             Message::DbusPropertiesResolved(items) => self.open_properties(items),
+            // --- features (alphabetical) ---
+        }
+    }
+
+    /// Delivers `message` to the view with id `id` and acts on whatever
+    /// `Event` it bubbles. A view that has since closed is simply not
+    /// found, and the message is dropped — late async results (a listing,
+    /// a rename result) for a closed view are expected, not an error.
+    fn update_view(&mut self, id: ViewId, message: ui::dirview::Message) -> Task<Message> {
+        let Some(view) = ui::explorer::find_mut(&mut self.views, id) else {
+            return Task::none();
+        };
+        let (task, event) = view.update(message);
+        let mut tasks = vec![directory_task(id, task)];
+        if let Some(event) = event {
+            tasks.push(self.handle_directory_event(id, event));
+        }
+        Task::batch(tasks)
+    }
+
+    /// The focused directory view, if it is still open.
+    fn focused_view(&self) -> Option<&ui::dirview::DirectoryView> {
+        ui::explorer::find(&self.views, self.focused)
+    }
+
+    /// Carries out an app-level keymap action (`keymap::Action::App`),
+    /// bubbled up from a view as `dirview::Event::App`.
+    ///
+    /// `AppAction` has no variants yet, so this `match` has no arms: the
+    /// compiler knows no value of the type can exist and accepts the empty
+    /// match as complete. Each feature that adds an `AppAction` variant
+    /// adds its arm here, under the marker.
+    pub(super) fn handle_app_action(&mut self, action: AppAction) -> Task<Message> {
+        match action {
+            // --- features (alphabetical) ---
         }
     }
 
@@ -497,24 +546,21 @@ impl App {
     }
 }
 
-/// `ui::dirview::Message -> Message`, as a bare `fn` — used wherever a
-/// `Subscription`'s own identity depends on the mapper being a plain
-/// function pointer rather than a capturing closure (`ui::dirview::watch`'s
-/// module docs explain why `Subscription::run_with`'s builder has the same
-/// constraint). `Message::Explorer(explorer::Message::Directory(inner))` is
-/// itself already `Fn(dirview::Message) -> Message`-shaped via ordinary
-/// tuple-variant construction, but nested two enums deep it isn't
-/// expressible as a single path the way `Message::Directory` used to be —
-/// this free function is that composition, named once.
-fn directory_message(inner: ui::dirview::Message) -> Message {
-    Message::Explorer(ui::explorer::Message::Directory(inner))
+/// `(ViewId, dirview::Message) -> Message`: the message for view `id`,
+/// nested two enums deep. Takes its two parts as one tuple because that is
+/// the item type `Subscription::with` produces — see `App::subscription`,
+/// which passes this function itself (not a closure) to
+/// `Subscription::map`.
+fn directory_message((id, inner): (ViewId, ui::dirview::Message)) -> Message {
+    Message::Explorer(ui::explorer::Message::Directory(id, inner))
 }
 
-/// Wraps a `Task<dirview::Message>` into `Task<Message>` — the same
-/// `directory_message` composition, for the `Task::map` call sites in
-/// `App::update`.
-fn directory_task(task: Task<ui::dirview::Message>) -> Task<Message> {
-    task.map(directory_message)
+/// Wraps a `Task<dirview::Message>` from view `id` into `Task<Message>`,
+/// so its result comes back addressed to that same view. Unlike
+/// `Subscription::map`, `Task::map` accepts a capturing closure; `move`
+/// copies `id` into it.
+fn directory_task(id: ViewId, task: Task<ui::dirview::Message>) -> Task<Message> {
+    task.map(move |inner| directory_message((id, inner)))
 }
 
 /// `Task<ui::trashview::Message> -> Task<Message>`, the `ui::trashview`

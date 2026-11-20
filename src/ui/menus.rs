@@ -41,6 +41,13 @@
 //! Shown whenever the selection isn't empty, same gate `Copy`/`Cut` already
 //! use.
 //!
+//! **The context menu is a table.** [`CONTEXT_MENU`] lists every fixed
+//! row once, in display order, each with a predicate deciding whether it
+//! shows for the current [`MenuContext`]. Adding an entry is adding one
+//! line there (plus its `dirview::menu::Message` variant and handler).
+//! The config-defined `[[action]]` rows follow the table: there can be any
+//! number of them, so they are appended by `context_menu` itself.
+//!
 //! **Anchoring is simplified too:** a precise "grow from the trigger
 //! button" popover (style guide §6) needs the trigger's on-screen rect,
 //! which iced 0.14's plain `view()` has no way to learn without threading
@@ -60,7 +67,7 @@ use crate::core::fs::entry::{EntryKind, FileEntry};
 use crate::core::mime::MimeDb;
 use crate::core::vfs::Caps;
 
-use super::dirview::{DirectoryView, Message};
+use super::dirview::{DirectoryView, Message, menu};
 
 /// Wraps `content` (the ordinary directory view) with whichever overlay is
 /// currently open, if any — otherwise returns `content` untouched. Called
@@ -92,7 +99,8 @@ fn popover_stack<'a>(
     content: Element<'a, Message>,
     popover: Element<'a, Message>,
 ) -> Element<'a, Message> {
-    let scrim = mouse_area(Space::new().width(Fill).height(Fill)).on_press(Message::CloseMenu);
+    let scrim = mouse_area(Space::new().width(Fill).height(Fill))
+        .on_press(Message::Menu(menu::Message::Close));
     let anchored = container(popover)
         .width(Fill)
         .height(Fill)
@@ -106,6 +114,79 @@ fn popover_stack<'a>(
     stack![content, scrim, anchored].into()
 }
 
+/// What a context-menu row's predicate gets to look at: the facts about
+/// the current selection and app state that decide which rows show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MenuContext {
+    /// How many entries are selected.
+    pub(super) selected: usize,
+    /// Whether the app's clipboard has anything to paste.
+    pub(super) clipboard_has_contents: bool,
+    /// Whether the current location's backend can trash (`Caps::TRASH`).
+    /// Only resolved when something is selected, since only the delete
+    /// rows read it.
+    pub(super) can_trash: bool,
+}
+
+/// One fixed row of the context menu.
+pub(super) struct MenuEntry {
+    pub(super) glyph: Icon,
+    pub(super) label: &'static str,
+    /// Whether this row shows for a given context. A plain function
+    /// pointer (`fn`), not a closure, so the whole table can be a `const`.
+    pub(super) shown: fn(&MenuContext) -> bool,
+    pub(super) message: menu::Message,
+}
+
+fn always(_: &MenuContext) -> bool {
+    true
+}
+
+fn has_selection(ctx: &MenuContext) -> bool {
+    ctx.selected > 0
+}
+
+fn single_selection(ctx: &MenuContext) -> bool {
+    ctx.selected == 1
+}
+
+fn has_clipboard(ctx: &MenuContext) -> bool {
+    ctx.clipboard_has_contents
+}
+
+fn has_selection_and_trash(ctx: &MenuContext) -> bool {
+    has_selection(ctx) && ctx.can_trash
+}
+
+fn has_selection_without_trash(ctx: &MenuContext) -> bool {
+    has_selection(ctx) && !ctx.can_trash
+}
+
+/// The context menu's fixed rows, in display order. "Move to Trash" and
+/// "Delete" are the same action worded per `Caps::TRASH`; their predicates
+/// are mutually exclusive, so exactly one of them shows with a selection.
+#[rustfmt::skip]
+pub(super) const CONTEXT_MENU: &[MenuEntry] = &[
+    MenuEntry { glyph: Icon::ExternalLink,   label: "Open",             shown: has_selection,               message: menu::Message::OpenSelected },
+    MenuEntry { glyph: Icon::Ellipsis,       label: "Open with…",       shown: has_selection,               message: menu::Message::OpenWithRequested },
+    MenuEntry { glyph: Icon::Terminal,       label: "Open in terminal", shown: always,                      message: menu::Message::OpenTerminalRequested },
+    MenuEntry { glyph: Icon::Copy,           label: "Copy",             shown: has_selection,               message: menu::Message::CopyRequested },
+    MenuEntry { glyph: Icon::Scissors,       label: "Cut",              shown: has_selection,               message: menu::Message::CutRequested },
+    MenuEntry { glyph: Icon::ClipboardPaste, label: "Paste",            shown: has_clipboard,               message: menu::Message::PasteRequested },
+    MenuEntry { glyph: Icon::Pencil,         label: "Rename…",          shown: single_selection,            message: menu::Message::RenameRequested },
+    MenuEntry { glyph: Icon::Trash2,         label: "Move to Trash",    shown: has_selection_and_trash,     message: menu::Message::DeleteRequested },
+    MenuEntry { glyph: Icon::Trash2,         label: "Delete",           shown: has_selection_without_trash, message: menu::Message::DeleteRequested },
+    MenuEntry { glyph: Icon::FolderPlus,     label: "New Folder",       shown: always,                      message: menu::Message::NewFolderRequested },
+    MenuEntry { glyph: Icon::FilePlus,       label: "New File",         shown: always,                      message: menu::Message::NewFileRequested },
+    MenuEntry { glyph: Icon::Info,           label: "Properties",       shown: has_selection,               message: menu::Message::PropertiesRequested },
+    // --- features: insert one row at the position it should display ---
+];
+
+/// The table rows that show for `ctx`, in display order.
+pub(super) fn visible_entries(ctx: &MenuContext) -> impl Iterator<Item = &'static MenuEntry> + '_ {
+    CONTEXT_MENU.iter().filter(move |entry| (entry.shown)(ctx))
+}
+
 fn context_menu<'a>(
     t: &'a Theme,
     state: &'a DirectoryView,
@@ -113,90 +194,23 @@ fn context_menu<'a>(
     clipboard_has_contents: bool,
 ) -> Element<'a, Message> {
     let selected = state.selected_entries();
-    let mut items: Vec<Element<'a, Message>> = Vec::new();
+    let ctx = MenuContext {
+        selected: selected.len(),
+        clipboard_has_contents,
+        // `caps()` resolves a backend, so only ask when a row needs it.
+        can_trash: !selected.is_empty() && state.caps().contains(Caps::TRASH),
+    };
 
-    if !selected.is_empty() {
-        items.push(menu_row(
-            t,
-            Icon::ExternalLink,
-            "Open",
-            Message::MenuOpenSelected,
-        ));
-        items.push(menu_row(
-            t,
-            Icon::Ellipsis,
-            "Open with…",
-            Message::MenuOpenWithRequested,
-        ));
-    }
-    items.push(menu_row(
-        t,
-        Icon::Terminal,
-        "Open in terminal",
-        Message::MenuOpenTerminalRequested,
-    ));
-
-    // ── Stage 8: clipboard / rename / new ────────────────────────────────
-    if !selected.is_empty() {
-        items.push(menu_row(t, Icon::Copy, "Copy", Message::MenuCopyRequested));
-        items.push(menu_row(
-            t,
-            Icon::Scissors,
-            "Cut",
-            Message::MenuCutRequested,
-        ));
-    }
-    if clipboard_has_contents {
-        items.push(menu_row(
-            t,
-            Icon::ClipboardPaste,
-            "Paste",
-            Message::MenuPasteRequested,
-        ));
-    }
-    if selected.len() == 1 {
-        items.push(menu_row(
-            t,
-            Icon::Pencil,
-            "Rename…",
-            Message::MenuRenameRequested,
-        ));
-    }
-    // ── Stage 9: delete / trash ──────────────────────────────────────────
-    if !selected.is_empty() {
-        let label = if state.caps().contains(Caps::TRASH) {
-            "Move to Trash"
-        } else {
-            "Delete"
-        };
-        items.push(menu_row(
-            t,
-            Icon::Trash2,
-            label,
-            Message::MenuDeleteRequested,
-        ));
-    }
-    items.push(menu_row(
-        t,
-        Icon::FolderPlus,
-        "New Folder",
-        Message::MenuNewFolderRequested,
-    ));
-    items.push(menu_row(
-        t,
-        Icon::FilePlus,
-        "New File",
-        Message::MenuNewFileRequested,
-    ));
-    // ── Stage 13: properties ─────────────────────────────────────────────
-    if !selected.is_empty() {
-        items.push(menu_row(
-            t,
-            Icon::Info,
-            "Properties",
-            Message::MenuPropertiesRequested,
-        ));
-    }
+    let mut items: Vec<Element<'a, Message>> = visible_entries(&ctx)
+        .map(|entry| {
+            menu_row(
+                t,
+                entry.glyph,
+                entry.label,
+                Message::Menu(entry.message.clone()),
+            )
+        })
+        .collect();
 
     if !selected.is_empty() {
         let scheme = state.location().scheme.clone();
@@ -213,7 +227,7 @@ fn context_menu<'a>(
                     t,
                     Icon::ChevronRight,
                     &action.name,
-                    Message::MenuCustomActionRequested(index),
+                    Message::Menu(menu::Message::CustomActionRequested(index)),
                 ));
             }
         }
@@ -295,7 +309,9 @@ fn open_with_row<'a>(
         Some(glyph),
         &entry.name,
         tint,
-        Some(Message::OpenWithChosen(entry.id.clone())),
+        Some(Message::Menu(menu::Message::OpenWithChosen(
+            entry.id.clone(),
+        ))),
     )
 }
 
@@ -348,6 +364,120 @@ fn mime_pattern_matches(pattern: &str, mimetype: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn labels(selected: usize, clipboard_has_contents: bool, can_trash: bool) -> Vec<&'static str> {
+        let ctx = MenuContext {
+            selected,
+            clipboard_has_contents,
+            can_trash,
+        };
+        visible_entries(&ctx).map(|entry| entry.label).collect()
+    }
+
+    // The expected lists below are the rows the pre-table, imperative
+    // `context_menu` pushed for each case, in its order.
+
+    #[test]
+    fn menu_with_nothing_selected_and_an_empty_clipboard() {
+        assert_eq!(
+            labels(0, false, false),
+            ["Open in terminal", "New Folder", "New File"]
+        );
+    }
+
+    #[test]
+    fn menu_with_nothing_selected_and_a_full_clipboard() {
+        assert_eq!(
+            labels(0, true, false),
+            ["Open in terminal", "Paste", "New Folder", "New File"]
+        );
+    }
+
+    #[test]
+    fn menu_with_one_file_selected_on_a_trash_capable_backend() {
+        assert_eq!(
+            labels(1, false, true),
+            [
+                "Open",
+                "Open with…",
+                "Open in terminal",
+                "Copy",
+                "Cut",
+                "Rename…",
+                "Move to Trash",
+                "New Folder",
+                "New File",
+                "Properties",
+            ]
+        );
+    }
+
+    #[test]
+    fn menu_with_one_file_selected_without_trash_says_delete() {
+        assert_eq!(
+            labels(1, true, false),
+            [
+                "Open",
+                "Open with…",
+                "Open in terminal",
+                "Copy",
+                "Cut",
+                "Paste",
+                "Rename…",
+                "Delete",
+                "New Folder",
+                "New File",
+                "Properties",
+            ]
+        );
+    }
+
+    #[test]
+    fn menu_with_several_selected_has_no_rename() {
+        assert_eq!(
+            labels(3, true, true),
+            [
+                "Open",
+                "Open with…",
+                "Open in terminal",
+                "Copy",
+                "Cut",
+                "Paste",
+                "Move to Trash",
+                "New Folder",
+                "New File",
+                "Properties",
+            ]
+        );
+    }
+
+    #[test]
+    fn every_row_sends_its_own_menu_message() {
+        let ctx = MenuContext {
+            selected: 1,
+            clipboard_has_contents: true,
+            can_trash: true,
+        };
+        let messages: Vec<String> = visible_entries(&ctx)
+            .map(|entry| format!("{:?}", entry.message))
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                "OpenSelected",
+                "OpenWithRequested",
+                "OpenTerminalRequested",
+                "CopyRequested",
+                "CutRequested",
+                "PasteRequested",
+                "RenameRequested",
+                "DeleteRequested",
+                "NewFolderRequested",
+                "NewFileRequested",
+                "PropertiesRequested",
+            ]
+        );
+    }
 
     fn action(mimetypes: &[&str], schemes: &[&str]) -> CustomAction {
         CustomAction {

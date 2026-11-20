@@ -14,7 +14,7 @@ use super::{DirectoryView, Event, Message, ThumbCandidate};
 
 /// Row-height guess used only to decide which entries are "near the
 /// viewport" for thumbnail-request scheduling (Stage 11) — the same
-/// placeholder posture as `PAGE_ROWS` just above: `update()` has no
+/// placeholder posture as `PAGE_ROWS` (in `keys.rs`): `update()` has no
 /// `Theme` to read the real `sizes.list_row`/grid tile height from (only
 /// `view()` does — see `list.rs`/`grid.rs`'s own pixel-exact virtualization
 /// math, which this never touches). Deliberately generous: a miss here

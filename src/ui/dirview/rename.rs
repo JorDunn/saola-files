@@ -313,7 +313,7 @@ impl DirectoryView {
 
 /// What `DirectoryView::create_new` is creating — kept as a tiny local enum
 /// rather than a `bool` so the call sites (`Action::NewFolder`,
-/// `Message::MenuNewFolderRequested`, `Message::MenuNewFileRequested`) read
+/// `menu::Message::NewFolderRequested`, `menu::Message::NewFileRequested`) read
 /// as what they mean, not "true or false".
 #[derive(Debug, Clone, Copy)]
 pub(super) enum NewKind {

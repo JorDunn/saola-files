@@ -61,12 +61,15 @@ impl App {
         if !parent.is_local() && self.remote.pooled(&parent).is_none() {
             return self.navigate_active(parent);
         }
-        directory_task(Task::perform(
-            list_for_reveal(parent, name),
-            |(location, select, result)| {
-                ui::dirview::Message::TargetResolved(location, select, result)
-            },
-        ))
+        directory_task(
+            self.focused,
+            Task::perform(
+                list_for_reveal(parent, name),
+                |(location, select, result)| {
+                    ui::dirview::Message::TargetResolved(location, select, result)
+                },
+            ),
+        )
     }
 }
 

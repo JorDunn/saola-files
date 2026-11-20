@@ -197,7 +197,7 @@ impl App {
     }
 
     /// Pushes `entry` onto the undo stack and (re)seeds the undo toast
-    /// from its label — every push call site in this file goes through
+    /// from its label — every push call site in `src/app/` goes through
     /// this one method rather than touching `undo_stack`/`undo_toast`
     /// separately, keeping `undo_toast`'s "always reflects the current
     /// top of the stack" invariant (see `App::undo_toast`'s own doc

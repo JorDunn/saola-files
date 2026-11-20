@@ -1,6 +1,10 @@
 //! `App::subscription`: every live stream the app listens to (keyboard,
 //! directory watch, udisks mounts, op progress, undo-toast tick, size
 //! count, connect handshake, D-Bus), gated on the state that needs it.
+//!
+//! A feature with its own stream adds a `fn <feature>_subscription(&self)
+//! -> Subscription<Message>` in its own `src/app/<feature>.rs` and one
+//! line calling it in the `batch` at the bottom, under the marker.
 
 use iced::Subscription;
 
@@ -12,7 +16,7 @@ impl App {
     pub(crate) fn subscription(&self) -> Subscription<Message> {
         // Stage 9: while the Trash browser is showing, the hidden
         // background `DirectoryView` must not receive keyboard input at
-        // all — `Message::Keyboard` mutating its (invisible) cursor/
+        // all — `dirview::Message::Keyboard` mutating its (invisible) cursor/
         // selection would be merely odd on its own, but reaching Delete/
         // Shift+Delete through it would silently trash/permanently-delete
         // files in whatever directory the user last browsed, with no
@@ -34,22 +38,28 @@ impl App {
         let keyboard = if self.trash_active || dialog_open {
             Subscription::none()
         } else {
-            iced::keyboard::listen().map(|event| {
-                Message::Explorer(ui::explorer::Message::Directory(
-                    ui::dirview::Message::Keyboard(event),
-                ))
-            })
+            // `App::update` routes `Message::Keyboard` to the focused view.
+            iced::keyboard::listen().map(Message::Keyboard)
         };
 
-        // Stage 5: the active view's own live-update watch, if its backend
-        // has one — `None`/an out-of-range `active` degrades to "no watch
-        // subscription" rather than a panic, same posture as `App::view`'s
-        // own `views.get(self.active)` guard.
-        let watch = self
-            .views
-            .get(self.active)
-            .map(|view| view.subscription().map(directory_message))
-            .unwrap_or_else(Subscription::none);
+        // Stage 5: every open view's own live-update watch (a backend that
+        // can't watch just never produces an event). All views, not only
+        // the focused one: a hidden tab must still see files appear.
+        //
+        // Why `.with(*id)` instead of a closure: `Subscription::map` only
+        // accepts a function that captures nothing (iced checks this at
+        // compile time), because iced identifies a running subscription
+        // partly by its mapper's type, and a captured value would be
+        // invisible to that identity. So `.map(|m| directory_message((id,
+        // m)))` is rejected. `.with(id)` instead folds the id into the
+        // subscription's identity (two views on the same folder get two
+        // separate watches) and turns each `m` into the pair `(id, m)`,
+        // which the plain function `directory_message` can then wrap.
+        let watch = Subscription::batch(
+            self.views
+                .iter()
+                .map(|(id, view)| view.subscription().with(*id).map(directory_message)),
+        );
 
         // Stage 7: the places sidebar's own live udisks feed — one for the
         // app's whole lifetime (`ui::sidebar::Sidebar::subscription`'s doc
@@ -118,6 +128,7 @@ impl App {
             size_sub,
             connect_sub,
             dbus,
+            // --- features (alphabetical) ---
         ])
     }
 }

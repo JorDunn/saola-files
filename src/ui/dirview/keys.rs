@@ -309,6 +309,11 @@ impl DirectoryView {
 
             // ── Stage 13: properties ───────────────────────────────────────
             Action::Properties => (Task::none(), self.properties_event()),
+
+            // App-level commands are not this view's to carry out: pass
+            // them up unchanged for `App` to handle.
+            Action::App(app_action) => (Task::none(), Some(Event::App(app_action))),
+            // --- features (alphabetical) ---
         }
     }
 }
