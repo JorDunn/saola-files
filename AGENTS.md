@@ -40,6 +40,11 @@ niri session can be driven directly; opening a window on screen is fine.
 Never use `slurp` (blocks waiting for a human). Two windows with the same
 app-id means a stale instance survived — kill both and relaunch.
 
+The live check is **serialized**: one niri session, one pointer. Only the
+orchestrator runs it, on `main` after merge — never a parallel task agent.
+Screenshots stay in the local scratchpad; the repo is public, so issues and
+PRs carry worded results only.
+
 ## Architecture
 
 Single binary crate, three layers with a hard import rule: `core/` never
@@ -66,8 +71,22 @@ documented exception).
   worded as such; without `WATCH`, refresh-on-navigate + F5; without
   `LOCAL_PATH`, open = download-to-temp with a read-only caveat.
 
-The approved staged build plan lives with the session task list; stages are
-one coherent PR each, CI green throughout.
+## Task workflow
+
+- **The board is the plan.** Work is GitHub issues on the "Saola" user
+  Project (https://github.com/users/JorDunn/projects/2): epics are
+  milestones with sub-issues, ordering is "blocked by" links. PLAN.md is
+  retired and gitignored — don't recreate it.
+- One task = one issue = one branch `task/<issue>-<slug>` = one PR. Never
+  push to `main`; PRs land by squash merge only.
+- The PR title is the Conventional Commit: it becomes the squash commit and
+  the changelog line, and CI's `pr-title` check enforces it. The body has
+  `Closes #<n>` and the notes the next task needs; a `BREAKING CHANGE:`
+  footer goes in the PR body.
+- Never hand-edit the version or CHANGELOG.md (release-plz owns both).
+- The toolchain is pinned: `rust-toolchain.toml` and the workflows'
+  `toolchain:` inputs move together, by PR.
+- Dispatching, review and merge mechanics: `docs/DISPATCH.md`.
 
 ## Design language (binding)
 
@@ -87,12 +106,17 @@ one coherent PR each, CI green throughout.
   threaded from `App` through every view. **No minimise button** — niri has
   no taskbar.
 - Icons are Lucide outline, 24×24 viewBox, `stroke-width="2.75"` baked into
-  the asset, tinted at draw time. Copy the panel's `src/icons.rs` pattern
-  (Icon enum + `include_bytes!` + stroke-width asset tests).
+  the asset, tinted at draw time. The assets and the `Icon` enum live in
+  `saola_theme::icon`; `src/icons.rs` here only maps domain types onto it.
 - Tabular numerals on size and date columns. Only sanctioned animations:
   hover, popover, notification, breathe. No spinners.
 - `docs/SAOLA-STYLE-GUIDE.md` is a verbatim copy of the spec and wins over
   any implementation; run every new surface through its §11 checklist.
+- **One planned exception, pending on saola-theme:** the embedded terminal's
+  viewport may render a full ANSI palette once saola-theme ships the
+  style-guide exception and its tokens. Until that release exists it is not
+  available — don't hardcode a palette. All chrome around the viewport stays
+  three-colour.
 
 ## Conventions
 
@@ -133,9 +157,36 @@ one coherent PR each, CI green throughout.
   clever abstraction.
 - **Dependencies:** every non-trivial addition carries a dated survey
   comment in Cargo.toml (alternatives considered, why they lost).
+- **Pure Rust only (binding):** no C-library bindings — protocols, codecs
+  and decoders alike. Where no suitable crate exists, it is written in its
+  own repository outside the Saola project; this repo carries a brief under
+  `docs/external-crates/` and a `blocked:external` task, and the feature
+  waits for the crate.
 - **Releases:** Conventional Commits; release-plz opens the release PR;
   never hand-edit the version or CHANGELOG.md. Tags are
   `saola-files-vX.Y.Z`.
+
+## Merge-safe conventions
+
+Several agents work in parallel, so shared choke points are laid out to
+merge cleanly. **These take effect with the hot-file split** (the
+`main.rs` / `dirview/mod.rs` refactor), which has **not landed yet** — until
+it does, the code does not look like this; follow the existing layout.
+
+- One enum variant, struct field, initialiser line and `update` arm per
+  feature, each placed under an alphabetical marker comment — never
+  reorder or regroup neighbours.
+- Each feature exposes its own `subscription()` and `layer()`; the app
+  batches them, one line per feature.
+- One `read_<feature>(&Table)` per config feature; the top-level config
+  reader only calls them.
+- Module lists (`mod` / `pub mod`) and Cargo dependencies alphabetical, one
+  per line.
+- Context-menu entries are an ordered table, one line per entry.
+
+Already true today, independent of the split: every new icon glyph is a
+saola-theme release (`src/icons.rs` only maps onto `saola_theme::icon::Icon`).
+Request it there; never inline an asset.
 
 ## iced 0.14 gotchas (verified — don't re-derive)
 
@@ -161,7 +212,11 @@ The full list lives in saola-theme's CLAUDE.md; the ones that bite here:
 
 - No xdg-desktop-portal implementation here — a future saola-portal owns
   that; this repo only keeps `ui/explorer.rs` embeddable.
-- No notifications daemon, no network-configuration UI, no archive
-  extraction (future `archive://` backend), no drag-and-drop in v1.
+- No notifications daemon. Calling `org.freedesktop.Notifications` as a
+  client is allowed.
+- No network-configuration UI.
+- Archives arrive as an `archive://` backend module, like any protocol.
+- The app itself never elevates. An admin helper, when built, is a separate
+  polkit-authorised binary.
 - Never run `sudo`; never edit Jordan's niri or user config — print the
   commands and wait.
