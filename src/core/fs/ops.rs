@@ -44,6 +44,25 @@
 //! engine just tries the fast path and accepts whatever the copy path
 //! would have done anyway if it doesn't work out.
 //!
+//! **Deletes and trashing** ([`OpKind::Trash`], [`OpKind::Delete`]) run
+//! through the same engine, so they get the same progress strip, Cancel and
+//! failure reporting as copy and move. They have no destination: the
+//! request is built with [`OpRequest::removal`]. See `execute_removal`.
+//!
+//! - *Trash* moves each top-level source into the freedesktop trash with one
+//!   `rename`, announces it with [`OpEvent::Trashed`] (the app turns that
+//!   into the same undo entry the old fire-and-forget path pushed), and
+//!   counts one item per source.
+//! - *Delete* walks the tree depth-first, removing children before their
+//!   directory, one `Backend::remove` per item. That is what makes a
+//!   non-empty remote folder deletable (SFTP `rmdir` refuses a directory
+//!   with contents), and it is why progress can count items. A symlink is
+//!   an item: it is unlinked, never followed, so a link to a directory
+//!   deletes the link and leaves the directory alone.
+//! - A failing item is recorded and the walk carries on; a directory whose
+//!   contents did not all go is left alone (its error is already recorded).
+//!   Cancel stops before the next item and reports nothing as failed.
+//!
 //! **What this stage does not build.** No queue of multiple concurrent
 //! ops — `ui::dialogs::progress`'s "ops strip" shows at most one running
 //! op, and `App` tracks `active_op: Option<OpRequest>`. No undo — Stage 10
@@ -55,6 +74,7 @@
 //! authoritative.
 
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -64,6 +84,7 @@ use futures::sink::SinkExt;
 use futures::stream::{BoxStream, StreamExt};
 
 use crate::core::fs::entry::EntryKind;
+use crate::core::fs::trash::{self, TrashId};
 use crate::core::vfs::{Backend, Caps, Location, VfsError};
 
 /// Chunk size the engine re-batches a backend's own read-stream chunks
@@ -101,6 +122,10 @@ impl OpIdSource {
 pub enum OpKind {
     Copy,
     Move,
+    /// Move each source into the trash. Local items only (`Caps::TRASH`).
+    Trash,
+    /// Remove each source and everything under it, for good.
+    Delete,
 }
 
 /// One submitted copy/move job: `sources` (top-level items only — trees are
@@ -113,8 +138,15 @@ pub struct OpRequest {
     pub id: OpId,
     pub kind: OpKind,
     pub sources: Vec<Location>,
+    /// Where copies and moves land. For [`OpKind::Trash`] and
+    /// [`OpKind::Delete`] there is no destination; [`OpRequest::removal`]
+    /// puts the folder the first source lives in here, and nothing reads it.
     pub dest_dir: Location,
     cancel: Arc<AtomicBool>,
+    /// Which trash [`OpKind::Trash`] moves into. `None` means the user's
+    /// real trash, resolved from the environment by `core::fs::trash`;
+    /// tests pass a temp directory so they never touch it.
+    trash_root: Option<PathBuf>,
 }
 
 impl OpRequest {
@@ -125,7 +157,31 @@ impl OpRequest {
             sources,
             dest_dir,
             cancel: Arc::new(AtomicBool::new(false)),
+            trash_root: None,
         }
+    }
+
+    /// A [`OpKind::Trash`] or [`OpKind::Delete`] request: no destination.
+    pub fn removal(id: OpId, kind: OpKind, sources: Vec<Location>) -> Self {
+        let dest_dir = sources
+            .first()
+            .and_then(Location::parent)
+            .or_else(|| sources.first().cloned())
+            .unwrap_or_else(|| Location::local("/"));
+        OpRequest::new(id, kind, sources, dest_dir)
+    }
+
+    /// Trash into `root` (a freedesktop trash directory) instead of the
+    /// user's own. Argument-taking so tests never read the environment.
+    pub fn with_trash_root(mut self, root: PathBuf) -> Self {
+        self.trash_root = Some(root);
+        self
+    }
+
+    /// True for the kinds that remove their sources rather than write a
+    /// destination.
+    pub fn is_removal(&self) -> bool {
+        matches!(self.kind, OpKind::Trash | OpKind::Delete)
     }
 
     /// Requests cancellation. Fire-and-forget: the engine notices on its
@@ -190,6 +246,9 @@ pub enum OpEvent {
     /// Cumulative totals so far — the UI replaces its whole progress
     /// readout with this, never accumulates deltas itself.
     Progress { files_done: usize, bytes_done: u64 },
+    /// A trash op moved `original` into the trash; `id` is what restores it.
+    /// The app turns this into an undo entry.
+    Trashed { original: Location, id: TrashId },
     /// `dest` already exists; the UI must answer via `reply` before the
     /// engine proceeds past this item. `reply` is a fresh capacity-1
     /// channel per conflict (CLAUDE.md's blocking-prompt pattern) — see the
@@ -287,6 +346,10 @@ fn same_backend(a: &Location, b: &Location) -> bool {
 }
 
 async fn execute(request: OpRequest, mut tx: mpsc::Sender<OpEvent>) {
+    if request.is_removal() {
+        execute_removal(request, tx, &crate::modules::resolve).await;
+        return;
+    }
     let is_move = request.kind == OpKind::Move;
 
     // ── Fast path: same-backend rename, tried per top-level source ──────
@@ -376,6 +439,284 @@ async fn execute(request: OpRequest, mut tx: mpsc::Sender<OpEvent>) {
     } else {
         send_event(&mut ctx.tx, OpEvent::Finished { errors: ctx.errors }).await;
     }
+}
+
+// ── Trash and delete ────────────────────────────────────────────────────
+
+/// Mutable state of one trash/delete op. Separate from [`ExecContext`]
+/// because a removal has no destination backend or conflicts.
+struct RemovalState {
+    cancel: Arc<AtomicBool>,
+    tx: mpsc::Sender<OpEvent>,
+    items_done: usize,
+    errors: Vec<(Location, VfsError)>,
+    /// Set the moment cancel is seen (or nobody listens any more).
+    cancelled: bool,
+}
+
+impl RemovalState {
+    fn is_cancelled(&mut self) -> bool {
+        if !self.cancelled && self.cancel.load(Ordering::Relaxed) {
+            self.cancelled = true;
+        }
+        self.cancelled
+    }
+
+    /// One more item is gone: report cumulative progress. Items, not bytes:
+    /// removing is not proportional to size.
+    fn item_done(&mut self) {
+        self.items_done += 1;
+        try_send_event(
+            &mut self.tx,
+            OpEvent::Progress {
+                files_done: self.items_done,
+                bytes_done: 0,
+            },
+        );
+    }
+
+    fn started(&mut self, location: &Location) {
+        try_send_event(
+            &mut self.tx,
+            OpEvent::FileStarted {
+                name: location
+                    .path
+                    .file_name()
+                    .map(OsString::from)
+                    .unwrap_or_default(),
+            },
+        );
+    }
+}
+
+/// Runs a trash or delete request. `resolve` finds the backend for a
+/// location: production passes `modules::resolve`; tests pass a closure
+/// that hands back an in-memory backend (the seam that lets the recursion
+/// be tested without a real remote).
+///
+/// Teaching note: `R: Fn(..) + Sync` lets us borrow the closure across
+/// `.await` points inside a task tokio may move between threads; sharing a
+/// borrow across threads needs `Sync`.
+async fn execute_removal<R>(request: OpRequest, tx: mpsc::Sender<OpEvent>, resolve: &R)
+where
+    R: Fn(&Location) -> Option<Box<dyn Backend>> + Sync,
+{
+    let mut state = RemovalState {
+        cancel: request.cancel.clone(),
+        tx,
+        items_done: 0,
+        errors: Vec::new(),
+        cancelled: false,
+    };
+
+    // Totals. Trash counts top-level sources (one rename each). Delete
+    // pre-scans so the strip can say "N of M"; like `count_totals` the scan
+    // may undercount, which only makes the bar read optimistic.
+    let files_total = match request.kind {
+        OpKind::Delete => {
+            let mut total = 0usize;
+            for source in &request.sources {
+                if let Some(backend) = resolve(source) {
+                    total += count_removal_items(backend.as_ref(), source.clone(), None).await;
+                }
+            }
+            total
+        }
+        _ => request.sources.len(),
+    };
+    if !send_event(
+        &mut state.tx,
+        OpEvent::Started {
+            files_total,
+            bytes_total: 0,
+        },
+    )
+    .await
+    {
+        return; // nobody is listening
+    }
+
+    for source in request.sources {
+        if state.is_cancelled() {
+            break;
+        }
+        let Some(backend) = resolve(&source) else {
+            state.errors.push((
+                source.clone(),
+                VfsError::Other {
+                    message: format!("no backend for scheme \"{}\"", source.scheme),
+                },
+            ));
+            continue;
+        };
+        match request.kind {
+            OpKind::Trash => {
+                trash_source(
+                    &mut state,
+                    backend.as_ref(),
+                    source,
+                    request.trash_root.as_deref(),
+                )
+                .await
+            }
+            _ => remove_tree(&mut state, backend.as_ref(), source, None).await,
+        }
+    }
+
+    if state.cancelled {
+        send_event(&mut state.tx, OpEvent::Cancelled).await;
+    } else {
+        let errors = state.errors;
+        send_event(&mut state.tx, OpEvent::Finished { errors }).await;
+    }
+}
+
+/// Moves one source into the trash. Honest about capabilities: a backend
+/// that cannot trash gets an error rather than a silent permanent delete.
+async fn trash_source(
+    state: &mut RemovalState,
+    backend: &dyn Backend,
+    source: Location,
+    trash_root: Option<&Path>,
+) {
+    state.started(&source);
+    if !(source.is_local() && backend.caps().contains(Caps::TRASH)) {
+        state.errors.push((
+            source,
+            VfsError::Unsupported {
+                operation: "moving to the trash".to_owned(),
+            },
+        ));
+        return;
+    }
+    // The trash code is plain blocking filesystem work, so it runs on
+    // tokio's blocking pool instead of stalling the async executor. The
+    // closure must own its data (`'static`), hence the clones.
+    let (path, root) = (source.path.clone(), trash_root.map(Path::to_path_buf));
+    let outcome = tokio::task::spawn_blocking(move || match root {
+        Some(root) => trash::trash_into(&path, &root),
+        None => trash::trash(&path),
+    })
+    .await;
+    match outcome {
+        Ok(Ok(id)) => {
+            state.item_done();
+            let event = OpEvent::Trashed {
+                original: source,
+                id,
+            };
+            // Must-deliver: a missed event is a trashed item with no undo.
+            if !send_event(&mut state.tx, event).await {
+                state.cancelled = true;
+            }
+        }
+        Ok(Err(err)) => state.errors.push((source, err)),
+        Err(join_err) => state.errors.push((
+            source,
+            VfsError::Other {
+                message: format!("internal error trashing: {join_err}"),
+            },
+        )),
+    }
+}
+
+/// Removes `location` and everything under it, depth first. `known` is the
+/// kind and symlink flag a parent's listing already reported (saves a call);
+/// `None` asks the backend.
+///
+/// Symlinks are never followed: a link is removed as an item and its target
+/// is not listed, even when the target is a directory.
+fn remove_tree<'a>(
+    state: &'a mut RemovalState,
+    backend: &'a dyn Backend,
+    location: Location,
+    known: Option<(EntryKind, bool)>,
+) -> BoxFuture<'a, ()> {
+    // Async fns cannot call themselves directly; boxing the future is the
+    // standard workaround (same as `copy_item`).
+    Box::pin(async move {
+        if state.is_cancelled() {
+            return;
+        }
+        let (kind, is_symlink) = match known {
+            Some(known) => known,
+            None => match backend.metadata(&location).await {
+                Ok(entry) => (entry.kind, entry.is_symlink),
+                Err(err) => {
+                    state.errors.push((location, err));
+                    return;
+                }
+            },
+        };
+
+        if kind == EntryKind::Directory && !is_symlink {
+            let errors_before = state.errors.len();
+            let children = match backend.list(&location).await {
+                Ok(children) => children,
+                Err(err) => {
+                    state.errors.push((location, err));
+                    return;
+                }
+            };
+            for child in children {
+                if state.is_cancelled() {
+                    return;
+                }
+                let child_location = location.join(&child.name);
+                remove_tree(
+                    state,
+                    backend,
+                    child_location,
+                    Some((child.kind, child.is_symlink)),
+                )
+                .await;
+            }
+            // If something inside could not go, removing the directory
+            // would only fail again with a misleading "not empty".
+            if state.is_cancelled() || state.errors.len() != errors_before {
+                return;
+            }
+        }
+
+        state.started(&location);
+        match backend.remove(&location).await {
+            Ok(()) => state.item_done(),
+            Err(err) => state.errors.push((location, err)),
+        }
+    })
+}
+
+/// Counts what [`remove_tree`] would remove (directories included), for the
+/// progress total. Errors stop that branch silently, like [`count_one`].
+fn count_removal_items<'a>(
+    backend: &'a dyn Backend,
+    location: Location,
+    known: Option<(EntryKind, bool)>,
+) -> BoxFuture<'a, usize> {
+    Box::pin(async move {
+        let (kind, is_symlink) = match known {
+            Some(known) => known,
+            None => match backend.metadata(&location).await {
+                Ok(entry) => (entry.kind, entry.is_symlink),
+                Err(_) => return 0,
+            },
+        };
+        let mut total = 1;
+        if kind == EntryKind::Directory && !is_symlink {
+            let Ok(children) = backend.list(&location).await else {
+                return total;
+            };
+            for child in children {
+                total += count_removal_items(
+                    backend,
+                    location.join(&child.name),
+                    Some((child.kind, child.is_symlink)),
+                )
+                .await;
+            }
+        }
+        total
+    })
 }
 
 /// Mutable state threaded through one op's recursive walk —
@@ -1304,5 +1645,430 @@ mod tests {
 
         cleanup(src_root);
         cleanup(dst_root);
+    }
+
+    // ── Trash and delete ────────────────────────────────────────────────
+    //
+    // None of these depend on timing. Cancel is triggered by the backend
+    // itself after a fixed number of removals (not by a clock or by racing
+    // the event stream), and progress events are never asserted on because
+    // they are best-effort by design (`try_send_event` may drop them).
+
+    use crate::core::fs::entry::FileEntry;
+    use crate::core::vfs::{DirEvent, ReadStream, WriteSink};
+    use std::collections::{BTreeMap, HashSet};
+    use std::sync::Mutex;
+
+    /// One node of the in-memory tree.
+    struct Node {
+        kind: EntryKind,
+        is_symlink: bool,
+    }
+
+    #[derive(Default)]
+    struct TreeState {
+        nodes: BTreeMap<PathBuf, Node>,
+        /// Paths whose `remove` fails with permission denied.
+        refuse: HashSet<PathBuf>,
+        removed: Vec<PathBuf>,
+        listed: Vec<PathBuf>,
+        /// After this many successful removals, flip the flag.
+        cancel_after: Option<(usize, Arc<AtomicBool>)>,
+    }
+
+    /// An in-memory remote-like backend. Like SFTP, `remove` on a directory
+    /// that still has children fails; the engine has to go depth first.
+    #[derive(Clone, Default)]
+    struct TreeBackend {
+        state: Arc<Mutex<TreeState>>,
+    }
+
+    fn fake(path: &str) -> Location {
+        Location {
+            scheme: "fake".to_owned(),
+            authority: None,
+            path: PathBuf::from(path),
+        }
+    }
+
+    impl TreeBackend {
+        fn with(self, path: &str, kind: EntryKind, is_symlink: bool) -> Self {
+            self.state
+                .lock()
+                .unwrap()
+                .nodes
+                .insert(PathBuf::from(path), Node { kind, is_symlink });
+            self
+        }
+        fn dir(self, path: &str) -> Self {
+            self.with(path, EntryKind::Directory, false)
+        }
+        fn file(self, path: &str) -> Self {
+            self.with(path, EntryKind::File, false)
+        }
+        fn refusing(self, path: &str) -> Self {
+            self.state
+                .lock()
+                .unwrap()
+                .refuse
+                .insert(PathBuf::from(path));
+            self
+        }
+        fn exists(&self, path: &str) -> bool {
+            self.state
+                .lock()
+                .unwrap()
+                .nodes
+                .contains_key(Path::new(path))
+        }
+        fn removed(&self) -> Vec<PathBuf> {
+            self.state.lock().unwrap().removed.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for TreeBackend {
+        fn scheme(&self) -> &'static str {
+            "fake"
+        }
+        fn caps(&self) -> Caps {
+            Caps::empty()
+        }
+        async fn list(&self, location: &Location) -> Result<Vec<FileEntry>, VfsError> {
+            let mut state = self.state.lock().unwrap();
+            state.listed.push(location.path.clone());
+            Ok(state
+                .nodes
+                .iter()
+                .filter(|(path, _)| path.parent() == Some(location.path.as_path()))
+                .map(|(path, node)| FileEntry {
+                    name: path.file_name().map(OsString::from).unwrap_or_default(),
+                    kind: node.kind,
+                    size: 0,
+                    modified: None,
+                    is_symlink: node.is_symlink,
+                    mode: None,
+                })
+                .collect())
+        }
+        async fn metadata(&self, location: &Location) -> Result<FileEntry, VfsError> {
+            let state = self.state.lock().unwrap();
+            state
+                .nodes
+                .get(&location.path)
+                .map(|node| FileEntry {
+                    name: location
+                        .path
+                        .file_name()
+                        .map(OsString::from)
+                        .unwrap_or_default(),
+                    kind: node.kind,
+                    size: 0,
+                    modified: None,
+                    is_symlink: node.is_symlink,
+                    mode: None,
+                })
+                .ok_or_else(|| VfsError::NotFound {
+                    location: location.to_string(),
+                })
+        }
+        async fn read(&self, _location: &Location) -> Result<ReadStream, VfsError> {
+            Err(VfsError::Other {
+                message: "unused".to_owned(),
+            })
+        }
+        async fn write(&self, _location: &Location) -> Result<WriteSink, VfsError> {
+            Err(VfsError::Other {
+                message: "unused".to_owned(),
+            })
+        }
+        async fn mkdir(&self, _location: &Location) -> Result<(), VfsError> {
+            Err(VfsError::Other {
+                message: "unused".to_owned(),
+            })
+        }
+        async fn rename(&self, _from: &Location, _to: &Location) -> Result<(), VfsError> {
+            Err(VfsError::Other {
+                message: "unused".to_owned(),
+            })
+        }
+        async fn remove(&self, location: &Location) -> Result<(), VfsError> {
+            let mut state = self.state.lock().unwrap();
+            if state.refuse.contains(&location.path) {
+                return Err(VfsError::PermissionDenied {
+                    location: location.to_string(),
+                });
+            }
+            let has_children = state
+                .nodes
+                .keys()
+                .any(|path| path.parent() == Some(location.path.as_path()));
+            let is_real_dir = state
+                .nodes
+                .get(&location.path)
+                .is_some_and(|n| n.kind == EntryKind::Directory && !n.is_symlink);
+            if is_real_dir && has_children {
+                return Err(VfsError::Other {
+                    message: "directory not empty".to_owned(),
+                });
+            }
+            if state.nodes.remove(&location.path).is_none() {
+                return Err(VfsError::NotFound {
+                    location: location.to_string(),
+                });
+            }
+            state.removed.push(location.path.clone());
+            if let Some((limit, flag)) = &state.cancel_after
+                && state.removed.len() >= *limit
+            {
+                flag.store(true, Ordering::Relaxed);
+            }
+            Ok(())
+        }
+        async fn set_times(
+            &self,
+            _location: &Location,
+            _accessed: Option<std::time::SystemTime>,
+            _modified: Option<std::time::SystemTime>,
+        ) -> Result<(), VfsError> {
+            Ok(())
+        }
+        fn watch(&self, _location: &Location) -> Option<BoxStream<'static, DirEvent>> {
+            None
+        }
+    }
+
+    /// `run`, but resolving every location to `tree` instead of the global
+    /// backend registry.
+    fn run_on_tree(request: &OpRequest, tree: &TreeBackend) -> BoxStream<'static, OpEvent> {
+        let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let (request, tree) = (request.clone(), tree.clone());
+        tokio::spawn(async move {
+            let resolve = move |_: &Location| Some(Box::new(tree.clone()) as Box<dyn Backend>);
+            execute_removal(request, tx, &resolve).await;
+        });
+        rx.boxed()
+    }
+
+    async fn collect(mut stream: BoxStream<'static, OpEvent>) -> Vec<OpEvent> {
+        let mut seen = Vec::new();
+        while let Some(event) = stream.next().await {
+            let terminal = matches!(event, OpEvent::Finished { .. } | OpEvent::Cancelled);
+            seen.push(event);
+            if terminal {
+                break;
+            }
+        }
+        seen
+    }
+
+    fn errors_of(events: &[OpEvent]) -> &[(Location, VfsError)] {
+        match events.last() {
+            Some(OpEvent::Finished { errors }) => errors,
+            other => panic!("expected Finished, got {other:?}"),
+        }
+    }
+
+    fn delete_request(sources: Vec<Location>) -> OpRequest {
+        OpRequest::removal(OpIdSource::default().alloc(), OpKind::Delete, sources)
+    }
+
+    /// Written first: a symlink to a directory must be deleted as a link.
+    /// Real filesystem, real `LocalBackend`.
+    #[tokio::test]
+    async fn deleting_a_tree_unlinks_a_symlink_to_a_directory_without_following_it() {
+        let root = tempdir();
+        let precious = root.join("precious");
+        std::fs::create_dir(&precious).unwrap();
+        std::fs::write(precious.join("keep.txt"), b"keep").unwrap();
+        let tree = root.join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        std::fs::write(tree.join("a.txt"), b"a").unwrap();
+        std::os::unix::fs::symlink(&precious, tree.join("link")).unwrap();
+
+        let request = delete_request(vec![Location::local(&tree)]);
+        let events = collect(run(&request)).await;
+
+        assert!(errors_of(&events).is_empty());
+        assert!(!tree.exists(), "the tree is gone, link included");
+        assert_eq!(
+            std::fs::read(precious.join("keep.txt")).unwrap(),
+            b"keep",
+            "the link's target must be untouched"
+        );
+        cleanup(root);
+    }
+
+    #[tokio::test]
+    async fn a_symlink_to_a_directory_is_never_listed_on_any_backend() {
+        // The link is *reported* as a directory (as a sloppy backend might)
+        // with children beneath its path: only `is_symlink` keeps the
+        // engine from walking into it.
+        let tree = TreeBackend::default()
+            .dir("/t")
+            .with("/t/link", EntryKind::Directory, true)
+            .file("/t/link/inside.txt");
+        let request = delete_request(vec![fake("/t")]);
+        let events = collect(run_on_tree(&request, &tree)).await;
+
+        // `/t/link/inside.txt` still exists, so removing `/t` fails: that
+        // is the proof the link was not entered.
+        let listed = tree.state.lock().unwrap().listed.clone();
+        assert!(!listed.contains(&PathBuf::from("/t/link")));
+        assert!(tree.removed().contains(&PathBuf::from("/t/link")));
+        assert!(tree.exists("/t/link/inside.txt"));
+        assert!(matches!(events.last(), Some(OpEvent::Finished { .. })));
+    }
+
+    #[tokio::test]
+    async fn deleting_a_non_empty_folder_removes_children_before_their_directory() {
+        let tree = TreeBackend::default()
+            .dir("/srv")
+            .dir("/srv/d")
+            .file("/srv/d/a")
+            .dir("/srv/d/sub")
+            .file("/srv/d/sub/b");
+        let request = delete_request(vec![fake("/srv/d")]);
+        let events = collect(run_on_tree(&request, &tree)).await;
+
+        assert!(errors_of(&events).is_empty());
+        assert!(!tree.exists("/srv/d"));
+        assert!(tree.exists("/srv"), "the parent is not touched");
+        let removed = tree.removed();
+        let at = |p: &str| removed.iter().position(|r| r == Path::new(p)).unwrap();
+        assert!(at("/srv/d/sub/b") < at("/srv/d/sub"));
+        assert!(at("/srv/d/sub") < at("/srv/d"));
+        assert!(at("/srv/d/a") < at("/srv/d"));
+        // The progress total is every item: d, a, sub, b.
+        assert!(matches!(
+            events.first(),
+            Some(OpEvent::Started { files_total: 4, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn one_failing_child_is_one_error_and_the_rest_are_still_removed() {
+        let tree = TreeBackend::default()
+            .dir("/d")
+            .file("/d/a")
+            .file("/d/b")
+            .file("/d/c")
+            .file("/other")
+            .refusing("/d/b");
+        let request = delete_request(vec![fake("/d"), fake("/other")]);
+        let events = collect(run_on_tree(&request, &tree)).await;
+
+        let errors = errors_of(&events);
+        assert_eq!(errors.len(), 1, "only the refused item is reported");
+        assert_eq!(errors[0].0, fake("/d/b"));
+        assert!(!tree.exists("/d/a") && !tree.exists("/d/c"));
+        assert!(!tree.exists("/other"), "later sources still go");
+        assert!(tree.exists("/d/b"));
+        assert!(tree.exists("/d"), "a folder with a survivor stays");
+    }
+
+    #[tokio::test]
+    async fn cancel_stops_cleanly_and_reports_nothing_as_failed() {
+        let request = delete_request(vec![fake("/d")]);
+        let tree = TreeBackend::default()
+            .dir("/d")
+            .file("/d/1")
+            .file("/d/2")
+            .file("/d/3")
+            .file("/d/4")
+            .file("/d/5");
+        tree.state.lock().unwrap().cancel_after = Some((2, request.cancel.clone()));
+        let events = collect(run_on_tree(&request, &tree)).await;
+
+        assert!(matches!(events.last(), Some(OpEvent::Cancelled)));
+        assert!(
+            !events.iter().any(|e| matches!(e, OpEvent::Finished { .. })),
+            "a cancelled op reports no failures"
+        );
+        assert_eq!(
+            tree.removed().len(),
+            2,
+            "already-removed items stay removed"
+        );
+        assert!(tree.exists("/d"), "the rest remain");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_real_local_tree_removes_everything() {
+        let root = tempdir();
+        std::fs::create_dir_all(root.join("t/sub/deeper")).unwrap();
+        std::fs::write(root.join("t/a"), b"a").unwrap();
+        std::fs::write(root.join("t/sub/deeper/b"), b"b").unwrap();
+        let request = delete_request(vec![Location::local(root.join("t"))]);
+        let events = collect(run(&request)).await;
+        assert!(errors_of(&events).is_empty());
+        assert!(!root.join("t").exists());
+        cleanup(root);
+    }
+
+    #[tokio::test]
+    async fn trash_moves_each_source_and_announces_it_for_undo() {
+        let root = tempdir();
+        let trash_root = tempdir().join("Trash");
+        std::fs::write(root.join("a.txt"), b"a").unwrap();
+        std::fs::create_dir(root.join("d")).unwrap();
+        std::fs::write(root.join("d/inner"), b"i").unwrap();
+        let sources = vec![
+            Location::local(root.join("a.txt")),
+            Location::local(root.join("missing")),
+            Location::local(root.join("d")),
+        ];
+        let request = OpRequest::removal(OpIdSource::default().alloc(), OpKind::Trash, sources)
+            .with_trash_root(trash_root.clone());
+        let events = collect(run(&request)).await;
+
+        // One failure, reported once; the items after it still went.
+        let errors = errors_of(&events);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, Location::local(root.join("missing")));
+        assert!(!root.join("a.txt").exists() && !root.join("d").exists());
+
+        // Exactly the trashed items are announced, in order, and each id
+        // restores its item: this is what the undo entry is built from.
+        let trashed: Vec<(&Location, &TrashId)> = events
+            .iter()
+            .filter_map(|e| match e {
+                OpEvent::Trashed { original, id } => Some((original, id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(trashed.len(), 2);
+        assert_eq!(trashed[0].0, &Location::local(root.join("a.txt")));
+        assert_eq!(trashed[1].0, &Location::local(root.join("d")));
+        for (original, id) in trashed {
+            assert_eq!(trash::restore(id).unwrap(), original.path);
+        }
+        assert_eq!(std::fs::read(root.join("d/inner")).unwrap(), b"i");
+
+        cleanup(root);
+        cleanup(trash_root.parent().unwrap().to_path_buf());
+    }
+
+    #[tokio::test]
+    async fn trash_on_a_backend_without_trash_fails_instead_of_deleting() {
+        let tree = TreeBackend::default().file("/x");
+        let request = OpRequest::removal(
+            OpIdSource::default().alloc(),
+            OpKind::Trash,
+            vec![fake("/x")],
+        );
+        let events = collect(run_on_tree(&request, &tree)).await;
+        assert_eq!(errors_of(&events).len(), 1);
+        assert!(tree.exists("/x"), "never a silent permanent delete");
+    }
+
+    #[tokio::test]
+    async fn only_trash_ops_produce_trashed_events() {
+        let root = tempdir();
+        std::fs::write(root.join("f"), b"f").unwrap();
+        let request = delete_request(vec![Location::local(root.join("f"))]);
+        let events = collect(run(&request)).await;
+        assert!(!events.iter().any(|e| matches!(e, OpEvent::Trashed { .. })));
+        cleanup(root);
     }
 }

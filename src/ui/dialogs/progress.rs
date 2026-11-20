@@ -54,6 +54,14 @@ impl Progress {
     /// near the end of such an op — this must still read as "done", never
     /// overshoot the bar past its own end.
     pub fn percent(&self) -> f32 {
+        // Removing is counted in items: bytes are not what takes the time.
+        if matches!(self.kind, OpKind::Trash | OpKind::Delete) {
+            if self.files_total == 0 {
+                return 100.0;
+            }
+            return ((self.files_done as f64 / self.files_total as f64) * 100.0).clamp(0.0, 100.0)
+                as f32;
+        }
         if self.bytes_total == 0 {
             // Nothing to divide by (every source was an empty directory,
             // or the pre-scan saw nothing at all) — "done" is the honest
@@ -104,6 +112,24 @@ pub fn view<'a>(t: &'a Theme, progress: &'a Progress) -> Element<'a, Message> {
         (OpKind::Move, false) => {
             tr!(
                 "progress-moving-named",
+                name = name.as_str(),
+                done = done,
+                total = total
+            )
+        }
+        (OpKind::Trash, true) => tr!("progress-trashing", done = done, total = total),
+        (OpKind::Trash, false) => {
+            tr!(
+                "progress-trashing-named",
+                name = name.as_str(),
+                done = done,
+                total = total
+            )
+        }
+        (OpKind::Delete, true) => tr!("progress-deleting", done = done, total = total),
+        (OpKind::Delete, false) => {
+            tr!(
+                "progress-deleting-named",
                 name = name.as_str(),
                 done = done,
                 total = total
@@ -172,6 +198,16 @@ mod tests {
         let mut progress = Progress::started(OpKind::Copy, 1, 100);
         progress.bytes_done = 150; // the pre-scan undercounted
         assert_eq!(progress.percent(), 100.0);
+    }
+
+    #[test]
+    fn removal_percent_counts_items_not_bytes() {
+        let mut progress = Progress::started(OpKind::Delete, 4, 0);
+        progress.files_done = 1;
+        assert_eq!(progress.percent(), 25.0);
+        let mut trashing = Progress::started(OpKind::Trash, 2, 0);
+        trashing.files_done = 2;
+        assert_eq!(trashing.percent(), 100.0);
     }
 
     #[test]

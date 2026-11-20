@@ -81,13 +81,6 @@ pub(crate) enum Message {
     /// already builds an `ops::OpRequest` from for the internal-clipboard
     /// case; see `Self::submit_paste_op`, which both paths funnel through.
     ForeignPasteReady(ops::ClipboardOp, Vec<Location>, Location),
-    /// `Self::start_delete`'s trash branch succeeded (Stage 10): `original`
-    /// is where the item was before, `TrashId` is everything
-    /// `core::fs::trash::restore` needs to undo it — see the free function
-    /// `delete_one`'s doc comment. Never fired for a permanent delete
-    /// (nothing to undo) or a failure (worded to stderr instead, same as
-    /// before this stage).
-    Trashed(Location, core::fs::trash::TrashId),
     /// A background thumbnail generation (`core::thumbs::thumbnail_for`)
     /// finished (Stage 11) — `location`/`modified` identify exactly which
     /// request this answers (mirrors `Message::RenameResult`'s staleness-
@@ -572,10 +565,6 @@ impl App {
                     ops::ClipboardOp::Cut => ops::OpKind::Move,
                 };
                 self.submit_paste_op(kind, locations, dest_dir)
-            }
-            Message::Trashed(original, id) => {
-                self.push_undo(undo::UndoEntry::Trash { id, original });
-                Task::none()
             }
             Message::ThumbnailReady(location, modified, handle) => {
                 self.handle_thumbnail_ready(location, modified, handle)
