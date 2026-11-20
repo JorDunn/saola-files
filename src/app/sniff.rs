@@ -91,19 +91,30 @@ fn select_for_sniff(
     let mut batch = Vec::new();
     for candidate in candidates {
         let location = &candidate.location;
-        let (Some(dir), Some(name)) = (location.parent(), location.path.file_name()) else {
-            continue;
-        };
-        if candidate.size_bytes == 0
-            || inflight.contains(location)
-            || !mime_db.wants_sniff(&dir, name, Some(candidate.modified))
-            || !is_local(location)
-        {
+        if inflight.contains(location) || !can_be_sniffed(mime_db, candidate, &is_local) {
             continue;
         }
         batch.push((location.clone(), candidate.modified));
     }
     batch
+}
+
+/// The sniffer's own eligibility test, minus the in-flight check: a
+/// non-empty file whose name wants a sniff (nothing cached for this mtime) on
+/// a backend that can serve a local path. Shared with `app/thumbs.rs`, which
+/// parks a thumbnail request only when this says a sniff will really run.
+pub(super) fn can_be_sniffed(
+    mime_db: &MimeDb,
+    candidate: &ui::dirview::ThumbCandidate,
+    is_local: impl Fn(&Location) -> bool,
+) -> bool {
+    let location = &candidate.location;
+    let (Some(dir), Some(name)) = (location.parent(), location.path.file_name()) else {
+        return false;
+    };
+    candidate.size_bytes != 0
+        && mime_db.wants_sniff(&dir, name, Some(candidate.modified))
+        && is_local(location)
 }
 
 /// Folds finished reads into the cache and clears their in-flight marks,
@@ -124,7 +135,7 @@ fn apply_outcomes(mime_db: &MimeDb, inflight: &mut HashSet<Location>, outcomes: 
 
 /// Whether `location`'s backend can serve a local path — the capability
 /// that makes reading a file's head free of network cost.
-fn has_local_path(location: &Location) -> bool {
+pub(super) fn has_local_path(location: &Location) -> bool {
     modules::resolve(location).is_some_and(|backend| backend.caps().contains(Caps::LOCAL_PATH))
 }
 

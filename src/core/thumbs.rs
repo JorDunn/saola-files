@@ -8,10 +8,9 @@
 //! (<https://specifications.freedesktop.org/thumbnail-spec/>).** Thumbnails
 //! live under `$XDG_CACHE_HOME/thumbnails/<size-dir>/<md5-of-uri>.png`
 //! ([`resolve_cache_root`]/[`cache_path`]). The URI is the canonical
-//! `file://<percent-encoded-absolute-path>` form ([`canonical_uri`]) —
-//! reuses `core::places::encode_percent`, the same percent-encoding scheme
-//! `core::clipboard_interop::file_uri` already uses for the exact same
-//! `file://` shape (one scheme app-wide, not two).
+//! `file://<percent-encoded-absolute-path>` form ([`canonical_uri`]),
+//! encoded exactly as GLib's `g_filename_to_uri` does (see [`encode_uri_path`])
+//! so the cache is shared with GTK-side apps.
 //!
 //! **PNG, deliberately, per the spec** — this was surveyed and decided at
 //! the plan level (WebP was considered and rejected for interop: every
@@ -86,7 +85,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Semaphore;
 
-use crate::core::places::encode_percent;
 use crate::core::vfs::Location;
 
 // ── md5 (RFC 1321) ──────────────────────────────────────────────────────
@@ -300,18 +298,63 @@ impl ThumbSize {
 // ── cache path / key computation ────────────────────────────────────────
 
 /// The canonical `file://<percent-encoded-path>` URI the spec keys cache
-/// entries on. Percent-encodes the path's raw bytes (`OsStrExt::as_bytes`),
-/// never `to_string_lossy` — matches CLAUDE.md's OsString discipline and
-/// `core::clipboard_interop::file_uri`'s identical choice for the identical
-/// reason (a non-UTF-8 name must still resolve to a stable, correct cache
-/// key). `path` is expected to already be absolute (every `Location` this
-/// module is ever called with is — see `ThumbRequest`'s doc comment); this
-/// function does no canonicalization of its own (no symlink resolution, no
-/// `..` collapsing), matching the spec's own "canonical" meaning "absolute,
-/// as the application understands the path" rather than "resolved by the
-/// kernel."
+/// entries on. Encodes the path's raw bytes (`OsStrExt::as_bytes`), never
+/// `to_string_lossy` (OsString discipline: a non-UTF-8 name still gets a
+/// stable, correct key). `path` is expected to be absolute; no
+/// canonicalization (symlinks, `..`) is done here.
 pub fn canonical_uri(path: &Path) -> String {
-    format!("file://{}", encode_percent(path.as_os_str().as_bytes()))
+    format!("file://{}", encode_uri_path(path.as_os_str().as_bytes()))
+}
+
+/// Percent-encodes a path the way GLib's `g_filename_to_uri` does, because
+/// the cache filename is the MD5 of this string and other apps (GTK,
+/// Nautilus, Thunar, the GNOME thumbnailers) hash GLib's form. A different
+/// escape set means a different hash, so the cache would silently never be
+/// shared. This is deliberately *not* `core::places::encode_percent`
+/// (clipboard and trash use that one and must not change).
+///
+/// Unescaped: ASCII letters and digits plus `- _ . ~ ! $ & ' ( ) * + , / : = @`.
+/// Everything else (space, `" # % ; < > ? [ \ ] ^ ` { | }`, control bytes and
+/// every byte >= 0x80, so non-UTF-8 names work) becomes `%XX` with
+/// **uppercase** hex.
+///
+/// Verified 2026-11-19 against (1) GLib's `glib/gconvert.c` on GNOME's GitLab
+/// (`g_filename_to_uri` -> `g_escape_uri_string(.., UNSAFE_PATH)`, whose
+/// `acceptable[]` table lets `! $ & ' ( ) * + , - . / : = @ ~` and
+/// alphanumerics/`_` through) and (2) empirically, `gio info -a standard::uri`
+/// on glib2 2.90.1 for every printable ASCII character, a non-ASCII name and
+/// a non-UTF-8 byte name. Note `;` is escaped by GLib despite being legal in
+/// RFC 3986 paths.
+fn encode_uri_path(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for &byte in bytes {
+        let keep = byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-' | b'_'
+                    | b'.'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b'/'
+                    | b':'
+                    | b'='
+                    | b'@'
+            );
+        if keep {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// `cache_root/<size-dir>/<md5-of-uri>.png`.
@@ -488,7 +531,12 @@ fn write_png_atomic(
     image: &image::RgbaImage,
 ) -> Result<(), String> {
     let dir = final_path.parent().ok_or("cache path has no parent")?;
-    std::fs::create_dir_all(dir).map_err(|err| err.to_string())?;
+    // The spec wants cache directories 0700. `DirBuilder` applies the mode to
+    // every directory it creates and leaves existing ones untouched.
+    std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
+        .recursive(true)
+        .create(dir)
+        .map_err(|err| err.to_string())?;
 
     let file_name = final_path
         .file_name()
@@ -531,12 +579,38 @@ pub trait Thumbnailer: Send + Sync {
     fn handles(&self, mimetype: &str) -> bool;
 
     /// Decode `path` and return pixels no larger than `max_pixels` on their
-    /// longest side, aspect preserved. `Err` means "couldn't thumbnail
-    /// this one" (corrupt file, an unsupported sub-format, …) — the
-    /// underlying `image` crate reports decode failures as `Result`, never
-    /// a panic, so this is a thin wrapper, not a `catch_unwind`.
-    fn generate(&self, path: &Path, max_pixels: u32) -> Result<image::RgbaImage, String>;
+    /// longest side, aspect preserved. The error says *why* it failed, which
+    /// decides whether the failure is remembered: see [`ThumbError`].
+    fn generate(&self, path: &Path, max_pixels: u32) -> Result<image::RgbaImage, ThumbError>;
 }
+
+/// Why a thumbnailer gave up. The split exists for the fail cache: a marker
+/// sticks until the file's mtime changes, so it must only be written when
+/// retrying cannot help.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThumbError {
+    /// Could not read the file: EACCES, vanished, still being written.
+    /// Transient or environmental, so **no** fail marker is written.
+    Unreadable(String),
+    /// Read fine but cannot be turned into a thumbnail: corrupt, unsupported
+    /// sub-format, or over the decode limits. Retrying is pointless until the
+    /// file changes, so a fail marker **is** written. (An over-limit image is
+    /// deliberately in this group.)
+    Undecodable(String),
+}
+
+/// Largest width or height the image thumbnailer will decode. 16384 px covers
+/// big panoramas and 100+ MP stitched photos' typical sides while refusing
+/// crafted headers that declare absurd sizes.
+const DECODE_MAX_DIMENSION: u32 = 16_384;
+
+/// Cap on what one decode may allocate (output buffer included). 192 MiB
+/// fits a ~40 MP RGBA decode (a normal modern photo). `app/thumbs.rs`
+/// allows `THUMB_MAX_CONCURRENT` (4) decodes at once, so the worst case is
+/// 4 x 192 MiB = 768 MiB, and it asserts that product at compile time. The
+/// `image` crate treats this limit as non-strict for some decoders, so it is
+/// a guard, not a guarantee.
+pub const DECODE_MAX_ALLOC_BYTES: u64 = 192 * 1024 * 1024;
 
 /// The `image` crate thumbnailer — every format that crate's
 /// `default-formats` feature decodes (jpeg/png/gif/webp/bmp/ico/tiff/…, see
@@ -549,15 +623,23 @@ impl Thumbnailer for ImageThumbnailer {
         mimetype.starts_with("image/")
     }
 
-    fn generate(&self, path: &Path, max_pixels: u32) -> Result<image::RgbaImage, String> {
+    fn generate(&self, path: &Path, max_pixels: u32) -> Result<image::RgbaImage, ThumbError> {
         // Decode by *content*, not extension: `image::open` trusts the file
         // name, which would fail for an extensionless or misnamed image
         // that the mimetype dispatch (content-sniffed) rightly sent here.
-        let decoded = image::ImageReader::open(path)
+        let mut reader = image::ImageReader::open(path)
             .and_then(|reader| reader.with_guessed_format())
-            .map_err(|err| err.to_string())?
-            .decode()
-            .map_err(|err| err.to_string())?;
+            .map_err(|err| ThumbError::Unreadable(err.to_string()))?;
+        let mut limits = image::Limits::no_limits();
+        limits.max_image_width = Some(DECODE_MAX_DIMENSION);
+        limits.max_image_height = Some(DECODE_MAX_DIMENSION);
+        limits.max_alloc = Some(DECODE_MAX_ALLOC_BYTES);
+        reader.limits(limits);
+        let decoded = reader.decode().map_err(|err| match err {
+            // An I/O error mid-decode is a read problem, not a bad image.
+            image::ImageError::IoError(io) => ThumbError::Unreadable(io.to_string()),
+            other => ThumbError::Undecodable(other.to_string()),
+        })?;
         // Never upscale: a 32 px icon stays 32 px (the view scales it), so
         // the big cache directories do not fill with blurry enlargements.
         if decoded.width() <= max_pixels && decoded.height() <= max_pixels {
@@ -793,11 +875,14 @@ fn generate_blocking(
     }
 
     // No thumbnailer for this type is not a failure of the *file* (a later
-    // thumbnailer might claim it), so it leaves no fail marker.
+    // thumbnailer might claim it), so it leaves no fail marker. The app
+    // already filters with `Registry::handles`, so this is defence in depth.
     let thumbnailer = registry.find(&request.mimetype)?;
     let rgba = match thumbnailer.generate(&request.location.path, request.size.max_pixels()) {
         Ok(rgba) => rgba,
-        Err(_) => {
+        // Unreadable: transient, retry next time, leave no marker.
+        Err(ThumbError::Unreadable(_)) => return None,
+        Err(ThumbError::Undecodable(_)) => {
             if let Some(root) = cache_root
                 && let Err(err) = write_fail_marker(root, &uri, &mtime)
             {
@@ -1157,8 +1242,14 @@ mod tests {
             fn handles(&self, _mimetype: &str) -> bool {
                 true
             }
-            fn generate(&self, _path: &Path, _max_pixels: u32) -> Result<image::RgbaImage, String> {
-                Err("marker: AlwaysHandles was the one dispatched to".to_owned())
+            fn generate(
+                &self,
+                _path: &Path,
+                _max_pixels: u32,
+            ) -> Result<image::RgbaImage, ThumbError> {
+                Err(ThumbError::Undecodable(
+                    "marker: AlwaysHandles was the one dispatched to".to_owned(),
+                ))
             }
         }
 
@@ -1174,7 +1265,10 @@ mod tests {
         let err = dispatched
             .generate(Path::new("/irrelevant"), 128)
             .unwrap_err();
-        assert_eq!(err, "marker: AlwaysHandles was the one dispatched to");
+        assert_eq!(
+            err,
+            ThumbError::Undecodable("marker: AlwaysHandles was the one dispatched to".to_owned())
+        );
     }
 
     // ── sizes, fail cache, mime dispatch (#61) ──────────────────────────
@@ -1325,6 +1419,131 @@ mod tests {
         let as_text = request_for(&source, 1, ThumbSize::Normal, "text/plain");
         assert!(generate_blocking(&registry, None, &as_text).is_none());
         assert!(registry.handles("image/webp") && !registry.handles("text/plain"));
+        cleanup(dir);
+    }
+
+    // ── review follow-ups: URI encoding, 0700, limits, error split ──────
+
+    // Expected values come from `gio info -a standard::uri` (glib2 2.90.1)
+    // run on files with these names, not from `encode_uri_path` itself.
+    #[test]
+    fn canonical_uri_matches_glibs_g_filename_to_uri() {
+        let table: &[(&[u8], &str)] = &[
+            (b"/d/sp ace", "file:///d/sp%20ace"),
+            (b"/d/a(1).jpg", "file:///d/a(1).jpg"),
+            (b"/d/it's.png", "file:///d/it's.png"),
+            (b"/d/a&=+,@:!$*b", "file:///d/a&=+,@:!$*b"),
+            (b"/d/a;b", "file:///d/a%3Bb"),
+            (b"/d/a#b", "file:///d/a%23b"),
+            (b"/d/a?b", "file:///d/a%3Fb"),
+            (b"/d/a%b", "file:///d/a%25b"),
+            (b"/d/a[b]", "file:///d/a%5Bb%5D"),
+            (b"/d/a{b}", "file:///d/a%7Bb%7D"),
+            (b"/d/a|b", "file:///d/a%7Cb"),
+            (b"/d/a\\b", "file:///d/a%5Cb"),
+            (b"/d/a^b", "file:///d/a%5Eb"),
+            (b"/d/a`b", "file:///d/a%60b"),
+            (b"/d/a\"b", "file:///d/a%22b"),
+            (b"/d/a<b>", "file:///d/a%3Cb%3E"),
+            (b"/d/a-_.~b", "file:///d/a-_.~b"),
+            ("/d/caf\u{e9}".as_bytes(), "file:///d/caf%C3%A9"),
+            (b"/d/bad\xff.txt", "file:///d/bad%FF.txt"),
+        ];
+        for (raw, expected) in table {
+            let path = Path::new(std::ffi::OsStr::from_bytes(raw));
+            assert_eq!(canonical_uri(path), *expected, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn directories_the_cache_creates_are_0700_and_existing_ones_are_left_alone() {
+        let dir = tempdir();
+        let root = dir.join("thumbnails");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        write_fail_marker(&root, "file:///a", "1").unwrap();
+        write_cache_atomic(
+            &root,
+            "file:///a",
+            "1",
+            ThumbSize::Large,
+            &solid_image(2, 2),
+        )
+        .unwrap();
+
+        let mode = |p: PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(root.clone()), 0o755, "pre-existing root untouched");
+        assert_eq!(mode(root.join("fail")), 0o700);
+        assert_eq!(mode(root.join("fail/saola-files")), 0o700);
+        assert_eq!(mode(root.join("large")), 0o700);
+        cleanup(dir);
+    }
+
+    /// CRC-32 (IEEE), only to forge a PNG header in the limits test below.
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn an_image_declaring_huge_dimensions_is_refused_cleanly_and_marked_failed() {
+        // A PNG whose IHDR claims 40000x40000 and which has no pixel data:
+        // nothing near that size is ever allocated; the limit check fires
+        // when the header is read.
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(b"IHDR");
+        ihdr.extend_from_slice(&40_000u32.to_be_bytes());
+        ihdr.extend_from_slice(&40_000u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        bytes.extend_from_slice(&13u32.to_be_bytes());
+        bytes.extend_from_slice(&ihdr);
+        bytes.extend_from_slice(&crc32(&ihdr).to_be_bytes());
+
+        let dir = tempdir();
+        let cache_root = dir.join("cache");
+        let source = dir.join("huge.png");
+        std::fs::write(&source, &bytes).unwrap();
+
+        match ImageThumbnailer.generate(&source, 128) {
+            Err(ThumbError::Undecodable(msg)) => {
+                assert!(msg.to_lowercase().contains("limit"), "{msg}")
+            }
+            other => panic!("expected an over-limit refusal, got {other:?}"),
+        }
+        let request = request_for(&source, 1, ThumbSize::Normal, "image/png");
+        assert!(
+            generate_blocking(&Registry::with_defaults(), Some(&cache_root), &request).is_none()
+        );
+        assert!(fail_path(&cache_root, &canonical_uri(&source)).exists());
+        cleanup(dir);
+    }
+
+    #[test]
+    fn a_missing_file_is_unreadable_and_leaves_no_fail_marker() {
+        let dir = tempdir();
+        let cache_root = dir.join("cache");
+        let source = dir.join("gone.png");
+        assert!(matches!(
+            ImageThumbnailer.generate(&source, 128),
+            Err(ThumbError::Unreadable(_))
+        ));
+        let request = request_for(&source, 1, ThumbSize::Normal, "image/png");
+        assert!(
+            generate_blocking(&Registry::with_defaults(), Some(&cache_root), &request).is_none()
+        );
+        assert!(!cache_root.join("fail").exists());
         cleanup(dir);
     }
 

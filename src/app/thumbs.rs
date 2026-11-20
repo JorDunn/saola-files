@@ -9,7 +9,33 @@ use iced::Task;
 use core::vfs::Location;
 use saola_files::{core, ui};
 
+use super::sniff::{can_be_sniffed, has_local_path};
 use super::{App, Message};
+
+/// Upper bound on parked candidates (`App::thumb_awaiting_sniff`). Entries
+/// leave when their sniff outcome arrives, so this is only a backstop against
+/// unbounded growth; a few viewports' worth is plenty.
+const MAX_PARKED: usize = 4096;
+
+// Worst-case decode memory: every permitted concurrent decode may allocate up
+// to the per-decode cap. Keep that product at or under 1 GiB, so raising
+// `THUMB_MAX_CONCURRENT` or the cap has to be a deliberate edit here.
+const _: () = assert!(
+    THUMB_MAX_CONCURRENT as u64 * core::thumbs::DECODE_MAX_ALLOC_BYTES <= 1024 * 1024 * 1024
+);
+
+/// Whether a candidate nobody can thumbnail yet should wait for its content
+/// sniff. Only when that sniff will really run (same predicate the sniffer
+/// uses, [`can_be_sniffed`]: non-empty, untyped name, local-path backend), so
+/// nothing is parked forever. `parked` is the current map size.
+fn should_park(
+    mime_db: &core::mime::MimeDb,
+    candidate: &ui::dirview::ThumbCandidate,
+    is_local: impl Fn(&Location) -> bool,
+    parked: usize,
+) -> bool {
+    parked < MAX_PARKED && can_be_sniffed(mime_db, candidate, is_local)
+}
 
 /// The App-owned decoded-thumbnail LRU's capacity (Stage 11 — CLAUDE.md's
 /// "~512-handle LRU"). A plain implementation constant, the same posture
@@ -65,7 +91,7 @@ impl App {
         // every closure in a single chain is constructed before any of
         // them run. Collecting the filtered candidates first ends that
         // immutable borrow before the mutating loop starts.
-        let filtered: Vec<(ui::dirview::ThumbCandidate, core::vfs::Location, String)> = candidates
+        let filtered: Vec<(ui::dirview::ThumbCandidate, String)> = candidates
             .into_iter()
             .filter(|candidate| !core::thumbs::exceeds_max_size(candidate.size_bytes, max_mb))
             .filter(|candidate| {
@@ -85,7 +111,7 @@ impl App {
                 let mimetype = self
                     .mime_db
                     .guess_entry(&dir, name, Some(candidate.modified));
-                Some((candidate, dir, mimetype))
+                Some((candidate, mimetype))
             })
             .collect();
 
@@ -94,14 +120,15 @@ impl App {
         // name was untyped and a sniff may still sharpen it, park the
         // candidate until `SniffReady`.
         let mut dispatchable: Vec<(ui::dirview::ThumbCandidate, String)> = Vec::new();
-        for (candidate, dir, mimetype) in filtered {
+        for (candidate, mimetype) in filtered {
             if self.thumb_registry.handles(&mimetype) {
                 dispatchable.push((candidate, mimetype));
-            } else if let Some(name) = candidate.location.path.file_name()
-                && self
-                    .mime_db
-                    .wants_sniff(&dir, name, Some(candidate.modified))
-            {
+            } else if should_park(
+                &self.mime_db,
+                &candidate,
+                has_local_path,
+                self.thumb_awaiting_sniff.len(),
+            ) {
                 self.thumb_awaiting_sniff
                     .insert(candidate.location.clone(), candidate);
             }
@@ -165,5 +192,69 @@ impl App {
             }
         }
         Task::none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn candidate(path: &str, size: u64) -> ui::dirview::ThumbCandidate {
+        ui::dirview::ThumbCandidate {
+            location: Location::local(path),
+            size_bytes: size,
+            modified: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+        }
+    }
+
+    #[test]
+    fn an_untyped_non_empty_local_file_is_parked() {
+        let db = core::mime::MimeDb::new();
+        assert!(should_park(&db, &candidate("/d/picture", 9), |_| true, 0));
+    }
+
+    #[test]
+    fn an_empty_file_is_not_parked() {
+        let db = core::mime::MimeDb::new();
+        assert!(!should_park(&db, &candidate("/d/empty", 0), |_| true, 0));
+    }
+
+    #[test]
+    fn a_backend_without_local_path_does_not_park() {
+        let db = core::mime::MimeDb::new();
+        assert!(!should_park(&db, &candidate("/d/picture", 9), |_| false, 0));
+    }
+
+    #[test]
+    fn an_already_typed_name_does_not_park() {
+        let db = core::mime::MimeDb::new();
+        assert!(!should_park(
+            &db,
+            &candidate("/d/notes.txt", 9),
+            |_| true,
+            0
+        ));
+    }
+
+    #[test]
+    fn a_full_map_stops_parking() {
+        let db = core::mime::MimeDb::new();
+        let full = MAX_PARKED;
+        assert!(!should_park(
+            &db,
+            &candidate("/d/picture", 9),
+            |_| true,
+            full
+        ));
+    }
+
+    #[test]
+    fn a_sniff_already_recorded_for_this_mtime_does_not_park() {
+        let db = core::mime::MimeDb::new();
+        let c = candidate("/d/picture", 9);
+        let dir = Location::local("/d");
+        db.record_unsniffable(&dir, std::ffi::OsStr::new("picture"), c.modified);
+        assert!(!should_park(&db, &c, |_| true, 0));
     }
 }
