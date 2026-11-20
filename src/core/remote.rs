@@ -1,7 +1,7 @@
 //! The connection manager for remote [`Backend`]s (Stage 14) — per-
-//! authority pooling, the auth/host-key prompt plumbing, and the
-//! download-to-temp cache a `Caps::LOCAL_PATH`-less backend's "open" flow
-//! needs. `App` owns exactly one [`RemoteManager`] (CLAUDE.md: "Shared
+//! authority pooling and the auth/host-key prompt plumbing. (Opening a
+//! file on a `Caps::LOCAL_PATH`-less backend is `core::open_copy` plus
+//! `app::remote_open`, through the ops engine.) `App` owns exactly one [`RemoteManager`] (CLAUDE.md: "Shared
 //! caches … live on the App, never per-view"), the same one-per-`App`
 //! posture `core::fs::ops::OpIdSource`/`core::thumbs::ThumbCache` already
 //! take.
@@ -220,16 +220,6 @@ impl std::hash::Hash for ConnectRequest {
 /// direct reference.
 pub struct RemoteManager {
     pool: Pool,
-    /// Download-to-temp cache for a `Caps::LOCAL_PATH`-less backend's
-    /// "open" flow (CLAUDE.md: "without `LOCAL_PATH`, open = download-to-
-    /// temp with a read-only caveat") — keyed by the exact remote
-    /// `Location`, so re-opening the same file twice in one session
-    /// doesn't re-download it. Session-scoped only, like `core::fs::undo`'s
-    /// stack (no persistence across restarts, no eviction beyond the
-    /// process's own temp-directory cleanup) — a stale cached path that no
-    /// longer exists on disk (something else cleaned `/tmp`) is simply
-    /// re-downloaded, not treated as an error.
-    downloads: Mutex<HashMap<Location, PathBuf>>,
 }
 
 impl Default for RemoteManager {
@@ -242,7 +232,6 @@ impl RemoteManager {
     pub fn new() -> Self {
         RemoteManager {
             pool: Arc::new(Mutex::new(HashMap::new())),
-            downloads: Mutex::new(HashMap::new()),
         }
     }
 
@@ -289,99 +278,6 @@ impl RemoteManager {
         if let Some(key) = pool_key(location) {
             lock_pool(&self.pool).remove(&key);
         }
-    }
-
-    /// The "open" flow's fallback for a `Caps::LOCAL_PATH`-less backend:
-    /// downloads `location` to a fresh temp file (or hands back a
-    /// previously-downloaded one still on disk) and marks it read-only —
-    /// the "read-only caveat" CLAUDE.md's capability-honest wording calls
-    /// for, made structural rather than just a label: an app that opens
-    /// this path and tries to save back to it gets an ordinary permission
-    /// error, not a change that silently never makes it back to the
-    /// server.
-    pub async fn download_to_temp(
-        &self,
-        backend: &dyn Backend,
-        location: &Location,
-    ) -> Result<PathBuf, VfsError> {
-        if let Some(path) = lock_pool_downloads(&self.downloads).get(location).cloned()
-            && path.is_file()
-        {
-            return Ok(path);
-        }
-
-        let name = location
-            .path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "download".to_owned());
-        let mut dest = std::env::temp_dir();
-        dest.push(format!(
-            "saola-files-{}-{}-{name}",
-            std::process::id(),
-            location.authority.as_deref().unwrap_or("remote")
-        ));
-
-        // Buffered fully in memory before one blocking write, rather than
-        // streaming chunk-by-chunk into a `tokio::fs::File` — this crate
-        // otherwise avoids `tokio::fs` entirely (`modules::local`'s own
-        // doc comment: every blocking call goes through `std::fs` inside
-        // `spawn_blocking`, kept in one visible place, not two I/O
-        // stacks). `download_to_temp` is a fallback path for a
-        // `Caps::LOCAL_PATH`-less backend's "open" flow, not a hot loop —
-        // buffering the whole file is an acceptable simplification here,
-        // unlike `core::fs::ops::copy_bytes`'s streaming re-chunking,
-        // which exists specifically because *that* path must handle
-        // multi-gigabyte files without holding them in memory.
-        let mut read = backend.read(location).await?;
-        let mut bytes: Vec<u8> = Vec::new();
-        while let Some(chunk) = read.next().await {
-            bytes.extend_from_slice(&chunk?);
-        }
-
-        let write_dest = dest.clone();
-        let write_result = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            std::fs::write(&write_dest, &bytes)?;
-            // Best-effort: a failed chmod still leaves a perfectly
-            // readable downloaded file behind — the caveat is worded to
-            // the human (`Caps::LOCAL_PATH`'s own doc comment), the
-            // read-only bit is defense in depth, not the only thing
-            // standing between the human and a silently-lost edit.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ =
-                    std::fs::set_permissions(&write_dest, std::fs::Permissions::from_mode(0o444));
-            }
-            Ok(())
-        })
-        .await;
-        match write_result {
-            Ok(Ok(())) => {}
-            Ok(Err(io_err)) => return Err(to_temp_io_error(location, io_err)),
-            Err(join_err) => {
-                return Err(VfsError::Other {
-                    message: format!("internal error downloading {location}: {join_err}"),
-                });
-            }
-        }
-
-        lock_pool_downloads(&self.downloads).insert(location.clone(), dest.clone());
-        Ok(dest)
-    }
-}
-
-fn lock_pool_downloads(
-    downloads: &Mutex<HashMap<Location, PathBuf>>,
-) -> std::sync::MutexGuard<'_, HashMap<Location, PathBuf>> {
-    downloads
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn to_temp_io_error(location: &Location, err: std::io::Error) -> VfsError {
-    VfsError::Other {
-        message: format!("downloading {location} to a temp file failed: {err}"),
     }
 }
 
@@ -487,7 +383,6 @@ fn unsupported_scheme(location: &Location) -> VfsError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::fs::entry::EntryKind;
     use crate::core::vfs::FakeBackend;
 
     fn sftp_location(authority: &str, path: &str) -> Location {
@@ -591,35 +486,6 @@ mod tests {
         // pool is what's checked, and `connect` (a free function reading
         // the *global* pool — see its own doc comment) never touches it.
         assert!(manager.pooled(&location).is_none());
-    }
-
-    #[tokio::test]
-    async fn download_to_temp_writes_the_backends_bytes_and_marks_it_read_only() {
-        let manager = RemoteManager::new();
-        let backend = FakeBackend::new().with_dir(
-            "/remote",
-            vec![crate::core::fs::entry::FileEntry {
-                name: std::ffi::OsString::from("note.txt"),
-                kind: EntryKind::File,
-                size: 0,
-                modified: None,
-                is_symlink: false,
-                mode: None,
-            }],
-        );
-        // `FakeBackend::read` always errors (see its own doc comment) —
-        // this test only proves `download_to_temp` propagates that
-        // `VfsError` rather than panicking; a real read-through-to-disk
-        // round trip is `modules::local`'s own `read`/`write` tests'
-        // territory, and `modules::sftp`'s equivalent is a manual
-        // done-criterion (no real SFTP server in this test binary).
-        let location = Location {
-            scheme: "fake".to_owned(),
-            authority: Some("host".to_owned()),
-            path: std::path::PathBuf::from("/remote/note.txt"),
-        };
-        let result = manager.download_to_temp(&backend, &location).await;
-        assert!(result.is_err());
     }
 
     #[test]

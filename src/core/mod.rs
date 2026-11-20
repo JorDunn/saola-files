@@ -7,6 +7,7 @@ pub mod clipboard_interop;
 pub mod failure;
 pub mod fs;
 pub mod mime;
+pub mod open_copy;
 pub mod places;
 pub mod remote;
 pub mod state;

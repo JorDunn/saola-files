@@ -102,6 +102,13 @@ pub enum Operation {
     EmptyTrash,
     /// Publishing copied items to the system clipboard.
     Clipboard,
+    /// Not a failure: the "this is a read-only copy" caveat shown after a
+    /// file without a local path (SFTP, ...) was downloaded and opened.
+    /// It rides the failure notice because that band already gives a
+    /// message an incident, a dismiss button, Esc, long-name truncation and
+    /// "a newer action replaces it". The target is the file's name; the
+    /// cause is unused.
+    OpenedCopy,
 }
 
 /// What went wrong.
@@ -376,6 +383,7 @@ pub fn describe(operation: Operation, failure: &Failure) -> String {
         (Operation::Restore, _) => tr!("failure-restore", name = name, reason = reason),
         (Operation::EmptyTrash, _) => tr!("failure-empty-trash", reason = reason),
         (Operation::Clipboard, _) => tr!("failure-clipboard", reason = reason),
+        (Operation::OpenedCopy, _) => tr!("notice-opened-copy", name = name),
     }
 }
 
@@ -429,6 +437,7 @@ fn group_headline(operation: Operation, count: usize) -> String {
         | Operation::Undo
         | Operation::EmptyTrash
         | Operation::Clipboard => tr!("failure-summary-other", count = count),
+        Operation::OpenedCopy => tr!("notice-opened-copy-many", count = count),
     }
 }
 

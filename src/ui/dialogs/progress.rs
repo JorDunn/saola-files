@@ -34,6 +34,9 @@ pub struct Progress {
     pub files_total: usize,
     pub bytes_done: u64,
     pub bytes_total: u64,
+    /// The copy is the first half of opening a file that has no local path:
+    /// the strip says "Downloading", not "Copying".
+    pub downloading: bool,
 }
 
 impl Progress {
@@ -45,6 +48,7 @@ impl Progress {
             files_total,
             bytes_done: 0,
             bytes_total,
+            downloading: false,
         }
     }
 
@@ -91,6 +95,17 @@ pub fn view<'a>(t: &'a Theme, progress: &'a Progress) -> Element<'a, Message> {
     // One whole message per verb and per with/without-name case, not a verb
     // spliced into a sentence: other languages inflect the verb.
     let label = match (progress.kind, name.is_empty()) {
+        (_, true) if progress.downloading => {
+            tr!("progress-downloading", done = done, total = total)
+        }
+        (_, false) if progress.downloading => {
+            tr!(
+                "progress-downloading-named",
+                name = name.as_str(),
+                done = done,
+                total = total
+            )
+        }
         (OpKind::Copy, true) => tr!("progress-copying", done = done, total = total),
         (OpKind::Copy, false) => {
             tr!(

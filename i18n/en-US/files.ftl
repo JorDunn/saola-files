@@ -107,6 +107,21 @@ progress-copying = Copying… { $done } of { $total }
 progress-copying-named = Copying { $name }… { $done } of { $total }
 progress-moving = Moving… { $done } of { $total }
 progress-moving-named = Moving { $name }… { $done } of { $total }
+progress-downloading = Downloading… { $done } of { $total }
+progress-downloading-named = Downloading { $name }… { $done } of { $total }
+
+## Opening a file that has no local path (a downloaded read-only copy)
+
+notice-opened-copy = Opened a read-only copy of “{ $name }” — changes won't be saved to the server.
+notice-opened-copy-many =
+    { $count ->
+        [one] Opened a read-only copy of { $count } item — changes won't be saved to the server.
+       *[other] Opened read-only copies of { $count } items — changes won't be saved to the server.
+    }
+open-busy = another copy or download is still running
+open-cancelled = the download was cancelled
+open-unsafe-name = its name can't be used as a file name here
+open-terminal-operation = opening a terminal here
 
 ## Properties dialog
 

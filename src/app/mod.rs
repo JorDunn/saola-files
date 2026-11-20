@@ -20,6 +20,7 @@ mod failures;
 mod file_ops;
 mod navigation;
 mod properties;
+mod remote_open;
 mod session;
 mod sniff;
 mod statusbar;
@@ -151,6 +152,8 @@ pub(crate) enum Message {
         Location,
         Result<core::vfs::FsStats, core::vfs::VfsError>,
     ),
+    /// A step of opening a file that has no local path (`remote_open.rs`).
+    RemoteOpen(remote_open::OpenMessage),
     /// Session-state events (`session.rs`): window resizes.
     Session(session::Message),
     /// A batch of background content-sniff head reads finished
@@ -380,6 +383,9 @@ pub(crate) struct App {
     free_space: statusbar::FreeSpace,
     /// Incident bookkeeping for failure notices (see `failures`).
     incidents: failures::Incidents,
+    /// The download whose completion launches an app on a read-only copy,
+    /// if one is in flight (`remote_open.rs`).
+    pending_open: Option<remote_open::PendingOpen>,
     /// Remembered window size, last location and per-folder view
     /// settings (`session.rs`).
     session: session::Session,
@@ -499,6 +505,7 @@ impl App {
             error_notice: ui::dialogs::error_notice::Slot::default(),
             free_space: statusbar::FreeSpace::default(),
             incidents: failures::Incidents::default(),
+            pending_open: None,
             session,
             sniff_inflight: HashSet::new(),
         };
@@ -507,7 +514,10 @@ impl App {
         // comment and `core::remote`'s module docs for why this is safe
         // (single-instance app) and why it happens exactly once, here.
         app.remote.install_global();
-        (app, directory_task(view_id, task))
+        (
+            app,
+            Task::batch([directory_task(view_id, task), remote_open::startup_sweep()]),
+        )
     }
 
     pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
@@ -611,6 +621,7 @@ impl App {
             // --- features (alphabetical) ---
             Message::ErrorNotice(inner) => self.handle_error_notice(inner),
             Message::FreeSpace(id, location, result) => self.on_free_space(id, location, result),
+            Message::RemoteOpen(inner) => self.handle_remote_open(inner),
             Message::Session(inner) => self.handle_session_message(inner),
             Message::SniffReady(outcomes) => self.handle_sniff_ready(outcomes),
         }
