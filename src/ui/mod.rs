@@ -5,12 +5,15 @@
 //! Layering rule (see CLAUDE.md): `ui/` may import `core/`, never
 //! `integration/`.
 
+pub mod anchored;
 pub mod breadcrumbs;
 pub mod dialogs;
 pub mod dirview;
 pub mod explorer;
 pub mod header;
+pub mod menu_placement;
 pub mod menus;
+pub mod right_click;
 pub mod sidebar;
 pub mod trashview;
 pub mod window;

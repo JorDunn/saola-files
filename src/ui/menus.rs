@@ -48,15 +48,17 @@
 //! The config-defined `[[action]]` rows follow the table: there can be any
 //! number of them, so they are appended by `context_menu` itself.
 //!
-//! **Anchoring is simplified too:** a precise "grow from the trigger
-//! button" popover (style guide §6) needs the trigger's on-screen rect,
-//! which iced 0.14's plain `view()` has no way to learn without threading
-//! measured layout state through — out of scope here. Both popovers below
-//! anchor to the window's top-right corner instead, roughly under where
-//! the header's overflow button always renders.
+//! **Anchoring.** Opened from a right-click or the Menu key, the popovers
+//! hang from the pointer or the cursor row (`DirectoryView::
+//! menu_anchor_rect`) and are placed by `ui::anchored`, which flips them at
+//! the window edge once the menu's real size is known (the rule itself is
+//! `ui::menu_placement`). Opened from the header's overflow button they
+//! keep the simpler top-right anchoring, roughly under where that button
+//! always renders: a precise "grow from the trigger" placement would need
+//! the trigger's on-screen rect, which iced's plain `view()` cannot learn.
 
 use iced::widget::{Space, column, container, mouse_area, stack, text};
-use iced::{Element, Fill};
+use iced::{Element, Fill, Rectangle};
 use saola_theme::icon::Icon;
 use saola_theme::widget::{self as saola_widget, Emphasis};
 use saola_theme::{ColorExt, Surface, Theme, convert, style};
@@ -68,6 +70,7 @@ use crate::core::mime::MimeDb;
 use crate::core::vfs::{Caps, Location};
 use crate::{msg, tr_static};
 
+use super::anchored::Anchored;
 use super::dirview::{DirectoryView, Message, menu};
 
 /// Wraps `content` (the ordinary directory view) with whichever overlay is
@@ -82,14 +85,23 @@ pub fn overlay<'a>(
     clipboard_has_contents: bool,
     content: Element<'a, Message>,
 ) -> Element<'a, Message> {
+    // `None` = opened from the header's overflow button (legacy top-right);
+    // `Some` = opened by a right-click or the Menu key, anchored there.
+    let anchor = state.menu_anchor_rect(&t.sizes);
     if state.open_with_open() {
-        return popover_stack(t, content, open_with_popover(t, state, mime_db, apps_db));
+        return popover_stack(
+            t,
+            content,
+            open_with_popover(t, state, mime_db, apps_db),
+            anchor,
+        );
     }
     if state.menu_open() {
         return popover_stack(
             t,
             content,
             context_menu(t, state, mime_db, clipboard_has_contents),
+            anchor,
         );
     }
     content
@@ -99,20 +111,36 @@ fn popover_stack<'a>(
     t: &'a Theme,
     content: Element<'a, Message>,
     popover: Element<'a, Message>,
+    anchor: Option<Rectangle>,
 ) -> Element<'a, Message> {
+    // The scrim closes on a right press as well: a right-click outside the
+    // menu dismisses it rather than falling through to the list behind.
     let scrim = mouse_area(Space::new().width(Fill).height(Fill))
-        .on_press(Message::Menu(menu::Message::Close));
-    let anchored = container(popover)
-        .width(Fill)
-        .height(Fill)
-        .padding(iced::Padding {
-            top: t.sizes.window_header,
-            right: t.sizes.pill_gap,
-            bottom: 0.0,
-            left: 0.0,
-        })
-        .align_x(iced::alignment::Horizontal::Right);
-    stack![content, scrim, anchored].into()
+        .on_press(Message::Menu(menu::Message::Close))
+        .on_right_press(Message::Menu(menu::Message::Close));
+    // A bare `container` does not capture clicks, so a press on the menu's
+    // own padding would fall through to the scrim and close it. Wrap it so
+    // both buttons are swallowed (button-without-`on_press` gotcha, AGENTS.md).
+    let swallow = Message::Menu(menu::Message::Swallow);
+    let popover = mouse_area(popover)
+        .on_press(swallow.clone())
+        .on_right_press(swallow);
+    let placed: Element<'a, Message> = match anchor {
+        // Beside the click/row; flips at the edges (`ui::anchored`).
+        Some(rect) => Anchored::new(popover, rect, t.sizes.gap_tight).into(),
+        None => container(popover)
+            .width(Fill)
+            .height(Fill)
+            .padding(iced::Padding {
+                top: t.sizes.window_header,
+                right: t.sizes.pill_gap,
+                bottom: 0.0,
+                left: 0.0,
+            })
+            .align_x(iced::alignment::Horizontal::Right)
+            .into(),
+    };
+    stack![content, scrim, placed].into()
 }
 
 /// What a context-menu row's predicate gets to look at: the facts about
@@ -149,6 +177,10 @@ fn has_selection(ctx: &MenuContext) -> bool {
     ctx.selected > 0
 }
 
+fn no_selection(ctx: &MenuContext) -> bool {
+    ctx.selected == 0
+}
+
 fn single_selection(ctx: &MenuContext) -> bool {
     ctx.selected == 1
 }
@@ -182,6 +214,7 @@ pub(super) const CONTEXT_MENU: &[MenuEntry] = &[
     MenuEntry { glyph: Icon::FolderPlus,     label_id: msg!("menu-new-folder"),       shown: always,                      message: menu::Message::NewFolderRequested },
     MenuEntry { glyph: Icon::FilePlus,       label_id: msg!("menu-new-file"),         shown: always,                      message: menu::Message::NewFileRequested },
     MenuEntry { glyph: Icon::Info,           label_id: msg!("menu-properties"),       shown: has_selection,               message: menu::Message::PropertiesRequested },
+    MenuEntry { glyph: Icon::Info,           label_id: msg!("menu-folder-properties"), shown: no_selection,                message: menu::Message::FolderPropertiesRequested },
     // --- features: insert one row at the position it should display ---
 ];
 
@@ -386,7 +419,12 @@ mod tests {
     fn menu_with_nothing_selected_and_an_empty_clipboard() {
         assert_eq!(
             labels(0, false, false),
-            ["Open in terminal", "New Folder", "New File"]
+            [
+                "Open in terminal",
+                "New Folder",
+                "New File",
+                "Folder properties"
+            ]
         );
     }
 
@@ -394,7 +432,13 @@ mod tests {
     fn menu_with_nothing_selected_and_a_full_clipboard() {
         assert_eq!(
             labels(0, true, false),
-            ["Open in terminal", "Paste", "New Folder", "New File"]
+            [
+                "Open in terminal",
+                "Paste",
+                "New Folder",
+                "New File",
+                "Folder properties"
+            ]
         );
     }
 

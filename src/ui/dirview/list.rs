@@ -10,7 +10,9 @@
 //! `ui_font` docs) — the style guide's "tabular numerals on size and date
 //! columns" rule.
 
-use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
+use iced::widget::{
+    Space, button, column, container, mouse_area, row, scrollable, text, text_input,
+};
 use iced::{Element, Fill, Length};
 use saola_theme::icon::{self, Icon};
 use saola_theme::{ColorExt, Surface, Theme, convert, style};
@@ -473,13 +475,20 @@ fn entry_row<'a>(
     // and iced's `MouseArea` forwards events to its child first, so an
     // outer double-click handler would never see a single press. Doubles
     // are paired app-side instead — see `Message::RowClicked`'s docs.
-    button(content)
-        .style(style::button::list_row(t, s, selected, has_cursor))
-        .width(Fill)
-        .height(t.sizes.list_row)
-        .padding(0)
-        .on_press(Message::RowClicked(visible_index))
-        .into()
+    // The right button is not the button widget's: the wrapper reports it
+    // (position first, from `RightClick` further out) — see `context.rs`.
+    mouse_area(
+        button(content)
+            .style(style::button::list_row(t, s, selected, has_cursor))
+            .width(Fill)
+            .height(t.sizes.list_row)
+            .padding(0)
+            .on_press(Message::RowClicked(visible_index)),
+    )
+    .on_right_press(Message::Context(super::context::Message::RowPressed(
+        visible_index,
+    )))
+    .into()
 }
 
 /// The inline-rename presentation of one row: the ordinary glyph, plus a

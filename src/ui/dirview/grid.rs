@@ -23,7 +23,9 @@
 //! [`columns_for_scroll`] instead — same arithmetic, width taken from the
 //! last reported scroll viewport.
 
-use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
+use iced::widget::{
+    Space, button, column, container, mouse_area, row, scrollable, text, text_input,
+};
 use iced::{Center, Element, Fill, Length};
 use saola_theme::icon;
 use saola_theme::{ColorExt, Surface, Theme, convert, style};
@@ -339,13 +341,19 @@ fn tile<'a>(
     // as `list.rs::entry_row`: the button's `on_press` captures every left
     // press before an outer `MouseArea` could track it, so doubles are
     // paired app-side in `Message::RowClicked`'s handler instead.
-    button(container(content).height(Fill).align_y(Center))
-        .style(style::button::selection_tile(t, s, selected, has_cursor))
-        .width(Length::Fixed(t.sizes.grid_tile))
-        .height(Length::Fixed(t.sizes.grid_tile + t.sizes.grid_tile_label))
-        .padding(t.sizes.pill_gap / 2.0)
-        .on_press(Message::RowClicked(visible_index))
-        .into()
+    // The right button is reported by the wrapper — see `context.rs`.
+    mouse_area(
+        button(container(content).height(Fill).align_y(Center))
+            .style(style::button::selection_tile(t, s, selected, has_cursor))
+            .width(Length::Fixed(t.sizes.grid_tile))
+            .height(Length::Fixed(t.sizes.grid_tile + t.sizes.grid_tile_label))
+            .padding(t.sizes.pill_gap / 2.0)
+            .on_press(Message::RowClicked(visible_index)),
+    )
+    .on_right_press(Message::Context(super::context::Message::RowPressed(
+        visible_index,
+    )))
+    .into()
 }
 
 /// The inline-rename presentation of one tile: same glyph, a `text_input`
