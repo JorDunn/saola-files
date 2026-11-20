@@ -136,14 +136,19 @@ bitflags::bitflags! {
         const TRASH = 1 << 1;
         /// `rename()` renames in place, without a copy+delete round trip.
         const RENAME_IN_PLACE = 1 << 2;
-        /// Permissions can be inspected/changed (a future trait method —
-        /// no backend sets this bit yet).
+        /// [`Backend::set_permissions`] works (chmod). Inspecting the mode
+        /// needs no cap: [`FileEntry::mode`] is `None` when a backend can't
+        /// report it.
         const SET_PERMISSIONS = 1 << 3;
         /// Entries have a real local path, so "open" can hand it straight
         /// to an app instead of downloading to a temp file first.
         const LOCAL_PATH = 1 << 4;
         /// Thumbnails can be generated directly from `read()`.
         const THUMBNAILS = 1 << 5;
+        /// [`Backend::symlink`] works.
+        const SYMLINK = 1 << 6;
+        /// [`Backend::statfs`] works (free-space numbers are available).
+        const STATFS = 1 << 7;
     }
 }
 
@@ -174,6 +179,14 @@ pub enum VfsError {
     Unavailable {
         message: String,
     },
+    /// The backend cannot do what was asked (its matching [`Caps`] bit is
+    /// unset). This is the answer from every trait method's default body,
+    /// so a UI that forgot to check `caps()` gets a worded error, not a
+    /// panic. `operation` is a noun phrase for what was refused, such as
+    /// `"creating links"`.
+    Unsupported {
+        operation: String,
+    },
     /// Catch-all for I/O errors that don't map onto a more specific
     /// variant above; still human-worded, never a raw `io::Error` dump.
     Other {
@@ -192,6 +205,9 @@ impl fmt::Display for VfsError {
             VfsError::NotADirectory { location } => write!(f, "{location} isn't a folder"),
             VfsError::IsADirectory { location } => write!(f, "{location} is a folder"),
             VfsError::Unavailable { message } => write!(f, "{message}"),
+            VfsError::Unsupported { operation } => {
+                write!(f, "This location doesn't support {operation}")
+            }
             VfsError::Other { message } => write!(f, "{message}"),
         }
     }
@@ -221,6 +237,19 @@ pub enum DirEvent {
     /// history would risk silently diverging from disk; the only correct
     /// recovery is a full re-list, same as a manual F5.
     Overflow,
+}
+
+/// Space on the filesystem holding a location, in bytes, from
+/// [`Backend::statfs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FsStats {
+    /// Size of the whole filesystem.
+    pub total: u64,
+    /// Unused bytes, including space only privileged users may use
+    /// (`f_bfree`). Use `available` for "how much can I write".
+    pub free: u64,
+    /// Unused bytes an ordinary user may use (`f_bavail`).
+    pub available: u64,
 }
 
 /// A chunk stream from [`Backend::read`]. Chunks are plain `Vec<u8>` (no
@@ -287,6 +316,37 @@ pub trait Backend: Send + Sync {
         modified: Option<SystemTime>,
     ) -> Result<(), VfsError>;
 
+    /// Create a symbolic link at `link` that points at `target`.
+    ///
+    /// `target` is stored verbatim, exactly as given (it may be relative
+    /// and need not exist), which is why it is a `&Path` and not a
+    /// [`Location`]: a link's target is just bytes to the filesystem.
+    /// Needs [`Caps::SYMLINK`]; the default says [`VfsError::Unsupported`].
+    async fn symlink(&self, _target: &Path, _link: &Location) -> Result<(), VfsError> {
+        Err(VfsError::Unsupported {
+            operation: "creating links".to_owned(),
+        })
+    }
+
+    /// Set the permission bits of `location` (chmod). Only the low 12 bits
+    /// (`0o7777`) of `mode` are used; file-type bits are ignored. Follows
+    /// a symlink to its target, like `chmod(1)`. Needs
+    /// [`Caps::SET_PERMISSIONS`]; the default says [`VfsError::Unsupported`].
+    async fn set_permissions(&self, _location: &Location, _mode: u32) -> Result<(), VfsError> {
+        Err(VfsError::Unsupported {
+            operation: "changing permissions".to_owned(),
+        })
+    }
+
+    /// Total, free and available bytes on the filesystem holding
+    /// `location`. Needs [`Caps::STATFS`]; the default says
+    /// [`VfsError::Unsupported`].
+    async fn statfs(&self, _location: &Location) -> Result<FsStats, VfsError> {
+        Err(VfsError::Unsupported {
+            operation: "reporting free space".to_owned(),
+        })
+    }
+
     /// A live stream of changes under `location`, or `None` if this
     /// backend can't signal (`Caps::WATCH` unset) — the UI falls back to
     /// refresh-on-navigate + F5. Synchronous: a backend either already has
@@ -351,6 +411,18 @@ impl Backend for std::sync::Arc<dyn Backend> {
         self.as_ref().set_times(location, accessed, modified).await
     }
 
+    async fn symlink(&self, target: &Path, link: &Location) -> Result<(), VfsError> {
+        self.as_ref().symlink(target, link).await
+    }
+
+    async fn set_permissions(&self, location: &Location, mode: u32) -> Result<(), VfsError> {
+        self.as_ref().set_permissions(location, mode).await
+    }
+
+    async fn statfs(&self, location: &Location) -> Result<FsStats, VfsError> {
+        self.as_ref().statfs(location).await
+    }
+
     fn watch(&self, location: &Location) -> Option<BoxStream<'static, DirEvent>> {
         self.as_ref().watch(location)
     }
@@ -364,6 +436,20 @@ impl Backend for std::sync::Arc<dyn Backend> {
 pub struct FakeBackend {
     caps: Caps,
     dirs: HashMap<PathBuf, Vec<FileEntry>>,
+    stats: Option<FsStats>,
+    /// Calls to the link/permission/space methods, in order. A `Mutex`
+    /// because the trait methods take `&self` (interior mutability), and
+    /// `Backend` requires `Sync`, which rules out `RefCell`.
+    calls: std::sync::Mutex<Vec<FakeCall>>,
+}
+
+/// One recorded call on a [`FakeBackend`], so tests can assert what a
+/// feature asked the backend to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FakeCall {
+    Symlink { target: PathBuf, link: Location },
+    SetPermissions { location: Location, mode: u32 },
+    Statfs { location: Location },
 }
 
 impl FakeBackend {
@@ -371,6 +457,41 @@ impl FakeBackend {
         FakeBackend {
             caps: Caps::empty(),
             dirs: HashMap::new(),
+            stats: None,
+            calls: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The numbers `statfs` returns when `Caps::STATFS` is set.
+    pub fn with_stats(mut self, stats: FsStats) -> Self {
+        self.stats = Some(stats);
+        self
+    }
+
+    /// Every symlink/permission/statfs call so far, refused ones included.
+    pub fn calls(&self) -> Vec<FakeCall> {
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn record(&self, call: FakeCall) {
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(call);
+    }
+
+    /// `Unsupported` unless `cap` is set: the same rule a real backend
+    /// follows, so UI tests see honest refusals.
+    fn require(&self, cap: Caps, operation: &str) -> Result<(), VfsError> {
+        if self.caps.contains(cap) {
+            Ok(())
+        } else {
+            Err(VfsError::Unsupported {
+                operation: operation.to_owned(),
+            })
         }
     }
 
@@ -465,6 +586,32 @@ impl Backend for FakeBackend {
     ) -> Result<(), VfsError> {
         Err(VfsError::Other {
             message: format!("FakeBackend can't set times on {location}"),
+        })
+    }
+
+    async fn symlink(&self, target: &Path, link: &Location) -> Result<(), VfsError> {
+        self.record(FakeCall::Symlink {
+            target: target.to_path_buf(),
+            link: link.clone(),
+        });
+        self.require(Caps::SYMLINK, "creating links")
+    }
+
+    async fn set_permissions(&self, location: &Location, mode: u32) -> Result<(), VfsError> {
+        self.record(FakeCall::SetPermissions {
+            location: location.clone(),
+            mode,
+        });
+        self.require(Caps::SET_PERMISSIONS, "changing permissions")
+    }
+
+    async fn statfs(&self, location: &Location) -> Result<FsStats, VfsError> {
+        self.record(FakeCall::Statfs {
+            location: location.clone(),
+        });
+        self.require(Caps::STATFS, "reporting free space")?;
+        self.stats.ok_or_else(|| VfsError::Other {
+            message: format!("FakeBackend has no space numbers for {location}"),
         })
     }
 
@@ -591,6 +738,9 @@ mod tests {
             VfsError::Unavailable {
                 message: "the server hung up".to_owned(),
             },
+            VfsError::Unsupported {
+                operation: "creating links".to_owned(),
+            },
             VfsError::Other {
                 message: "something else went wrong".to_owned(),
             },
@@ -664,5 +814,154 @@ mod tests {
         let backend = FakeBackend::new().with_dir("/home", vec![entry("a.txt", EntryKind::File)]);
         let result = futures::executor::block_on(backend.metadata(&Location::local("/home/a.txt")));
         assert_eq!(result.unwrap().name, OsString::from("a.txt"));
+    }
+
+    // ── symlink / set_permissions / statfs ───────────────────────────────
+
+    /// A backend that overrides nothing, to prove the trait's default
+    /// bodies refuse with `Unsupported` instead of panicking.
+    struct BareBackend;
+
+    #[async_trait]
+    impl Backend for BareBackend {
+        fn scheme(&self) -> &'static str {
+            "bare"
+        }
+        fn caps(&self) -> Caps {
+            Caps::empty()
+        }
+        async fn list(&self, _: &Location) -> Result<Vec<FileEntry>, VfsError> {
+            Ok(Vec::new())
+        }
+        async fn metadata(&self, l: &Location) -> Result<FileEntry, VfsError> {
+            Err(VfsError::NotFound {
+                location: l.to_string(),
+            })
+        }
+        async fn read(&self, l: &Location) -> Result<ReadStream, VfsError> {
+            Err(VfsError::NotFound {
+                location: l.to_string(),
+            })
+        }
+        async fn write(&self, l: &Location) -> Result<WriteSink, VfsError> {
+            Err(VfsError::NotFound {
+                location: l.to_string(),
+            })
+        }
+        async fn mkdir(&self, _: &Location) -> Result<(), VfsError> {
+            Ok(())
+        }
+        async fn rename(&self, _: &Location, _: &Location) -> Result<(), VfsError> {
+            Ok(())
+        }
+        async fn remove(&self, _: &Location) -> Result<(), VfsError> {
+            Ok(())
+        }
+        async fn set_times(
+            &self,
+            _: &Location,
+            _: Option<SystemTime>,
+            _: Option<SystemTime>,
+        ) -> Result<(), VfsError> {
+            Ok(())
+        }
+        fn watch(&self, _: &Location) -> Option<BoxStream<'static, DirEvent>> {
+            None
+        }
+    }
+
+    fn is_unsupported<T: std::fmt::Debug>(result: Result<T, VfsError>) -> bool {
+        matches!(result, Err(VfsError::Unsupported { .. }))
+    }
+
+    #[tokio::test]
+    async fn default_methods_answer_unsupported() {
+        let backend = BareBackend;
+        let here = Location::local("/x");
+        assert!(is_unsupported(backend.symlink(Path::new("t"), &here).await));
+        assert!(is_unsupported(backend.set_permissions(&here, 0o644).await));
+        assert!(is_unsupported(backend.statfs(&here).await));
+    }
+
+    #[tokio::test]
+    async fn fake_backend_records_calls_and_follows_its_caps() {
+        let stats = FsStats {
+            total: 100,
+            free: 40,
+            available: 30,
+        };
+        let fake = FakeBackend::new()
+            .with_caps(Caps::SYMLINK | Caps::SET_PERMISSIONS | Caps::STATFS)
+            .with_stats(stats);
+        let link = Location::local("/d/link");
+        let file = Location::local("/d/file");
+        assert_eq!(fake.symlink(Path::new("file"), &link).await, Ok(()));
+        assert_eq!(fake.set_permissions(&file, 0o600).await, Ok(()));
+        assert_eq!(fake.statfs(&file).await, Ok(stats));
+        assert_eq!(
+            fake.calls(),
+            vec![
+                FakeCall::Symlink {
+                    target: PathBuf::from("file"),
+                    link,
+                },
+                FakeCall::SetPermissions {
+                    location: file.clone(),
+                    mode: 0o600,
+                },
+                FakeCall::Statfs { location: file },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_backend_without_caps_refuses_but_still_records() {
+        let fake = FakeBackend::new();
+        let here = Location::local("/x");
+        assert!(is_unsupported(fake.symlink(Path::new("t"), &here).await));
+        assert!(is_unsupported(fake.set_permissions(&here, 0o644).await));
+        assert!(is_unsupported(fake.statfs(&here).await));
+        assert_eq!(fake.calls().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn arc_forwarding_impl_matches_the_inner_backend() {
+        let caps = Caps::SYMLINK | Caps::STATFS;
+        let stats = FsStats {
+            total: 9,
+            free: 5,
+            available: 4,
+        };
+        let inner: std::sync::Arc<dyn Backend> =
+            std::sync::Arc::new(FakeBackend::new().with_caps(caps).with_stats(stats));
+        // Calls go through `Backend for Arc<dyn Backend>`, not the inner
+        // value directly: a forgotten forwarder would hit the trait's
+        // default body and answer `Unsupported` despite the caps.
+        assert_eq!(Backend::caps(&inner), caps);
+        let here = Location::local("/x");
+        assert_eq!(
+            Backend::symlink(&inner, Path::new("t"), &here).await,
+            Ok(())
+        );
+        assert_eq!(Backend::statfs(&inner, &here).await, Ok(stats));
+        assert!(is_unsupported(
+            Backend::set_permissions(&inner, &here, 0o644).await
+        ));
+    }
+
+    #[test]
+    fn caps_bits_for_links_and_space_are_distinct() {
+        let all = [
+            Caps::WATCH,
+            Caps::TRASH,
+            Caps::RENAME_IN_PLACE,
+            Caps::SET_PERMISSIONS,
+            Caps::LOCAL_PATH,
+            Caps::THUMBNAILS,
+            Caps::SYMLINK,
+            Caps::STATFS,
+        ];
+        let combined = all.iter().fold(Caps::empty(), |acc, cap| acc | *cap);
+        assert_eq!(combined.bits().count_ones() as usize, all.len());
     }
 }

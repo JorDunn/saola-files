@@ -51,6 +51,7 @@ use std::fs;
 use std::future::Future;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
@@ -65,7 +66,9 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant as TokioInstant;
 
 use crate::core::fs::entry::{EntryKind, FileEntry};
-use crate::core::vfs::{Backend, Caps, DirEvent, Location, ReadStream, VfsError, WriteSink};
+use crate::core::vfs::{
+    Backend, Caps, DirEvent, FsStats, Location, ReadStream, VfsError, WriteSink,
+};
 
 /// Bytes read/written per chunk on `read`/`write` — big enough that a
 /// multi-gigabyte file doesn't produce an absurd number of channel sends,
@@ -261,6 +264,37 @@ fn set_times_blocking(
     file.set_times(times).map_err(|err| io_error(location, err))
 }
 
+/// Create a symlink. `std::os::unix::fs::symlink` takes the target as a
+/// `Path`, which on Unix is raw bytes, so a non-UTF-8 target is stored
+/// exactly as given.
+fn symlink_blocking(target: &Path, link: &Location) -> Result<(), VfsError> {
+    std::os::unix::fs::symlink(target, &link.path).map_err(|err| io_error(link, err))
+}
+
+/// chmod. `from_mode` keeps only what the caller passes; masking to
+/// `0o7777` drops any file-type bits so a mode copied from `st_mode`
+/// cannot confuse the call.
+fn set_permissions_blocking(location: &Location, mode: u32) -> Result<(), VfsError> {
+    fs::set_permissions(&location.path, fs::Permissions::from_mode(mode & 0o7777))
+        .map_err(|err| io_error(location, err))
+}
+
+/// `statvfs(2)` via rustix (safe, no libc). Block counts are in units of
+/// the fragment size (`f_frsize`); the multiplications saturate rather
+/// than overflow on a hostile or absurd filesystem.
+fn statfs_blocking(location: &Location) -> Result<FsStats, VfsError> {
+    let stat = rustix::fs::statvfs(&location.path)
+        // `Errno` converts to `io::Error`, so the existing worded mapping
+        // (NotFound, PermissionDenied, ...) applies unchanged.
+        .map_err(|errno| io_error(location, io::Error::from(errno)))?;
+    let unit = stat.f_frsize;
+    Ok(FsStats {
+        total: stat.f_blocks.saturating_mul(unit),
+        free: stat.f_bfree.saturating_mul(unit),
+        available: stat.f_bavail.saturating_mul(unit),
+    })
+}
+
 /// The [`WriteSink`] `LocalBackend::write` returns.
 ///
 /// Wraps the raw `mpsc::Sender<Vec<u8>>` fed to the detached blocking
@@ -370,9 +404,17 @@ impl Backend for LocalBackend {
         // `core::fs::trash::trash` directly for local locations rather
         // than going through this trait when it's set, so claiming it here
         // is honest, not a capability lie the way it would have been
-        // before this stage existed. `SET_PERMISSIONS` has no backing
-        // trait method at all yet.
-        Caps::WATCH | Caps::TRASH | Caps::RENAME_IN_PLACE | Caps::LOCAL_PATH | Caps::THUMBNAILS
+        // before this stage existed. `SET_PERMISSIONS`, `SYMLINK` and
+        // `STATFS` each have a real method below (std chmod, std symlink,
+        // rustix statvfs), so all three are honest too.
+        Caps::WATCH
+            | Caps::TRASH
+            | Caps::RENAME_IN_PLACE
+            | Caps::LOCAL_PATH
+            | Caps::THUMBNAILS
+            | Caps::SET_PERMISSIONS
+            | Caps::SYMLINK
+            | Caps::STATFS
     }
 
     async fn list(&self, location: &Location) -> Result<Vec<FileEntry>, VfsError> {
@@ -473,6 +515,23 @@ impl Backend for LocalBackend {
             set_times_blocking(&loc, accessed, modified)
         })
         .await
+    }
+
+    async fn symlink(&self, target: &Path, link: &Location) -> Result<(), VfsError> {
+        // Owned copies: the closure runs on another thread and must be
+        // `'static`, so it cannot borrow the arguments.
+        let (target, link_owned) = (target.to_path_buf(), link.clone());
+        run_blocking(link, move || symlink_blocking(&target, &link_owned)).await
+    }
+
+    async fn set_permissions(&self, location: &Location, mode: u32) -> Result<(), VfsError> {
+        let loc = location.clone();
+        run_blocking(location, move || set_permissions_blocking(&loc, mode)).await
+    }
+
+    async fn statfs(&self, location: &Location) -> Result<FsStats, VfsError> {
+        let loc = location.clone();
+        run_blocking(location, move || statfs_blocking(&loc)).await
     }
 
     fn watch(&self, location: &Location) -> Option<BoxStream<'static, DirEvent>> {
@@ -937,6 +996,99 @@ mod tests {
         }
         assert_eq!(contents, vec![1, 2, 3, 4, 5]);
 
+        cleanup(dir);
+    }
+
+    // ── symlink / set_permissions / statfs ───────────────────────────────
+
+    #[tokio::test]
+    async fn caps_claim_links_permissions_and_space() {
+        let caps = backend().caps();
+        assert!(caps.contains(Caps::SYMLINK));
+        assert!(caps.contains(Caps::SET_PERMISSIONS));
+        assert!(caps.contains(Caps::STATFS));
+    }
+
+    #[tokio::test]
+    async fn symlink_target_bytes_round_trip_even_when_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempdir();
+        let link = dir.join("link");
+        let target = std::path::Path::new(std::ffi::OsStr::from_bytes(b"gone-\xff\xfe.txt"));
+        // The target need not exist: a dangling link is still a link.
+        backend()
+            .symlink(target, &Location::local(&link))
+            .await
+            .unwrap();
+        let stored = std::fs::read_link(&link).unwrap();
+        assert_eq!(stored.as_os_str().as_bytes(), target.as_os_str().as_bytes());
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn symlink_over_an_existing_name_is_already_exists() {
+        let dir = tempdir();
+        let link = dir.join("taken");
+        std::fs::write(&link, b"x").unwrap();
+        let err = backend()
+            .symlink(std::path::Path::new("whatever"), &Location::local(&link))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VfsError::AlreadyExists { .. }), "{err:?}");
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn set_permissions_applies_the_mode() {
+        let dir = tempdir();
+        let file = dir.join("f");
+        std::fs::write(&file, b"x").unwrap();
+        backend()
+            .set_permissions(&Location::local(&file), 0o640)
+            .await
+            .unwrap();
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o640);
+        // File-type bits in the argument (as copied from `st_mode`) are
+        // ignored rather than rejected.
+        backend()
+            .set_permissions(&Location::local(&file), 0o100_600)
+            .await
+            .unwrap();
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o600);
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn set_permissions_on_a_missing_file_is_not_found() {
+        let dir = tempdir();
+        let err = backend()
+            .set_permissions(&Location::local(dir.join("nope")), 0o600)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VfsError::NotFound { .. }), "{err:?}");
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn statfs_reports_plausible_numbers_for_a_temp_dir() {
+        let dir = tempdir();
+        let stats = backend().statfs(&Location::local(&dir)).await.unwrap();
+        assert!(stats.total > 0);
+        assert!(stats.free <= stats.total);
+        assert!(stats.available <= stats.free);
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn statfs_on_a_missing_path_is_not_found() {
+        let dir = tempdir();
+        let err = backend()
+            .statfs(&Location::local(dir.join("nope")))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VfsError::NotFound { .. }), "{err:?}");
         cleanup(dir);
     }
 

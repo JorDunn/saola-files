@@ -217,6 +217,24 @@ russh = { version = "0.52", optional = true, default-features = false, features 
 # in that module's doc comment rather than silently accepted.
 russh-sftp = { version = "2.4", optional = true, default-features = true }
 
+# `Backend::statfs` on the local backend (`modules::local`) needs one
+# `statvfs(2)` call, and this crate has no `unsafe` and no libc binding.
+# Surveyed 2026-11-19:
+# 1. **`rustix` (chosen)** — safe wrappers over Linux syscalls; its default
+#    `linux_raw` backend issues the syscall directly, so there is no C
+#    library or build script involved (pure Rust). `fs::statvfs(path)`
+#    returns a plain struct of block counts. Already in the lock file
+#    transitively (1.x via other crates), so no new code is compiled.
+#    `default-features = false` plus `std` + `fs` keeps it to just the
+#    filesystem module.
+# 2. **`libc::statvfs`** — works, but needs an `unsafe` block and a
+#    zeroed out-struct, against the no-panic/no-surprise posture here.
+# 3. **`nix`** — safe `statvfs` too, but a larger API surface (and a libc
+#    dependency) than the one call needed.
+# 4. **`fs2`/`fs4` (`available_space`)** — fs4 would work, but is another
+#    crate for one number and only reports available space, not total/free.
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
+
 # The Saola design system: tokens (colors, typography, radii, sizes) and
 # iced style helpers. `tag` and `version` must move together — cargo errors
 # if they disagree, which is the guard against drifting off a released tag.
