@@ -78,6 +78,7 @@ use saola_theme::{Surface, Theme};
 
 use crate::config::{Config, CustomAction, SortKey, View};
 use crate::core::apps::AppsDb;
+use crate::core::failure::{Failure, Operation};
 use crate::core::fs::entry::FileEntry;
 use crate::core::mime::MimeDb;
 use crate::core::thumbs::ThumbCache;
@@ -268,6 +269,10 @@ pub enum Event {
     /// view's (see [`AppAction`]).
     App(AppAction),
     // --- features (alphabetical) ---
+    /// An operation this view started failed (today: New Folder / New File
+    /// could not be created). The owner decides how to show it; see
+    /// `ui::dialogs::error_notice`.
+    Failed(Operation, Vec<Failure>),
 }
 
 /// One thumbnail candidate bubbled via [`Event::ThumbnailsNeeded`] —

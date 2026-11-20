@@ -16,6 +16,7 @@
 
 mod connect;
 mod dbus;
+mod failures;
 mod file_ops;
 mod navigation;
 mod properties;
@@ -140,6 +141,9 @@ pub(crate) enum Message {
     /// the menu instead of doing nothing).
     Noop,
     // --- features (alphabetical) ---
+    /// The error notice's buttons, and the way anything reports a failure
+    /// into it (`error_notice::Message::Report`; see `failures::failed`).
+    ErrorNotice(ui::dialogs::error_notice::Message),
     /// Session-state events (`session.rs`): window resizes.
     Session(session::Message),
     /// A batch of background content-sniff head reads finished
@@ -341,6 +345,9 @@ pub(crate) struct App {
     /// gets to do anything else with it.
     activation: cli::Cli,
     // --- features (alphabetical) ---
+    /// The failure notice in the footer band, if one is showing. Persists
+    /// until dismissed; see `ui::dialogs::error_notice` and `failures`.
+    error_notice: Option<ui::dialogs::error_notice::Notice>,
     /// Remembered window size, last location and per-folder view
     /// settings (`session.rs`).
     session: session::Session,
@@ -456,6 +463,7 @@ impl App {
             pending_connect: None,
             activation,
             // --- features (alphabetical) ---
+            error_notice: None,
             session,
             sniff_inflight: HashSet::new(),
         };
@@ -516,7 +524,10 @@ impl App {
                 Task::none()
             }
             Message::Noop => Task::none(),
-            Message::Trash(inner) => trash_task(self.trash_view.update(inner)),
+            Message::Trash(inner) => {
+                self.report_trash_failure(&inner);
+                trash_task(self.trash_view.update(inner))
+            }
             Message::UndoToast(ui::dialogs::undo_toast::Message::UndoClicked) => self.start_undo(),
             Message::UndoToast(ui::dialogs::undo_toast::Message::Tick) => {
                 if let Some(toast) = &self.undo_toast
@@ -550,6 +561,7 @@ impl App {
             Message::Dbus(event) => self.handle_dbus_event(event),
             Message::DbusPropertiesResolved(items) => self.open_properties(items),
             // --- features (alphabetical) ---
+            Message::ErrorNotice(inner) => self.handle_error_notice(inner),
             Message::Session(inner) => self.handle_session_message(inner),
             Message::SniffReady(outcomes) => self.handle_sniff_ready(outcomes),
         }

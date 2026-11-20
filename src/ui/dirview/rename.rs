@@ -25,6 +25,7 @@ use std::ffi::{OsStr, OsString};
 use futures::SinkExt;
 use iced::Task;
 
+use crate::core::failure::{Failure, Operation};
 use crate::core::fs::entry::FileEntry;
 use crate::core::vfs::{Location, VfsError};
 use crate::tr;
@@ -182,7 +183,11 @@ impl DirectoryView {
             }
             Err(err) => {
                 eprintln!("saola-files: could not create {name:?} in {dir_location}: {err}");
-                (Task::none(), None)
+                let failure = Failure::new(name, err).into_folder(&dir_location);
+                (
+                    Task::none(),
+                    Some(Event::Failed(Operation::Create, vec![failure])),
+                )
             }
         }
     }
@@ -554,6 +559,30 @@ mod tests {
             .rename_state()
             .expect("New Folder should start already in rename mode");
         assert_eq!(state.original, OsString::from("New Folder"));
+    }
+
+    #[test]
+    fn create_result_failure_bubbles_a_worded_failure() {
+        let mut view = listed_view(vec![]);
+        let (_, event) = view.update(Message::CreateResult(
+            Location::local("/home"),
+            OsString::from("New Folder"),
+            Err(VfsError::PermissionDenied {
+                location: "/home".to_owned(),
+            }),
+        ));
+        match event {
+            Some(Event::Failed(Operation::Create, failures)) => {
+                assert_eq!(failures.len(), 1);
+                assert_eq!(
+                    crate::core::failure::describe(Operation::Create, &failures[0]),
+                    "Couldn't create “New Folder” in “home”: permission denied."
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        // Nothing was created, so nothing is selected or being renamed.
+        assert!(view.rename_state().is_none());
     }
 
     #[test]

@@ -3,13 +3,17 @@
 //! and the session undo stack. Named `file_ops` rather than `ops` so it
 //! doesn't collide with the `core::fs::ops` import `app/mod.rs` uses.
 
+use std::ffi::OsString;
+
 use iced::Task;
 
 use core::clipboard_interop;
+use core::failure::{Failure, Operation};
 use core::fs::{ops, undo};
-use core::vfs::Location;
+use core::vfs::{Location, VfsError};
 use saola_files::{core, modules, tr, ui};
 
+use super::failures::{self, failed};
 use super::{App, Message};
 
 /// See `App::pending_conflict`'s doc comment.
@@ -68,11 +72,19 @@ impl App {
                 });
             }
             ops::OpEvent::Finished { errors } => {
-                // No error-dialog surface exists yet (same posture
-                // `handle_directory_event`'s spawn failures already take)
-                // — worded to stderr rather than silently dropped.
+                // stderr keeps the raw line; the window gets the worded
+                // notice (`app::failures`).
                 for (location, err) in &errors {
                     eprintln!("saola-files: {location}: {err}");
+                }
+                // Built first so the borrow of `self.active_op` ends before
+                // `report_failures` borrows `self` mutably.
+                let reported = self
+                    .active_op
+                    .as_ref()
+                    .map(|request| failures::op_failures(request.kind, &request.dest_dir, &errors));
+                if let Some((operation, failures)) = reported {
+                    self.report_failures(operation, failures);
                 }
 
                 // Stage 10: a clean (zero-conflict) Move is undo-able —
@@ -224,11 +236,12 @@ impl App {
             return Task::none();
         };
         self.undo_toast = None;
-        Task::perform(undo::apply(entry), |result| {
-            if let Err(err) = result {
+        Task::perform(undo::apply(entry), |result| match result {
+            Ok(()) => Message::Noop,
+            Err(err) => {
                 eprintln!("saola-files: couldn't undo: {err}");
+                failed(Operation::Undo, vec![Failure::new(OsString::new(), err)])
             }
-            Message::Noop
         })
     }
 
@@ -271,9 +284,9 @@ impl App {
                         // `Message::Trashed`'s doc comment.
                         Ok(Some(id)) => Message::Trashed(original, id),
                         Ok(None) => Message::Noop,
-                        Err((location, err)) => {
+                        Err((location, operation, err)) => {
                             eprintln!("saola-files: couldn't delete {location}: {err}");
-                            Message::Noop
+                            failed(operation, vec![Failure::at(&location, err)])
                         }
                     }
                 })
@@ -296,12 +309,19 @@ pub(super) fn write_foreign_clipboard(
     op: ops::ClipboardOp,
     locations: Vec<Location>,
 ) -> Task<Message> {
-    Task::perform(clipboard_interop::write(op, locations), |result| {
-        if let Err(err) = result {
-            eprintln!("saola-files: couldn't update the system clipboard: {err}");
-        }
-        Message::Noop
-    })
+    Task::perform(
+        clipboard_interop::write(op, locations),
+        |result| match result {
+            Ok(()) => Message::Noop,
+            Err(err) => {
+                eprintln!("saola-files: couldn't update the system clipboard: {err}");
+                failed(
+                    Operation::Clipboard,
+                    vec![Failure::new(OsString::new(), err)],
+                )
+            }
+        },
+    )
 }
 
 /// One location's half of `App::start_delete`: trashes it when its
@@ -323,12 +343,17 @@ pub(super) fn write_foreign_clipboard(
 async fn delete_one(
     location: Location,
     force_permanent: bool,
-) -> Result<Option<core::fs::trash::TrashId>, (Location, String)> {
+) -> Result<Option<core::fs::trash::TrashId>, (Location, Operation, VfsError)> {
+    let attempted = if force_permanent {
+        Operation::Delete
+    } else {
+        Operation::Trash
+    };
     let Some(backend) = modules::resolve(&location) else {
-        return Err((
-            location.clone(),
-            tr!("error-no-backend", scheme = location.scheme.as_str()),
-        ));
+        let err = VfsError::Other {
+            message: tr!("error-no-backend", scheme = location.scheme.as_str()),
+        };
+        return Err((location, attempted, err));
     };
     let caps = backend.caps();
 
@@ -336,17 +361,17 @@ async fn delete_one(
         let path = location.path.clone();
         return core::fs::trash::trash(&path)
             .map(Some)
-            .map_err(|err| (location.clone(), err.to_string()));
+            .map_err(|err| (location.clone(), Operation::Trash, err));
     }
     if location.is_local() {
         let path = location.path.clone();
         return core::fs::trash::delete_permanently(&path)
             .map(|()| None)
-            .map_err(|err| (location.clone(), err.to_string()));
+            .map_err(|err| (location.clone(), Operation::Delete, err));
     }
     backend
         .remove(&location)
         .await
         .map(|()| None)
-        .map_err(|err| (location.clone(), err.to_string()))
+        .map_err(|err| (location.clone(), Operation::Delete, err))
 }
