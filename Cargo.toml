@@ -21,80 +21,22 @@ default = ["sftp"]
 sftp = ["dep:russh", "dep:russh-sftp"]
 
 [dependencies]
-# GUI toolkit. Surveyed 2026-08-08: iced is the only toolkit the Saola
-# ecosystem targets (saola-theme is an iced style crate; panel, capture and
-# lockscreen are all iced 0.14), so there was no real alternative to weigh —
-# GTK/Qt would orphan the design system. Unlike the panel/capture this app is
-# an ordinary toplevel window, not a layer-shell surface, so there is no
-# iced_layershell here and never should be. Features, following capture's
-# posture of default renderer features plus what the app needs:
-# `tokio` (one shared async runtime — zbus joins it in a later stage),
-# `svg` (Lucide icons, Stage 6), `image` (thumbnails, Stage 11).
-iced = { version = "0.14", features = ["tokio", "svg", "image"] }
 
-# The Saola design system: tokens (colors, typography, radii, sizes) and
-# iced style helpers. `tag` and `version` must move together — cargo errors
-# if they disagree, which is the guard against drifting off a released tag.
-# Never point this at `branch = "main"`; bumping the tag is a deliberate,
-# reviewed change (see CLAUDE.md "Design language").
-# Pinned 2026-08-08 at the same tag the panel and capture use.
-# Bumped 2026-08-10 to v0.9.0 for `saola_theme::overflow::truncate` — the
-# design language's shared answer to text that doesn't fit (style guide §7's
-# default mode: cut at a character limit, one `…`, no motion). `ui/dirview/
-# grid.rs` calls it on tile labels; before the bump a long filename wrapped
-# and overflowed the fixed tile-row height the grid's virtualization math
-# assumes. Ported into the theme rather than written locally per CLAUDE.md's
-# "if a style is missing, add it to saola-theme — never restyle locally".
-# Bumped again 2026-08-10 to v0.10.0: `truncate`'s budget is now counted in
-# UAX #11 East-Asian *width units* (wide/fullwidth char = 2, narrow = 1,
-# control = 0) instead of raw `char`s. This is the upstream fix for the
-# limitation grid.rs used to disclose — a 13-character CJK label was cut to
-# 13 *characters*, which paints ~145 px in a 96 px tile and spilled into the
-# neighbouring label. Same "add it to saola-theme, never patch locally" rule:
-# every surface with a width cap gets the fix at once. Narrow-only input is
-# unaffected (for all-narrow text the arithmetic is exactly the old character
-# count), so Latin labels render byte-for-byte as they did at 0.9.0.
-# Bumped again 2026-08-11 to v0.11.0 for `saola_theme::overflow::unit_budget`
-# — the pixels → width-units conversion that used to live here as grid.rs's
-# private `LABEL_AVG_ADVANCE_EM` + `label_unit_budget`. The list view needs
-# the same arithmetic for its flexible name column, and two surfaces sharing
-# a calibration constant is exactly the "shared helpers go upstream" rule:
-# the 0.55 em average advance and the floor-of-4 rationale now have one home
-# (and one test suite) instead of a copy per view. Behaviour at today's
-# tokens is identical — `unit_budget(96.0, 12.5)` is still 13.
-# Bumped 2026-08-17 to v0.13.0 for two breaking changes, both resolving items
-# tracked in docs/UPSTREAM-THEME-DEBT.md: rest-recipe helpers now take a
-# `Chrome` (`Chrome::Shell` for panel/popover-style ink chrome,
-# `Chrome::Window` for controls inside this app's own window) so an
-# unselected control no longer paints a full-opacity ivory pill on an ink
-# window; and `widget::breadcrumb` takes a trailing width budget, replacing
-# this app's stopgap scrollable wrapper (`ui/breadcrumbs.rs`) with the real
-# upstream fix.
-# Bumped again 2026-09-06 to v0.15.0 to track the family's current release.
-# 0.14.0 made the notification card kit alpha-aware — `icon_tile` and
-# `life_rule` now take the card's `alpha` so the tile and countdown rule fade
-# at the same rate as the card they sit on — and gave `toast_alpha` an
-# ease-out entrance. 0.15.0 added `bar_row_container`, `avatar::placeholder`,
-# and their supporting tokens, none of which this app uses yet.
-# Bumped again 2026-11-19 to v0.17.0 to track the release. 0.16.0 added
-# `notification::icon_tile_colored` and 0.17.0 added launcher grid tiles and
-# touch-size tokens (`button::app_tile`, `list_row_touch`, edge-strip sizes);
-# both are additive and unused here. saola-tokens moved 0.9.0 -> 0.10.0 with it.
-saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.17.0", version = "0.17.0" }
+# Dependency debt is cheap to take on and expensive to shed; every
+# dependency in this table carries a dated survey comment (alternatives
+# considered, why they lost) — the panel's Cargo.toml is the reference for
+# the format. Entries are alphabetical, one per line, so parallel additions
+# land in different places and merge cleanly.
 
-# Config parsing. Surveyed 2026-08-08: the family standard is hand-walked
-# parsing over a real parser's loose document type. capture (the newest
-# precedent, migrated from KDL 2026-08-08) uses `toml`'s `Table` for this;
-# `toml_edit` adds format-preserving round-tripping we don't need (we never
-# write the config), and serde-derive on the config struct is banned by the
-# resilience rules (one bad knob must degrade alone, with its own warning).
-# serde comes along transitively as toml's data model; we don't derive on it.
-toml = "0.9"
-
-# Dependency debt is cheap to take on and expensive to shed; every addition
-# below this line needs a dated survey comment like the ones above
-# (alternatives considered, why they lost) — the panel's Cargo.toml is the
-# reference for the format.
+# `core::vfs::Backend` (Stage 3) is `dyn`-safe with `async fn` methods via
+# `async_trait`'s boxing macro. Surveyed 2026-08-08: the alternative is
+# hand-writing `fn list(&self, ..) -> Pin<Box<dyn Future<Output = ..> + Send
+# + '_>>` at each of the trait's nine async methods — mechanical
+# boilerplate that obscures the actual signatures teaching-notes-style
+# comments are supposed to explain. `async_trait` is the de facto standard
+# for this (rust-lang/rfcs #3185's motivating use case) and is already
+# transitively present via other deps, so this pins it as a direct one.
+async-trait = "0.1"
 
 # `Backend::caps()` (src/core/vfs.rs, Stage 3). Surveyed 2026-08-08: the
 # alternative is a hand-rolled `struct Caps { watch: bool, trash: bool, ... }`
@@ -107,34 +49,6 @@ toml = "0.9"
 # there's no version-fragmentation cost.
 bitflags = "2"
 
-# `core::vfs::Backend` (Stage 3) is `dyn`-safe with `async fn` methods via
-# `async_trait`'s boxing macro. Surveyed 2026-08-08: the alternative is
-# hand-writing `fn list(&self, ..) -> Pin<Box<dyn Future<Output = ..> + Send
-# + '_>>` at each of the trait's nine async methods — mechanical
-# boilerplate that obscures the actual signatures teaching-notes-style
-# comments are supposed to explain. `async_trait` is the de facto standard
-# for this (rust-lang/rfcs #3185's motivating use case) and is already
-# transitively present via other deps, so this pins it as a direct one.
-async-trait = "0.1"
-
-# `modules::local`'s `spawn_blocking` calls (Stage 3 — CLAUDE.md: "One
-# async runtime: iced's tokio executor and zbus's tokio integration share
-# it; never construct a second"). Already pulled in transitively by iced's
-# `tokio` feature (see the `iced` entry above), which *is* the shared
-# runtime this crate's blocking-file-I/O calls run on — this makes that an
-# explicit, versioned dependency instead of relying on it staying available
-# transitively. No `rt-multi-thread`/other extra features requested here:
-# iced's own feature selection already provides the runtime this crate's
-# code calls into.
-# `features = ["sync"]` added Stage 11: `core::thumbs::thumbnail_for` bounds
-# concurrent thumbnail generation with a `tokio::sync::Semaphore`
-# (CLAUDE.md: "never unbounded task spawns") — `Semaphore` lives behind
-# tokio's `sync` feature specifically, which nothing already enables
-# transitively (iced's own `tokio` feature only pulls in `iced_futures`'
-# executor integration, not `tokio::sync`), so this is requested explicitly
-# rather than relied on.
-tokio = { version = "1", features = ["sync"] }
-
 # `core::vfs::{ReadStream, WriteSink}` and the local backend's chunked
 # read/write (Stage 3) need `Stream`/`Sink`/`BoxStream` and a channel that
 # isn't `tokio::sync` (CLAUDE.md: iced messages use `iced::futures::channel::
@@ -143,6 +57,28 @@ tokio = { version = "1", features = ["sync"] }
 # `iced::futures`). Already an indirect dependency of `iced`/`tokio`; this
 # pins the version this crate's code actually names in `use` paths.
 futures = "0.3"
+
+# GUI toolkit. Surveyed 2026-08-08: iced is the only toolkit the Saola
+# ecosystem targets (saola-theme is an iced style crate; panel, capture and
+# lockscreen are all iced 0.14), so there was no real alternative to weigh —
+# GTK/Qt would orphan the design system. Unlike the panel/capture this app is
+# an ordinary toplevel window, not a layer-shell surface, so there is no
+# iced_layershell here and never should be. Features, following capture's
+# posture of default renderer features plus what the app needs:
+# `tokio` (one shared async runtime — zbus joins it in a later stage),
+# `svg` (Lucide icons, Stage 6), `image` (thumbnails, Stage 11).
+iced = { version = "0.14", features = ["tokio", "svg", "image"] }
+
+# `core::thumbs` (Stage 11) — decoding a source image and resizing it down
+# to a thumbnail. Surveyed 2026-08-09: already resident transitively at
+# 0.25.10 (`iced`'s own `image` feature — see the `iced` entry above —
+# pulls it in for `iced::widget::image` to decode/display bytes with), so
+# this is just making that an explicit, versioned direct dependency rather
+# than relying on it staying available transitively; no new download, no
+# new version in the dependency graph. Default features (`default-formats`)
+# match what iced's own resolution already built, covering every common
+# raster format (jpeg/png/gif/webp/bmp/ico/tiff/…) a thumbnailer needs.
+image = "0.25"
 
 # `LocalBackend::watch()` (Stage 5, src/modules/local.rs) — the inotify
 # backend CLAUDE.md's "signal, never poll" rule calls for on Linux local
@@ -161,76 +97,6 @@ futures = "0.3"
 # turns on tokio's `rt`/`rt-multi-thread`/`time`; `stream` only adds `net`
 # for `AsyncFd` — no second runtime, per CLAUDE.md's "one async runtime").
 inotify = "0.11"
-
-# `core::mime::MimeDb` (Stage 6, src/core/mime.rs) — mimetype resolution for
-# icon selection and default-app lookup. Surveyed 2026-08-09 per PLAN.md's
-# stated choice ("use the `xdg-mime` crate if its license passes the
-# survey-essay check, else hand-parse `/usr/share/mime/globs2` plus a 4 KiB
-# sniff"): `xdg-mime` (ebassi/xdg-mime-rs) is Apache-2.0, which is fully
-# compatible with this crate's `MIT OR Apache-2.0` — the license passes
-# outright, so hand-rolling glob2 weighting, magic-byte offset/mask
-# matching, and the alias/subclass tables (~2000 lines in the real crate)
-# would just be reinventing what a compatibly-licensed, actively-maintained
-# crate (last pushed 2025-08-11) already gets right. It walks
-# `$XDG_DATA_HOME/mime`/`$XDG_DATA_DIRS/mime` itself at construction time —
-# the one place `core::mime` touches the filesystem, and it's a system
-# database load (same category as `config.rs` reading `files.toml`), not
-# "file access" in the VFS sense CLAUDE.md's "all file access goes through a
-# `Backend`" rule is about. No feature flags to trim (the crate has none);
-# its transitive deps (`glob`, `mime`, `nom`, `dirs-next`, `unicase`) are
-# small, single-purpose parsing/path crates, not a heavy pull.
-xdg-mime = "0.4"
-
-# `core::udisks` (Stage 7) — UDisks2 mount discovery for the places
-# sidebar, the app's first D-Bus consumer. Surveyed 2026-08-09: `zbus` is
-# the crate every sibling Saola surface already standardizes on (panel,
-# capture, session), so there was no real alternative to weigh — a second
-# D-Bus binding would mean two async D-Bus stacks sharing one process for
-# no benefit. `default-features = false` drops zbus's default `async-io`
-# executor; `tokio` re-enables just the integration that lets it run its
-# socket-reader tasks on the *same* shared runtime iced's own `tokio`
-# feature provides (CLAUDE.md: "one async runtime … never construct a
-# second") — the exact posture the panel's Cargo.toml documents for this
-# same dependency.
-zbus = { version = "5", default-features = false, features = ["tokio"] }
-
-# `core::clipboard_interop` (Stage 10) — writing `text/uri-list` +
-# `x-special/gnome-copied-files` on copy/cut, and a best-effort read on
-# paste, so a plain Ctrl+C in this app pastes into Nautilus/Dolphin/etc.
-# and vice versa. Surveyed 2026-08-09: `arboard` (the usual cross-platform
-# clipboard crate) has no concept of file-list MIME types at all — it's
-# text/image only, and this app needs to offer/parse two specific,
-# file-manager-shaped MIME payloads, not generic clipboard text. Hand-rolling
-# the Wayland `wlr-data-control`/`ext-data-control` protocol bindings
-# directly (`wayland-client` + `wayland-protocols-wlr`) is what
-# `wl-clipboard-rs` already *is* — it's the crate the `wl-copy`/`wl-paste`
-# CLI tools themselves are built on (same author), it exposes exactly the
-# multi-MIME-source `copy_multi`/MIME-filtered `get_contents` shape this
-# module needs, and it's already resident in this machine's cargo registry
-# cache at 0.9.3 (no new download). **Unconditional, not feature-gated**:
-# `--no-default-features` only elides *remote protocol* backends (the
-# `sftp` feature) — desktop clipboard interop is exactly as fundamental a
-# local-desktop concern as inotify watching (`inotify`, above) or mount
-# discovery (`zbus`, above), both already unconditional dependencies, so
-# gating this one differently would be an arbitrary inconsistency. It talks
-# to the compositor over `$WAYLAND_DISPLAY` at *runtime* only — building
-# this crate (including in a headless CI sandbox with no compositor at all)
-# never touches Wayland, and every call site wraps it in `spawn_blocking`
-# with the failure path (`ConnectError::NoCompositor` when unset/absent)
-# turned into an ordinary `Result`, never a panic — see
-# `core::clipboard_interop`'s own module doc comment.
-wl-clipboard-rs = "0.9"
-
-# `core::thumbs` (Stage 11) — decoding a source image and resizing it down
-# to a thumbnail. Surveyed 2026-08-09: already resident transitively at
-# 0.25.10 (`iced`'s own `image` feature — see the `iced` entry above —
-# pulls it in for `iced::widget::image` to decode/display bytes with), so
-# this is just making that an explicit, versioned direct dependency rather
-# than relying on it staying available transitively; no new download, no
-# new version in the dependency graph. Default features (`default-formats`)
-# match what iced's own resolution already built, covering every common
-# raster format (jpeg/png/gif/webp/bmp/ico/tiff/…) a thumbnailer needs.
-image = "0.25"
 
 # `core::thumbs` (Stage 11) — writing the freedesktop thumbnail spec's
 # required `tEXt` metadata chunks (`Thumb::URI`/`Thumb::MTime`) and reading
@@ -340,6 +206,142 @@ russh = { version = "0.52", optional = true, default-features = false, features 
 # strictly inside the third-party crate's wire encoding, disclosed here and
 # in that module's doc comment rather than silently accepted.
 russh-sftp = { version = "2.4", optional = true, default-features = true }
+
+# The Saola design system: tokens (colors, typography, radii, sizes) and
+# iced style helpers. `tag` and `version` must move together — cargo errors
+# if they disagree, which is the guard against drifting off a released tag.
+# Never point this at `branch = "main"`; bumping the tag is a deliberate,
+# reviewed change (see CLAUDE.md "Design language").
+# Pinned 2026-08-08 at the same tag the panel and capture use.
+# Bumped 2026-08-10 to v0.9.0 for `saola_theme::overflow::truncate` — the
+# design language's shared answer to text that doesn't fit (style guide §7's
+# default mode: cut at a character limit, one `…`, no motion). `ui/dirview/
+# grid.rs` calls it on tile labels; before the bump a long filename wrapped
+# and overflowed the fixed tile-row height the grid's virtualization math
+# assumes. Ported into the theme rather than written locally per CLAUDE.md's
+# "if a style is missing, add it to saola-theme — never restyle locally".
+# Bumped again 2026-08-10 to v0.10.0: `truncate`'s budget is now counted in
+# UAX #11 East-Asian *width units* (wide/fullwidth char = 2, narrow = 1,
+# control = 0) instead of raw `char`s. This is the upstream fix for the
+# limitation grid.rs used to disclose — a 13-character CJK label was cut to
+# 13 *characters*, which paints ~145 px in a 96 px tile and spilled into the
+# neighbouring label. Same "add it to saola-theme, never patch locally" rule:
+# every surface with a width cap gets the fix at once. Narrow-only input is
+# unaffected (for all-narrow text the arithmetic is exactly the old character
+# count), so Latin labels render byte-for-byte as they did at 0.9.0.
+# Bumped again 2026-08-11 to v0.11.0 for `saola_theme::overflow::unit_budget`
+# — the pixels → width-units conversion that used to live here as grid.rs's
+# private `LABEL_AVG_ADVANCE_EM` + `label_unit_budget`. The list view needs
+# the same arithmetic for its flexible name column, and two surfaces sharing
+# a calibration constant is exactly the "shared helpers go upstream" rule:
+# the 0.55 em average advance and the floor-of-4 rationale now have one home
+# (and one test suite) instead of a copy per view. Behaviour at today's
+# tokens is identical — `unit_budget(96.0, 12.5)` is still 13.
+# Bumped 2026-08-17 to v0.13.0 for two breaking changes, both resolving items
+# tracked in docs/UPSTREAM-THEME-DEBT.md: rest-recipe helpers now take a
+# `Chrome` (`Chrome::Shell` for panel/popover-style ink chrome,
+# `Chrome::Window` for controls inside this app's own window) so an
+# unselected control no longer paints a full-opacity ivory pill on an ink
+# window; and `widget::breadcrumb` takes a trailing width budget, replacing
+# this app's stopgap scrollable wrapper (`ui/breadcrumbs.rs`) with the real
+# upstream fix.
+# Bumped again 2026-09-06 to v0.15.0 to track the family's current release.
+# 0.14.0 made the notification card kit alpha-aware — `icon_tile` and
+# `life_rule` now take the card's `alpha` so the tile and countdown rule fade
+# at the same rate as the card they sit on — and gave `toast_alpha` an
+# ease-out entrance. 0.15.0 added `bar_row_container`, `avatar::placeholder`,
+# and their supporting tokens, none of which this app uses yet.
+# Bumped again 2026-11-19 to v0.17.0 to track the release. 0.16.0 added
+# `notification::icon_tile_colored` and 0.17.0 added launcher grid tiles and
+# touch-size tokens (`button::app_tile`, `list_row_touch`, edge-strip sizes);
+# both are additive and unused here. saola-tokens moved 0.9.0 -> 0.10.0 with it.
+saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.17.0", version = "0.17.0" }
+
+# `modules::local`'s `spawn_blocking` calls (Stage 3 — CLAUDE.md: "One
+# async runtime: iced's tokio executor and zbus's tokio integration share
+# it; never construct a second"). Already pulled in transitively by iced's
+# `tokio` feature (see the `iced` entry above), which *is* the shared
+# runtime this crate's blocking-file-I/O calls run on — this makes that an
+# explicit, versioned dependency instead of relying on it staying available
+# transitively. No `rt-multi-thread`/other extra features requested here:
+# iced's own feature selection already provides the runtime this crate's
+# code calls into.
+# `features = ["sync"]` added Stage 11: `core::thumbs::thumbnail_for` bounds
+# concurrent thumbnail generation with a `tokio::sync::Semaphore`
+# (CLAUDE.md: "never unbounded task spawns") — `Semaphore` lives behind
+# tokio's `sync` feature specifically, which nothing already enables
+# transitively (iced's own `tokio` feature only pulls in `iced_futures`'
+# executor integration, not `tokio::sync`), so this is requested explicitly
+# rather than relied on.
+tokio = { version = "1", features = ["sync"] }
+
+# Config parsing. Surveyed 2026-08-08: the family standard is hand-walked
+# parsing over a real parser's loose document type. capture (the newest
+# precedent, migrated from KDL 2026-08-08) uses `toml`'s `Table` for this;
+# `toml_edit` adds format-preserving round-tripping we don't need (we never
+# write the config), and serde-derive on the config struct is banned by the
+# resilience rules (one bad knob must degrade alone, with its own warning).
+# serde comes along transitively as toml's data model; we don't derive on it.
+toml = "0.9"
+
+# `core::clipboard_interop` (Stage 10) — writing `text/uri-list` +
+# `x-special/gnome-copied-files` on copy/cut, and a best-effort read on
+# paste, so a plain Ctrl+C in this app pastes into Nautilus/Dolphin/etc.
+# and vice versa. Surveyed 2026-08-09: `arboard` (the usual cross-platform
+# clipboard crate) has no concept of file-list MIME types at all — it's
+# text/image only, and this app needs to offer/parse two specific,
+# file-manager-shaped MIME payloads, not generic clipboard text. Hand-rolling
+# the Wayland `wlr-data-control`/`ext-data-control` protocol bindings
+# directly (`wayland-client` + `wayland-protocols-wlr`) is what
+# `wl-clipboard-rs` already *is* — it's the crate the `wl-copy`/`wl-paste`
+# CLI tools themselves are built on (same author), it exposes exactly the
+# multi-MIME-source `copy_multi`/MIME-filtered `get_contents` shape this
+# module needs, and it's already resident in this machine's cargo registry
+# cache at 0.9.3 (no new download). **Unconditional, not feature-gated**:
+# `--no-default-features` only elides *remote protocol* backends (the
+# `sftp` feature) — desktop clipboard interop is exactly as fundamental a
+# local-desktop concern as inotify watching (`inotify`, above) or mount
+# discovery (`zbus`, below), both already unconditional dependencies, so
+# gating this one differently would be an arbitrary inconsistency. It talks
+# to the compositor over `$WAYLAND_DISPLAY` at *runtime* only — building
+# this crate (including in a headless CI sandbox with no compositor at all)
+# never touches Wayland, and every call site wraps it in `spawn_blocking`
+# with the failure path (`ConnectError::NoCompositor` when unset/absent)
+# turned into an ordinary `Result`, never a panic — see
+# `core::clipboard_interop`'s own module doc comment.
+wl-clipboard-rs = "0.9"
+
+# `core::mime::MimeDb` (Stage 6, src/core/mime.rs) — mimetype resolution for
+# icon selection and default-app lookup. Surveyed 2026-08-09 per PLAN.md's
+# stated choice ("use the `xdg-mime` crate if its license passes the
+# survey-essay check, else hand-parse `/usr/share/mime/globs2` plus a 4 KiB
+# sniff"): `xdg-mime` (ebassi/xdg-mime-rs) is Apache-2.0, which is fully
+# compatible with this crate's `MIT OR Apache-2.0` — the license passes
+# outright, so hand-rolling glob2 weighting, magic-byte offset/mask
+# matching, and the alias/subclass tables (~2000 lines in the real crate)
+# would just be reinventing what a compatibly-licensed, actively-maintained
+# crate (last pushed 2025-08-11) already gets right. It walks
+# `$XDG_DATA_HOME/mime`/`$XDG_DATA_DIRS/mime` itself at construction time —
+# the one place `core::mime` touches the filesystem, and it's a system
+# database load (same category as `config.rs` reading `files.toml`), not
+# "file access" in the VFS sense CLAUDE.md's "all file access goes through a
+# `Backend`" rule is about. No feature flags to trim (the crate has none);
+# its transitive deps (`glob`, `mime`, `nom`, `dirs-next`, `unicase`) are
+# small, single-purpose parsing/path crates, not a heavy pull.
+xdg-mime = "0.4"
+
+# `core::udisks` (Stage 7) — UDisks2 mount discovery for the places
+# sidebar, the app's first D-Bus consumer. Surveyed 2026-08-09: `zbus` is
+# the crate every sibling Saola surface already standardizes on (panel,
+# capture, session), so there was no real alternative to weigh — a second
+# D-Bus binding would mean two async D-Bus stacks sharing one process for
+# no benefit. `default-features = false` drops zbus's default `async-io`
+# executor; `tokio` re-enables just the integration that lets it run its
+# socket-reader tasks on the *same* shared runtime iced's own `tokio`
+# feature provides (CLAUDE.md: "one async runtime … never construct a
+# second") — the exact posture the panel's Cargo.toml documents for this
+# same dependency.
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 # `modules::local`'s unit tests call `LocalBackend` methods directly (not

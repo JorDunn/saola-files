@@ -1,6 +1,12 @@
 //! `App::view`: the window's composition — explorer body or Trash
-//! browser, the ops/undo footer strip, and the modal dialogs layered
-//! over it (properties, connect, conflict, in that stacking order).
+//! browser, the ops/undo footer strip, any feature layers, and the modal
+//! dialogs layered over it (properties, connect, conflict, in that
+//! stacking order).
+//!
+//! A feature that draws over the window body adds a `fn <feature>_layer(
+//! &self) -> Option<Element<'_, Message>>` in its own `src/app/<feature>.rs`
+//! and one `layers.extend(self.<feature>_layer());` line under the marker
+//! below. Layers stack above the body and footer, below the modal dialogs.
 
 use iced::{Element, Fill};
 
@@ -36,11 +42,12 @@ impl App {
                 .height(Fill)
                 .into()
         } else {
-            match self.views.get(self.active) {
+            match self.focused_view() {
                 Some(view) => ui::explorer::view(
                     t,
                     self.surface,
                     &self.sidebar,
+                    self.focused,
                     view,
                     &self.mime_db,
                     &self.thumb_cache,
@@ -49,8 +56,8 @@ impl App {
                     Message::Explorer,
                 ),
                 // Degrades to a blank window ground rather than panicking —
-                // `active` should always be in range, but the no-panic
-                // rule means "should" isn't good enough.
+                // `focused` should always name an open view, but the
+                // no-panic rule means "should" isn't good enough.
                 None => iced::widget::Space::new().into(),
             }
         };
@@ -83,6 +90,21 @@ impl App {
             (None, None) => body,
         };
 
+        // Feature layers, one line each. With none (today), the body
+        // passes through untouched, so the widget tree is exactly what it
+        // was before this seam existed.
+        #[allow(unused_mut)] // Mutated only once a feature adds a line.
+        let mut layers: Vec<Element<'_, Message>> = Vec::new();
+        // --- features (alphabetical) ---
+        let with_layers: Element<'_, Message> = if layers.is_empty() {
+            with_progress
+        } else {
+            iced::widget::Stack::with_children(std::iter::once(with_progress).chain(layers))
+                .width(Fill)
+                .height(Fill)
+                .into()
+        };
+
         // The properties dialog (Stage 13) is a modal too, but — unlike the
         // conflict dialog — has a sane dismiss default (there's no decision
         // to force), so its scrim closes it instead of swallowing the
@@ -109,9 +131,9 @@ impl App {
                 .height(Fill)
                 .align_x(iced::alignment::Horizontal::Center)
                 .align_y(iced::alignment::Vertical::Center);
-                iced::widget::stack![with_progress, scrim, dialog].into()
+                iced::widget::stack![with_layers, scrim, dialog].into()
             }
-            None => with_progress,
+            None => with_layers,
         };
 
         // The connect dialog (Stage 14) is a modal with the same "sane

@@ -32,7 +32,7 @@ impl App {
     /// "show me *this* selection's properties now", not "queue a second
     /// dialog". `caps` is resolved once here (not carried by `Event::
     /// PropertiesRequested` itself) via the same `modules::resolve` every
-    /// other backend-capability check in this file already goes through;
+    /// other backend-capability check in `src/app/` already goes through;
     /// every item shares one backend, since a `DirectoryView`'s selection
     /// never spans two locations at once.
     pub(super) fn open_properties(&mut self, items: Vec<(Location, FileEntry)>) -> Task<Message> {

@@ -10,16 +10,24 @@ use iced::Task;
 use core::fs::{ops, undo};
 use core::vfs::Location;
 use saola_files::{core, ui};
+use ui::explorer::ViewId;
 
 use super::file_ops::write_foreign_clipboard;
 use super::{App, Message, directory_task, trash_task};
 
 impl App {
-    /// Navigates the active `DirectoryView` to `location` — the shared
-    /// tail end of both `ui::sidebar::Event::OpenDirectory` (a places-row
-    /// click) and `ui::dirview::Event::OpenDirectory` (ascend/breadcrumb/
-    /// descend) below, since both ultimately mean the same thing: "show
-    /// this location in the one tab there currently is."
+    /// Navigates the focused `DirectoryView` to `location` — what a
+    /// places-row click (`ui::sidebar::Event::OpenDirectory`) and a D-Bus
+    /// "show this folder" mean. See [`Self::navigate_view`].
+    pub(super) fn navigate_active(&mut self, location: Location) -> Task<Message> {
+        self.navigate_view(self.focused, location)
+    }
+
+    /// Navigates the view with id `id` to `location` — the shared tail end
+    /// of both [`Self::navigate_active`] and `ui::dirview::Event::
+    /// OpenDirectory` (ascend/breadcrumb/descend, which navigates the view
+    /// that asked), since both ultimately mean the same thing: "show this
+    /// location in that view."
     ///
     /// **Stage 9's one exception:** the sidebar's Trash place navigates to
     /// `core::places::trash_location()`, a sentinel no backend actually
@@ -32,7 +40,7 @@ impl App {
     /// scheme — so this check is cheap and never fires from that path in
     /// practice; it's here because both callers share this one function,
     /// not because both need it.
-    pub(super) fn navigate_active(&mut self, location: Location) -> Task<Message> {
+    pub(super) fn navigate_view(&mut self, id: ViewId, location: Location) -> Task<Message> {
         if location == core::places::trash_location() {
             self.trash_active = true;
             return trash_task(self.trash_view.load());
@@ -52,13 +60,13 @@ impl App {
             return self.open_connect_dialog(Some(location.to_string()), true);
         }
 
-        let Some(view) = self.views.get_mut(self.active) else {
+        let Some(view) = ui::explorer::find_mut(&mut self.views, id) else {
             return Task::none();
         };
-        directory_task(view.navigate(location))
+        directory_task(id, view.navigate(location))
     }
 
-    /// The owner's response to a `DirectoryView` `Event` — the view only
+    /// The owner's response to an `Event` from the view with id `id` — the view only
     /// ever requests a navigation or an open/spawn, never performs one
     /// itself (see `ui::dirview`'s module docs). Every branch here is a
     /// synchronous `Command::spawn` (a detached process launch returns
@@ -67,9 +75,13 @@ impl App {
     /// surfaced in the UI (no error-dialog surface exists yet, and a
     /// failed launch is exactly the kind of thing CLAUDE.md's no-panic
     /// posture says should degrade quietly, not take the app down).
-    pub(super) fn handle_directory_event(&mut self, event: ui::dirview::Event) -> Task<Message> {
+    pub(super) fn handle_directory_event(
+        &mut self,
+        id: ViewId,
+        event: ui::dirview::Event,
+    ) -> Task<Message> {
         match event {
-            ui::dirview::Event::OpenDirectory(location) => self.navigate_active(location),
+            ui::dirview::Event::OpenDirectory(location) => self.navigate_view(id, location),
             ui::dirview::Event::Activated(locations) => {
                 self.open_with_default_app(&locations);
                 Task::none()
@@ -131,6 +143,8 @@ impl App {
             ui::dirview::Event::UndoRequested => self.start_undo(),
             ui::dirview::Event::ThumbnailsNeeded(candidates) => self.request_thumbnails(candidates),
             ui::dirview::Event::PropertiesRequested(items) => self.open_properties(items),
+            ui::dirview::Event::App(action) => self.handle_app_action(action),
+            // --- features (alphabetical) ---
         }
     }
 

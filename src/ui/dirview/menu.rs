@@ -1,7 +1,8 @@
-//! The context menu and Open-with popover's messages (`Message::Menu*`,
-//! `OpenMenu`/`CloseMenu`, `OpenWithChosen`), plus the selection-to-event
-//! helpers they share with the keyboard path (`activate_selection`,
-//! `selection_targets`, `properties_event`, `terminal_target`).
+//! The context menu and Open-with popover: their own message enum
+//! ([`Message`], nested in the view's as `dirview::Message::Menu`), its
+//! handlers, and the selection-to-event helpers they share with the
+//! keyboard path (`activate_selection`, `selection_targets`,
+//! `properties_event`, `terminal_target`).
 
 use iced::Task;
 
@@ -9,47 +10,121 @@ use crate::core::fs::entry::{EntryKind, FileEntry};
 use crate::core::vfs::Location;
 
 use super::rename::NewKind;
-use super::{DeleteMode, DirectoryView, Event, Message};
+use super::{DeleteMode, DirectoryView, Event};
+
+/// The view's own message type, named once here: inside this file plain
+/// `Message` means the menu's enum below, so the handlers' return type
+/// (`Task<ViewMessage>`) needs a distinct name for the outer one.
+type ViewMessage = super::Message;
+
+/// Everything the context menu and the Open-with popover can send. Nested
+/// in the view's own message as `dirview::Message::Menu(menu::Message)`, so
+/// a feature that adds a menu entry adds one variant here (under the
+/// marker) instead of widening `dirview::Message`.
+///
+/// `ui::menus` builds these (it renders both popovers); the header's
+/// overflow button sends [`Message::Open`].
+#[derive(Debug, Clone)]
+pub enum Message {
+    /// The header's overflow button: opens the context menu.
+    Open,
+    /// The scrim, or a menu item that finished its job: closes whichever
+    /// of the context menu/Open-with popover is open.
+    Close,
+    /// "Open" — the same activation double-click/Enter already drive,
+    /// reached from the menu instead.
+    OpenSelected,
+    /// "Open with…": swaps the context menu for the Open-with popover.
+    OpenWithRequested,
+    /// "Open in terminal".
+    OpenTerminalRequested,
+    /// A config-defined `[[action]]`, by its index into
+    /// `DirectoryView::actions`.
+    CustomActionRequested(usize),
+    /// An app chosen in the Open-with popover, by its desktop-id.
+    OpenWithChosen(String),
+    /// The menu equivalents of `Action::Copy`/`Cut`/`Paste` — mouse parity
+    /// for the Ctrl+C/X/V keyboard path. Each closes the menu first.
+    CopyRequested,
+    CutRequested,
+    PasteRequested,
+    /// "Rename…" — the mouse path to the same `start_rename_named` F2 uses.
+    RenameRequested,
+    NewFolderRequested,
+    NewFileRequested,
+    /// "Delete"/"Move to Trash" — always `DeleteMode::ToTrash`; the menu
+    /// never offers a permanent-delete row of its own, that's
+    /// Shift+Delete's job (see `ui::menus`'s doc comment on why one
+    /// capability-honestly-worded row is enough).
+    DeleteRequested,
+    /// "Properties" — the mouse path to the same dialog Alt+Enter opens
+    /// (`Action::Properties`).
+    PropertiesRequested,
+    // --- features (alphabetical) ---
+}
 
 impl DirectoryView {
-    /// `update`'s `Message::OpenMenu` arm, moved here verbatim.
-    pub(super) fn on_open_menu(&mut self) -> (Task<Message>, Option<Event>) {
+    /// `update`'s `dirview::Message::Menu` arm: one line per menu message,
+    /// each delegating to its handler below.
+    pub(super) fn on_menu(&mut self, message: Message) -> (Task<ViewMessage>, Option<Event>) {
+        match message {
+            Message::Open => self.on_open_menu(),
+            Message::Close => self.on_close_menu(),
+            Message::OpenSelected => self.on_menu_open_selected(),
+            Message::OpenWithRequested => self.on_menu_open_with_requested(),
+            Message::OpenTerminalRequested => self.on_menu_open_terminal_requested(),
+            Message::CustomActionRequested(index) => self.on_menu_custom_action_requested(index),
+            Message::OpenWithChosen(desktop_id) => self.on_open_with_chosen(desktop_id),
+            Message::CopyRequested => self.on_menu_copy_requested(),
+            Message::CutRequested => self.on_menu_cut_requested(),
+            Message::PasteRequested => self.on_menu_paste_requested(),
+            Message::RenameRequested => self.on_menu_rename_requested(),
+            Message::NewFolderRequested => self.on_menu_new_folder_requested(),
+            Message::NewFileRequested => self.on_menu_new_file_requested(),
+            Message::DeleteRequested => self.on_menu_delete_requested(),
+            Message::PropertiesRequested => self.on_menu_properties_requested(),
+            // --- features (alphabetical) ---
+        }
+    }
+
+    /// [`Message::Open`]'s handler.
+    pub(super) fn on_open_menu(&mut self) -> (Task<ViewMessage>, Option<Event>) {
         self.menu_open = true;
         self.open_with_open = false;
         (Task::none(), None)
     }
 
-    /// `update`'s `Message::CloseMenu` arm, moved here verbatim.
-    pub(super) fn on_close_menu(&mut self) -> (Task<Message>, Option<Event>) {
+    /// [`Message::Close`]'s handler.
+    pub(super) fn on_close_menu(&mut self) -> (Task<ViewMessage>, Option<Event>) {
         self.menu_open = false;
         self.open_with_open = false;
         (Task::none(), None)
     }
 
-    /// `update`'s `Message::MenuOpenSelected` arm, moved here verbatim.
-    pub(super) fn on_menu_open_selected(&mut self) -> (Task<Message>, Option<Event>) {
+    /// [`Message::OpenSelected`]'s handler.
+    pub(super) fn on_menu_open_selected(&mut self) -> (Task<ViewMessage>, Option<Event>) {
         self.menu_open = false;
         (Task::none(), self.activate_selection())
     }
 
-    /// `update`'s `Message::MenuOpenWithRequested` arm, moved here verbatim.
-    pub(super) fn on_menu_open_with_requested(&mut self) -> (Task<Message>, Option<Event>) {
+    /// [`Message::OpenWithRequested`]'s handler.
+    pub(super) fn on_menu_open_with_requested(&mut self) -> (Task<ViewMessage>, Option<Event>) {
         self.menu_open = false;
         self.open_with_open = true;
         (Task::none(), None)
     }
 
-    /// `update`'s `Message::MenuOpenTerminalRequested` arm, moved here verbatim.
-    pub(super) fn on_menu_open_terminal_requested(&mut self) -> (Task<Message>, Option<Event>) {
+    /// [`Message::OpenTerminalRequested`]'s handler.
+    pub(super) fn on_menu_open_terminal_requested(&mut self) -> (Task<ViewMessage>, Option<Event>) {
         self.menu_open = false;
         (Task::none(), Some(self.terminal_target()))
     }
 
-    /// `update`'s `Message::MenuCustomActionRequested` arm, moved here verbatim.
+    /// [`Message::CustomActionRequested`]'s handler.
     pub(super) fn on_menu_custom_action_requested(
         &mut self,
         index: usize,
-    ) -> (Task<Message>, Option<Event>) {
+    ) -> (Task<ViewMessage>, Option<Event>) {
         self.menu_open = false;
         let Some(action) = self.actions.get(index) else {
             return (Task::none(), None);
@@ -64,11 +139,11 @@ impl DirectoryView {
         )
     }
 
-    /// `update`'s `Message::OpenWithChosen` arm, moved here verbatim.
+    /// [`Message::OpenWithChosen`]'s handler.
     pub(super) fn on_open_with_chosen(
         &mut self,
         desktop_id: String,
-    ) -> (Task<Message>, Option<Event>) {
+    ) -> (Task<ViewMessage>, Option<Event>) {
         self.open_with_open = false;
         let targets = self.selection_targets();
         if targets.is_empty() {
@@ -77,8 +152,8 @@ impl DirectoryView {
         (Task::none(), Some(Event::OpenWith(targets, desktop_id)))
     }
 
-    /// `update`'s `Message::MenuCopyRequested` arm, moved here verbatim.
-    pub(super) fn on_menu_copy_requested(&mut self) -> (Task<Message>, Option<Event>) {
+    /// [`Message::CopyRequested`]'s handler.
+    pub(super) fn on_menu_copy_requested(&mut self) -> (Task<ViewMessage>, Option<Event>) {
         self.menu_open = false;
         let targets = self.selection_targets();
         if targets.is_empty() {
@@ -87,8 +162,8 @@ impl DirectoryView {
         (Task::none(), Some(Event::CopyRequested(targets)))
     }
 
-    /// `update`'s `Message::MenuCutRequested` arm, moved here verbatim.
-    pub(super) fn on_menu_cut_requested(&mut self) -> (Task<Message>, Option<Event>) {
+    /// [`Message::CutRequested`]'s handler.
+    pub(super) fn on_menu_cut_requested(&mut self) -> (Task<ViewMessage>, Option<Event>) {
         self.menu_open = false;
         let targets = self.selection_targets();
         if targets.is_empty() {
@@ -97,8 +172,8 @@ impl DirectoryView {
         (Task::none(), Some(Event::CutRequested(targets)))
     }
 
-    /// `update`'s `Message::MenuPasteRequested` arm, moved here verbatim.
-    pub(super) fn on_menu_paste_requested(&mut self) -> (Task<Message>, Option<Event>) {
+    /// [`Message::PasteRequested`]'s handler.
+    pub(super) fn on_menu_paste_requested(&mut self) -> (Task<ViewMessage>, Option<Event>) {
         self.menu_open = false;
         (
             Task::none(),
@@ -106,8 +181,8 @@ impl DirectoryView {
         )
     }
 
-    /// `update`'s `Message::MenuRenameRequested` arm, moved here verbatim.
-    pub(super) fn on_menu_rename_requested(&mut self) -> (Task<Message>, Option<Event>) {
+    /// [`Message::RenameRequested`]'s handler.
+    pub(super) fn on_menu_rename_requested(&mut self) -> (Task<ViewMessage>, Option<Event>) {
         self.menu_open = false;
         let selected = self.selected_entries();
         if let [entry] = selected.as_slice() {
@@ -118,20 +193,20 @@ impl DirectoryView {
         }
     }
 
-    /// `update`'s `Message::MenuNewFolderRequested` arm, moved here verbatim.
-    pub(super) fn on_menu_new_folder_requested(&mut self) -> (Task<Message>, Option<Event>) {
+    /// [`Message::NewFolderRequested`]'s handler.
+    pub(super) fn on_menu_new_folder_requested(&mut self) -> (Task<ViewMessage>, Option<Event>) {
         self.menu_open = false;
         (self.create_new(NewKind::Folder), None)
     }
 
-    /// `update`'s `Message::MenuNewFileRequested` arm, moved here verbatim.
-    pub(super) fn on_menu_new_file_requested(&mut self) -> (Task<Message>, Option<Event>) {
+    /// [`Message::NewFileRequested`]'s handler.
+    pub(super) fn on_menu_new_file_requested(&mut self) -> (Task<ViewMessage>, Option<Event>) {
         self.menu_open = false;
         (self.create_new(NewKind::File), None)
     }
 
-    /// `update`'s `Message::MenuDeleteRequested` arm, moved here verbatim.
-    pub(super) fn on_menu_delete_requested(&mut self) -> (Task<Message>, Option<Event>) {
+    /// [`Message::DeleteRequested`]'s handler.
+    pub(super) fn on_menu_delete_requested(&mut self) -> (Task<ViewMessage>, Option<Event>) {
         self.menu_open = false;
         let targets = self.selection_targets();
         if targets.is_empty() {
@@ -143,8 +218,8 @@ impl DirectoryView {
         )
     }
 
-    /// `update`'s `Message::MenuPropertiesRequested` arm, moved here verbatim.
-    pub(super) fn on_menu_properties_requested(&mut self) -> (Task<Message>, Option<Event>) {
+    /// [`Message::PropertiesRequested`]'s handler.
+    pub(super) fn on_menu_properties_requested(&mut self) -> (Task<ViewMessage>, Option<Event>) {
         self.menu_open = false;
         (Task::none(), self.properties_event())
     }
@@ -193,7 +268,7 @@ impl DirectoryView {
 
     /// `Event::PropertiesRequested`'s payload for the current selection —
     /// shared by `Action::Properties` (Alt+Enter) and
-    /// `Message::MenuPropertiesRequested` (the context menu row), the same
+    /// `menu::Message::PropertiesRequested` (the context menu row), the same
     /// "one behavior, two input paths" split every other action/menu-row
     /// pair in this module already takes. `None` when nothing is selected
     /// — there is nothing to show properties for.
@@ -257,6 +332,41 @@ mod tests {
         }
     }
 
+    // ── Menu message nesting ─────────────────────────────────────────────
+
+    #[test]
+    fn nested_open_and_close_messages_toggle_the_menu() {
+        let mut view = listed_view(vec![file("a")]);
+        let _ = view.update(ViewMessage::Menu(Message::Open));
+        assert!(view.menu_open());
+        let _ = view.update(ViewMessage::Menu(Message::Close));
+        assert!(!view.menu_open());
+    }
+
+    #[test]
+    fn nested_open_with_request_swaps_the_menu_for_the_popover() {
+        let mut view = listed_view(vec![file("a")]);
+        let _ = view.update(ViewMessage::Menu(Message::Open));
+        let _ = view.update(ViewMessage::Menu(Message::OpenWithRequested));
+        assert!(!view.menu_open());
+        assert!(view.open_with_open());
+    }
+
+    #[test]
+    fn nested_copy_with_a_selection_bubbles_copy_requested() {
+        let mut view = listed_view(vec![file("a")]);
+        let _ = view.apply_action_for_test(Action::MoveCursorDown);
+        let _ = view.update(ViewMessage::Menu(Message::Open));
+        let (_, event) = view.update(ViewMessage::Menu(Message::CopyRequested));
+        assert!(!view.menu_open());
+        match event {
+            Some(Event::CopyRequested(locations)) => {
+                assert_eq!(locations, vec![Location::local("/home/a")]);
+            }
+            other => panic!("expected CopyRequested, got {other:?}"),
+        }
+    }
+
     // ── Stage 13: properties ─────────────────────────────────────────────
 
     #[test]
@@ -286,7 +396,7 @@ mod tests {
         let mut view = listed_view(vec![file("a"), file("b")]);
         let _ = view.apply_action_for_test(Action::MoveCursorDown);
         view.menu_open = true;
-        let (_, event) = view.update(Message::MenuPropertiesRequested);
+        let (_, event) = view.update(ViewMessage::Menu(Message::PropertiesRequested));
         assert!(!view.menu_open());
         match event {
             Some(Event::PropertiesRequested(items)) => assert_eq!(items.len(), 1),

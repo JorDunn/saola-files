@@ -64,9 +64,13 @@ documented exception).
   behind one state/view. This is the seam a future saola-portal embeds as
   the file picker; keep it free of app-window concerns.
 - `DirectoryView` (`src/ui/dirview/`) is self-contained per-directory state;
-  the app holds `Vec<DirectoryView> + active` (the tabs seam — UI shows one
-  for now). Shared caches (thumbs, mime, apps, undo, clipboard, ops engine)
-  live on the App, never per-view.
+  the app (`src/app/`) holds `Vec<(ViewId, DirectoryView)>` + a `focused`
+  `ViewId` (the tabs seam — UI shows one for now). `ViewId`
+  (`ui/explorer.rs`) is monotonic and never reused, never a `Vec` index:
+  every directory message is `explorer::Message::Directory(ViewId, _)`, and
+  one addressed to a closed view is dropped. Keyboard input is the app's
+  `Message::Keyboard`, routed to the focused view. Shared caches (thumbs,
+  mime, apps, undo, clipboard, ops engine) live on the App, never per-view.
 - Capability-honest UI: a backend without `TRASH` gets permanent delete
   worded as such; without `WATCH`, refresh-on-navigate + F5; without
   `LOCAL_PATH`, open = download-to-temp with a read-only caveat.
@@ -169,20 +173,33 @@ documented exception).
 ## Merge-safe conventions
 
 Several agents work in parallel, so shared choke points are laid out to
-merge cleanly. **These take effect with the hot-file split** (the
-`main.rs` / `dirview/mod.rs` refactor), which has **not landed yet** — until
-it does, the code does not look like this; follow the existing layout.
+merge cleanly. These are in force: the code is laid out this way.
 
 - One enum variant, struct field, initialiser line and `update` arm per
-  feature, each placed under an alphabetical marker comment — never
-  reorder or regroup neighbours.
-- Each feature exposes its own `subscription()` and `layer()`; the app
-  batches them, one line per feature.
+  feature, each placed under the `// --- features (alphabetical) ---`
+  marker at the end of that enum/struct/initialiser/match, in alphabetical
+  order by feature among the other feature lines — never reorder or
+  regroup neighbours. Markers exist in `app::Message`, `App` + `App::new`
+  + `App::update`, `dirview::{Message, Event, DirectoryView}` +
+  `DirectoryView::new` + `DirectoryView::update`, `menu::Message` +
+  `on_menu`, `keymap::{Action, AppAction}`, `apply_action`,
+  `handle_directory_event`, `handle_app_action`, and `Config` + its
+  `Default` + `Config::parse`.
+- App-level shortcuts are `keymap::AppAction` variants (`Action::App`);
+  the view bubbles them as `dirview::Event::App`, and `App::
+  handle_app_action` carries them out. Never widen `Action` for those.
+- Each feature exposes its own `<feature>_subscription()` and
+  `<feature>_layer()` (in `src/app/<feature>.rs`); the app batches them in
+  `src/app/subscription.rs` / stacks them in `src/app/view.rs`, one line
+  per feature under the marker.
 - One `read_<feature>(&Table)` per config feature; the top-level config
-  reader only calls them.
+  reader (`Config::parse`) only calls them.
 - Module lists (`mod` / `pub mod`) and Cargo dependencies alphabetical, one
   per line.
-- Context-menu entries are an ordered table, one line per entry.
+- Context-menu entries are an ordered table (`CONTEXT_MENU` in
+  `src/ui/menus.rs`), one line per entry with a predicate deciding when it
+  shows, inserted at the position it displays; the click is a
+  `dirview::menu::Message` variant.
 
 Already true today, independent of the split: every new icon glyph is a
 saola-theme release (`src/icons.rs` only maps onto `saola_theme::icon::Icon`).

@@ -1,6 +1,7 @@
 //! `DirectoryView` — self-contained per-directory state (the tabs seam):
-//! the app holds `Vec<DirectoryView> + active` (UI shows one for now, see
-//! `main.rs`). This module never navigates itself for a *new* location —
+//! the app holds `Vec<(ViewId, DirectoryView)>` plus the focused
+//! `ui::explorer::ViewId` (UI shows one for now, see `src/app/mod.rs`).
+//! This module never navigates itself for a *new* location —
 //! clicks, Enter, Backspace/Alt+Up, and breadcrumb clicks all resolve to
 //! an [`Event`] the owner decides whether to act on, so a future tabs
 //! feature can open a new view instead of reusing this one without
@@ -56,7 +57,7 @@ mod grid;
 mod keys;
 mod list;
 mod listing;
-mod menu;
+pub mod menu;
 mod navigation;
 mod pointer;
 mod rename;
@@ -80,7 +81,7 @@ use crate::core::fs::entry::FileEntry;
 use crate::core::mime::MimeDb;
 use crate::core::thumbs::ThumbCache;
 use crate::core::vfs::{Caps, DirEvent, Location, VfsError};
-use crate::keymap::Action;
+use crate::keymap::{Action, AppAction};
 use crate::ui::menus;
 // `row_icon`/`thumbnail_for` moved to `thumbs.rs`; re-exported here so
 // `list.rs`/`grid.rs` keep importing them as `super::{row_icon, thumbnail_for}`.
@@ -112,9 +113,9 @@ pub enum Message {
     /// once the child captures them, so an outer
     /// `mouse_area(...).on_double_click(...)` around a button with
     /// `on_press` never sees a single press and can never fire. Instead a
-    /// second plain click on the same row within [`DOUBLE_CLICK_WINDOW`]
+    /// second plain click on the same row within `DOUBLE_CLICK_WINDOW`
     /// of the last one (`DirectoryView::last_click`, paired by
-    /// [`is_double_click`]) activates the selection.
+    /// `is_double_click` — both in `pointer.rs`) activates the selection.
     RowClicked(usize),
     HeaderClicked(SortKey),
     Scrolled(scrollable::Viewport),
@@ -152,44 +153,13 @@ pub enum Message {
     /// worth surfacing, just skip inserting it.
     WatchRefreshed(Location, Vec<(OsString, Option<FileEntry>)>),
 
-    // ── Stage 6: context menu / Open-with popover (`ui::menus`) ─────────
-    /// The header's overflow button: opens the context menu.
-    OpenMenu,
-    /// The scrim, Escape, or a menu item that finished its job: closes
-    /// whichever of the context menu/Open-with popover is open.
-    CloseMenu,
-    /// "Open" inside the context menu — the same activation
-    /// double-click/Enter already drive, reached from the menu instead.
-    MenuOpenSelected,
-    /// "Open with…" inside the context menu: swaps it for the Open-with
-    /// popover.
-    MenuOpenWithRequested,
-    /// "Open in terminal" inside the context menu.
-    MenuOpenTerminalRequested,
-    /// A config-defined `[[action]]` clicked in the context menu, by its
-    /// index into `DirectoryView::actions`.
-    MenuCustomActionRequested(usize),
-    /// An app chosen in the Open-with popover, by its desktop-id.
-    OpenWithChosen(String),
+    /// Anything from the context menu or the Open-with popover
+    /// (`ui::menus`, plus the header's overflow button that opens it) —
+    /// see [`menu::Message`]. A new menu entry adds its variant there, not
+    /// here.
+    Menu(menu::Message),
 
-    // ── Stage 8: clipboard / rename / new folder / new file ─────────────
-    /// The header/context-menu equivalents of `Action::Copy`/`Cut`/`Paste`
-    /// — mouse parity for the Ctrl+C/X/V keyboard path, same shape
-    /// `Message::Action` already gives every other action a mouse
-    /// equivalent through. Closes the context menu first.
-    MenuCopyRequested,
-    MenuCutRequested,
-    MenuPasteRequested,
-    /// "Rename…" in the context menu — the mouse path to the same
-    /// `start_rename_named` F2 uses.
-    MenuRenameRequested,
-    MenuNewFolderRequested,
-    MenuNewFileRequested,
-    /// "Delete"/"Move to Trash" in the context menu (Stage 9) — always
-    /// `DeleteMode::ToTrash`; the menu never offers a permanent-delete row
-    /// of its own, that's Shift+Delete's job (see `ui::menus`'s doc
-    /// comment on why one capability-honestly-worded row is enough).
-    MenuDeleteRequested,
+    // ── Stage 8: rename / new folder / new file ─────────────────────────
     /// The inline rename field's `on_input`, while `self.rename` is `Some`.
     RenameChanged(String),
     /// Enter: commit the inline rename.
@@ -209,11 +179,7 @@ pub enum Message {
     /// can type its real name immediately instead of "New Folder" then a
     /// second F2.
     CreateResult(Location, OsString, Result<(), VfsError>),
-
-    // ── Stage 13: properties ─────────────────────────────────────────────
-    /// "Properties" in the context menu — the mouse path to the same
-    /// dialog Alt+Enter opens (`Action::Properties`).
-    MenuPropertiesRequested,
+    // --- features (alphabetical) ---
 }
 
 /// What the owner (the app, via `ui::explorer`) decides to act on. The
@@ -296,6 +262,11 @@ pub enum Event {
     /// view already has in memory); only the live size count is fetched
     /// fresh, by `App`, via `core::fs::size::run`.
     PropertiesRequested(Vec<(Location, FileEntry)>),
+    /// A keymap [`Action::App`] the view received: passed up unchanged,
+    /// because app-level commands are the window's to carry out, never one
+    /// view's (see [`AppAction`]).
+    App(AppAction),
+    // --- features (alphabetical) ---
 }
 
 /// One thumbnail candidate bubbled via [`Event::ThumbnailsNeeded`] —
@@ -382,7 +353,7 @@ pub struct DirectoryView {
     last_click: Option<(usize, std::time::Instant)>,
     /// Config-defined `[[action]]`s, cloned once at construction —
     /// `ui::menus`'s context menu filters/renders these by index
-    /// (`Message::MenuCustomActionRequested`). Small and static for the
+    /// (`menu::Message::CustomActionRequested`). Small and static for the
     /// life of the view, unlike `MimeDb`/`AppsDb` (real per-App caches —
     /// see `Self::view`'s parameters), so a per-view clone is fine.
     actions: Vec<CustomAction>,
@@ -404,6 +375,7 @@ pub struct DirectoryView {
     /// reads as "type its name" rather than "see 'New Folder', press F2,
     /// then type its name".
     pending_rename: bool,
+    // --- features (alphabetical) ---
 }
 
 impl DirectoryView {
@@ -435,6 +407,7 @@ impl DirectoryView {
             open_with_open: false,
             rename: None,
             pending_rename: false,
+            // --- features (alphabetical) ---
         }
     }
 
@@ -499,7 +472,8 @@ impl DirectoryView {
     }
 
     /// This view's live-update subscription (Stage 5) — the app batches
-    /// this alongside its own keyboard subscription (`main.rs`). Identified
+    /// one per open view, tagged with that view's id
+    /// (`src/app/subscription.rs`). Identified
     /// by `self.location` (see `watch::subscription`'s docs), so iced tears
     /// down and rebuilds the underlying watch the moment `navigate`/
     /// `go_back`/`go_forward` points this view somewhere else; a backend
@@ -577,26 +551,9 @@ impl DirectoryView {
             Message::WatchRefreshed(location, results) => {
                 self.on_watch_refreshed(location, results)
             }
+            Message::Menu(inner) => self.on_menu(inner),
 
-            // ── Stage 6: context menu / Open-with popover ───────────────
-            Message::OpenMenu => self.on_open_menu(),
-            Message::CloseMenu => self.on_close_menu(),
-            Message::MenuOpenSelected => self.on_menu_open_selected(),
-            Message::MenuOpenWithRequested => self.on_menu_open_with_requested(),
-            Message::MenuOpenTerminalRequested => self.on_menu_open_terminal_requested(),
-            Message::MenuCustomActionRequested(index) => {
-                self.on_menu_custom_action_requested(index)
-            }
-            Message::OpenWithChosen(desktop_id) => self.on_open_with_chosen(desktop_id),
-
-            // ── Stage 8: clipboard / rename / new folder / new file ─────
-            Message::MenuCopyRequested => self.on_menu_copy_requested(),
-            Message::MenuCutRequested => self.on_menu_cut_requested(),
-            Message::MenuPasteRequested => self.on_menu_paste_requested(),
-            Message::MenuRenameRequested => self.on_menu_rename_requested(),
-            Message::MenuNewFolderRequested => self.on_menu_new_folder_requested(),
-            Message::MenuNewFileRequested => self.on_menu_new_file_requested(),
-            Message::MenuDeleteRequested => self.on_menu_delete_requested(),
+            // ── Stage 8: rename / new folder / new file ─────────────────
             Message::RenameChanged(value) => self.on_rename_changed(value),
             Message::RenameSubmitted => (self.submit_rename(), None),
             Message::RenameCancelled => self.on_rename_cancelled(),
@@ -605,10 +562,7 @@ impl DirectoryView {
             }
             Message::CreateResult(dir_location, name, result) => {
                 self.on_create_result(dir_location, name, result)
-            }
-
-            // ── Stage 13: properties ─────────────────────────────────────
-            Message::MenuPropertiesRequested => self.on_menu_properties_requested(),
+            } // --- features (alphabetical) ---
         }
     }
 

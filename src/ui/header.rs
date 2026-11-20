@@ -176,7 +176,7 @@ fn hidden_toggle<'a>(t: &'a Theme, s: Surface, active: bool) -> Element<'a, dirv
 }
 
 /// The overflow menu trigger: opens `ui::menus`'s context menu
-/// (`Message::OpenMenu`) — Stage 6's real wiring of the chrome slot Stage 4
+/// (`menu::Message::Open`) — Stage 6's real wiring of the chrome slot Stage 4
 /// reserved.
 fn overflow_button<'a>(t: &'a Theme, s: Surface) -> Element<'a, dirview::Message> {
     widget::icon_button(
@@ -185,6 +185,6 @@ fn overflow_button<'a>(t: &'a Theme, s: Surface) -> Element<'a, dirview::Message
         Icon::Ellipsis,
         None,
         t.on(s).primary.into_iced(),
-        Some(dirview::Message::OpenMenu),
+        Some(dirview::Message::Menu(dirview::menu::Message::Open)),
     )
 }

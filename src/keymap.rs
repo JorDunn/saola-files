@@ -104,6 +104,29 @@ pub enum Action {
     /// `Action::Rename`) — matches the mainstream file-manager convention
     /// this style guide follows for "get info".
     Properties,
+
+    /// An app-level command: something the window (not one directory
+    /// view) carries out, such as a future "new tab". `DirectoryView`
+    /// never handles these itself; it bubbles them unchanged as
+    /// `dirview::Event::App` so `App` can act on them. Nesting them here
+    /// keeps `Action` from growing a variant per app feature — a feature
+    /// adds its variant to [`AppAction`] instead.
+    App(AppAction),
+    // --- features (alphabetical) ---
+}
+
+/// Keyboard commands that belong to the whole app rather than to one
+/// directory view (see [`Action::App`]).
+///
+/// Empty for now: every shortcut that exists today acts on a directory
+/// view. An enum with no variants is a type with no values, so nothing can
+/// construct an `Action::App` yet, and `App`'s handler is the empty match
+/// `match action {}` — the compiler accepts that as exhaustive because
+/// there is no value it could ever be called with. The first feature that
+/// adds a variant here turns that match into an ordinary one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppAction {
+    // --- features (alphabetical) ---
 }
 
 /// Resolve one key press into an [`Action`], or `None` if this module

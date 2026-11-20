@@ -2,8 +2,9 @@
 //! backend, and — if it can signal (`Backend::watch` returns `Some`) —
 //! bridges its raw [`DirEvent`] stream into debounced `Vec<DirEvent>`
 //! batches as [`Message::Watch`]. `DirectoryView::apply_watch_events`
-//! (`mod.rs`) is what actually mutates `entries`/`selection` off of those;
-//! this module is only the plumbing that gets a batch there.
+//! (the `impl` block at the bottom of this file) is what actually mutates
+//! `entries`/`selection` off of those; the top half of the file is only
+//! the plumbing that gets a batch there.
 //!
 //! Backends without `Caps::WATCH` (`watch()` returns `None`, or nothing
 //! resolves for the location's scheme at all) produce an empty stream here
