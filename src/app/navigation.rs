@@ -83,7 +83,7 @@ impl App {
         match event {
             ui::dirview::Event::OpenDirectory(location) => self.navigate_view(id, location),
             ui::dirview::Event::Activated(locations) => {
-                self.open_with_default_app(&locations);
+                self.open_with_default_app(id, &locations);
                 Task::none()
             }
             ui::dirview::Event::OpenWith(locations, desktop_id) => {
@@ -141,7 +141,12 @@ impl App {
                 Task::none()
             }
             ui::dirview::Event::UndoRequested => self.start_undo(),
-            ui::dirview::Event::ThumbnailsNeeded(candidates) => self.request_thumbnails(candidates),
+            ui::dirview::Event::ThumbnailsNeeded(candidates) => {
+                // The same visible-range candidates drive content sniffing
+                // (`app::sniff`); it only borrows them, so it goes first.
+                let sniffs = self.request_sniffs(&candidates);
+                Task::batch([sniffs, self.request_thumbnails(candidates)])
+            }
             ui::dirview::Event::PropertiesRequested(items) => self.open_properties(items),
             ui::dirview::Event::App(action) => self.handle_app_action(action),
             // --- features (alphabetical) ---
@@ -154,12 +159,20 @@ impl App {
     /// resolvable mimetype association, or an association naming an app
     /// this database never found all degrade to a worded `eprintln!`
     /// rather than silently doing nothing or panicking.
-    fn open_with_default_app(&self, locations: &[Location]) {
+    fn open_with_default_app(&self, id: ViewId, locations: &[Location]) {
         for location in locations {
             let Some(name) = location.path.file_name() else {
                 continue;
             };
-            let mimetype = self.mime_db.guess(name, None);
+            // Uses the content-sniff verdict when the background sniff
+            // (`app::sniff`) has already produced one for this mtime.
+            let mimetype = match location.parent() {
+                Some(dir) => {
+                    let modified = self.entry_mtime(id, location);
+                    self.mime_db.guess_entry(&dir, name, modified)
+                }
+                None => self.mime_db.guess(name, None),
+            };
             let Some(entry) = self.apps_db.default_for(&mimetype) else {
                 eprintln!("saola-files: no app is associated with {mimetype} for {location}");
                 continue;

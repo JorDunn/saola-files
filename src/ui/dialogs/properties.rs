@@ -145,11 +145,11 @@ pub fn view<'a>(
             false,
         ));
     }
-    if let [(_, entry)] = properties.items.as_slice() {
+    if let [(location, entry)] = properties.items.as_slice() {
         rows.push(info_row(
             t,
             tr_static!("properties-kind"),
-            kind_text(entry, mime_db),
+            kind_text(location.parent().as_ref(), entry, mime_db),
             false,
         ));
     }
@@ -243,13 +243,17 @@ fn footer<'a>(t: &'a Theme) -> Element<'a, Message> {
 /// already does for the context menu (not reused directly — that helper
 /// isn't `pub(crate)`, and duplicating one `match` is cheaper than widening
 /// its visibility for a single other caller).
-fn kind_text(entry: &FileEntry, mime_db: &MimeDb) -> String {
+fn kind_text(dir: Option<&Location>, entry: &FileEntry, mime_db: &MimeDb) -> String {
     if entry.is_symlink {
         return tr!("properties-kind-symlink");
     }
     match entry.kind {
         EntryKind::Directory => tr!("properties-kind-folder"),
-        _ => mime_db.guess(&entry.name, None),
+        _ => match dir {
+            // Uses the cached content-sniff verdict when there is one.
+            Some(dir) => mime_db.guess_entry(dir, &entry.name, entry.modified),
+            None => mime_db.guess(&entry.name, None),
+        },
     }
 }
 
@@ -332,7 +336,7 @@ mod tests {
     fn kind_text_words_a_directory_as_folder() {
         let mime_db = MimeDb::new();
         let dir = entry("docs", EntryKind::Directory, 0, None);
-        assert_eq!(kind_text(&dir, &mime_db), "Folder");
+        assert_eq!(kind_text(None, &dir, &mime_db), "Folder");
     }
 
     #[test]
@@ -340,7 +344,7 @@ mod tests {
         let mime_db = MimeDb::new();
         let mut link = entry("link", EntryKind::Other, 0, None);
         link.is_symlink = true;
-        assert_eq!(kind_text(&link, &mime_db), "Symlink");
+        assert_eq!(kind_text(None, &link, &mime_db), "Symlink");
     }
 
     // ── Properties::size_text ───────────────────────────────────────────

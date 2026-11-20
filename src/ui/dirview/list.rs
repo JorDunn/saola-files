@@ -338,7 +338,7 @@ fn entry_row<'a>(
     if let Some(rename) = state.rename_state()
         && rename.original == entry.name
     {
-        return renaming_row(t, s, mime_db, entry, rename);
+        return renaming_row(t, s, state, mime_db, entry, rename);
     }
 
     let selected = state.selection.is_selected(&entry.name);
@@ -370,7 +370,7 @@ fn entry_row<'a>(
             .height(t.sizes.icon_row)
             .into(),
         None => icon::icon(
-            row_icon(entry, mime_db),
+            row_icon(state.location(), entry, mime_db),
             t.sizes.icon_row,
             icon_color.into_iced(),
         )
@@ -463,12 +463,13 @@ fn entry_row<'a>(
 fn renaming_row<'a>(
     t: &'a Theme,
     s: Surface,
+    state: &'a DirectoryView,
     mime_db: &'a MimeDb,
     entry: &'a FileEntry,
     rename: &'a super::rename::RenameState,
 ) -> Element<'a, Message> {
     let icon = icon::icon(
-        row_icon(entry, mime_db),
+        row_icon(state.location(), entry, mime_db),
         t.sizes.icon_row,
         t.on(s).primary.into_iced(),
     );

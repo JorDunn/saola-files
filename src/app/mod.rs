@@ -19,6 +19,7 @@ mod dbus;
 mod file_ops;
 mod navigation;
 mod properties;
+mod sniff;
 mod subscription;
 mod thumbs;
 mod view;
@@ -138,6 +139,9 @@ pub(crate) enum Message {
     /// the menu instead of doing nothing).
     Noop,
     // --- features (alphabetical) ---
+    /// A batch of background content-sniff head reads finished
+    /// (`app::sniff`).
+    SniffReady(Vec<sniff::SniffOutcome>),
 }
 
 pub(crate) struct App {
@@ -325,6 +329,9 @@ pub(crate) struct App {
     /// gets to do anything else with it.
     activation: cli::Cli,
     // --- features (alphabetical) ---
+    /// Files with a content-sniff head read in flight (`app::sniff`), so a
+    /// second scroll batch does not queue a duplicate read.
+    sniff_inflight: HashSet<Location>,
 }
 
 impl App {
@@ -419,6 +426,7 @@ impl App {
             pending_connect: None,
             activation,
             // --- features (alphabetical) ---
+            sniff_inflight: HashSet::new(),
         };
         // Stage 14: publish this `App`'s `RemoteManager` pool for
         // `modules::resolve` to reach — see that function's own doc
@@ -500,6 +508,7 @@ impl App {
             Message::Dbus(event) => self.handle_dbus_event(event),
             Message::DbusPropertiesResolved(items) => self.open_properties(items),
             // --- features (alphabetical) ---
+            Message::SniffReady(outcomes) => self.handle_sniff_ready(outcomes),
         }
     }
 

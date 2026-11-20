@@ -249,7 +249,7 @@ fn tile<'a>(
     if let Some(rename) = state.rename_state()
         && rename.original == entry.name
     {
-        return renaming_tile(t, s, mime_db, entry, rename);
+        return renaming_tile(t, s, state, mime_db, entry, rename);
     }
 
     let selected = state.selection.is_selected(&entry.name);
@@ -274,7 +274,7 @@ fn tile<'a>(
             .height(t.sizes.grid_tile)
             .into(),
         None => icon::icon(
-            row_icon(entry, mime_db),
+            row_icon(state.location(), entry, mime_db),
             t.sizes.icon_bare,
             icon_color.into_iced(),
         )
@@ -359,12 +359,13 @@ fn tile<'a>(
 fn renaming_tile<'a>(
     t: &'a Theme,
     s: Surface,
+    state: &'a DirectoryView,
     mime_db: &'a MimeDb,
     entry: &'a FileEntry,
     rename: &'a super::rename::RenameState,
 ) -> Element<'a, Message> {
     let glyph = icon::icon(
-        row_icon(entry, mime_db),
+        row_icon(state.location(), entry, mime_db),
         t.sizes.icon_bare,
         t.on(s).primary.into_iced(),
     );

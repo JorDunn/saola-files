@@ -520,6 +520,18 @@ impl DirectoryView {
             .collect()
     }
 
+    /// The modification time of the entry named `name` in this directory,
+    /// whether or not it is selected. Activation falls back to the cursor
+    /// row when nothing is selected, so a lookup through
+    /// [`Self::selected_entries`] would miss it; the content-sniff cache is
+    /// keyed by mtime and needs this to find the verdict for that row.
+    pub fn modified_of(&self, name: &std::ffi::OsStr) -> Option<SystemTime> {
+        self.entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .and_then(|entry| entry.modified)
+    }
+
     /// Resolve a `visible` row index to its `FileEntry`, or `None` if it's
     /// out of range — the one indirection every row-index lookup in this
     /// module goes through, so a stale index (a race with a resort/

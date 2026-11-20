@@ -304,7 +304,37 @@ mod tests {
     use super::super::test_support::*;
     use super::*;
     use crate::keymap::Action;
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
+
+    #[test]
+    fn enter_on_an_unselected_cursor_row_still_finds_its_sniffed_type() {
+        use crate::core::mime::MimeDb;
+        use std::time::{Duration, SystemTime};
+
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(5);
+        // List without an mtime (a listing with one bubbles thumbnail
+        // requests, which `listed_view` forbids), then stamp it.
+        let mut view = listed_view(vec![file("picture")]);
+        if let Some(entry) = view.entries.first_mut() {
+            entry.modified = Some(mtime);
+        }
+        // Cursor sits on the row without selecting it (as after a click
+        // that was then cleared, or Ctrl+arrow navigation).
+        view.selection.set_cursor(Some(0));
+        assert_eq!(view.selected_count(), 0);
+
+        let db = MimeDb::new();
+        let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+        db.record_sniff(view.location(), OsStr::new("picture"), mtime, png);
+
+        let Some(Event::Activated(locations)) = view.activate_selection() else {
+            panic!("expected Activated");
+        };
+        let name = locations[0].path.file_name().unwrap();
+        // The mtime comes from the view, not the (empty) selection.
+        let found = db.guess_entry(view.location(), name, view.modified_of(name));
+        assert_eq!(found, "image/png");
+    }
 
     #[test]
     fn enter_on_a_lone_selected_directory_requests_open_directory() {
