@@ -33,6 +33,11 @@ impl App {
     /// event themselves, only what this builds from it (see
     /// `ui::dialogs::progress`'s module doc comment).
     pub(super) fn handle_op_event(&mut self, event: ops::OpEvent) -> Task<Message> {
+        // A download for opening a remote file is an ordinary copy op, but
+        // its end launches an app instead of finishing a paste.
+        if let Some(task) = self.remote_open_event(&event) {
+            return task;
+        }
         match event {
             ops::OpEvent::Started {
                 files_total,

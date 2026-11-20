@@ -161,8 +161,8 @@ impl Backend for SftpBackend {
         // `main.rs::delete_one`'s permanent-delete branch is what a
         // non-`TRASH` backend gets, worded as such.
         // No `LOCAL_PATH`: files live on the remote host; "open" downloads
-        // to a temp file via `core::remote::RemoteManager::
-        // download_to_temp`, with a read-only caveat.
+        // to a read-only temp copy (`core::open_copy`,
+        // `app::remote_open`), with a caveat.
         // No `THUMBNAILS`: generating a directory's worth of thumbnails
         // one network round trip per file at a time is a real performance
         // concern this stage doesn't take on (see `core::thumbs`'s "known

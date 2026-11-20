@@ -9,11 +9,13 @@ use iced::Task;
 
 use core::failure::{Cause, Failure, Operation};
 use core::fs::{ops, undo};
-use core::vfs::Location;
-use saola_files::{core, ui};
+use core::vfs::{Location, VfsError};
+use saola_files::{core, tr, ui};
 use ui::explorer::ViewId;
 
 use super::file_ops::write_foreign_clipboard;
+use super::remote_open::Launch;
+use super::sniff::has_local_path;
 use super::{App, Message, directory_task, trash_task};
 
 impl App {
@@ -86,8 +88,11 @@ impl App {
         match event {
             ui::dirview::Event::OpenDirectory(location) => self.navigate_view(id, location),
             ui::dirview::Event::Activated(locations) => {
+                // Files with no local path (SFTP) are downloaded first
+                // (`remote_open`); the rest open in place, as ever.
+                let (locations, remote) = self.divert_remote(locations, Launch::Default);
                 self.open_with_default_app(id, &locations);
-                Task::none()
+                remote
             }
             ui::dirview::Event::OpenWith(locations, desktop_id) => {
                 let Some(entry) = self.apps_db.entry(&desktop_id).cloned() else {
@@ -101,6 +106,11 @@ impl App {
                     self.report_new(Operation::OpenWith, failures);
                     return Task::none();
                 };
+                let (locations, remote) =
+                    self.divert_remote(locations, Launch::With(desktop_id.clone()));
+                if locations.is_empty() {
+                    return remote;
+                }
                 let terminal = core::apps::resolve_terminal_from_env(self.terminal.as_deref());
                 let paths: Vec<PathBuf> = locations.iter().map(|l| l.path.clone()).collect();
                 if let Err(err) = core::apps::open(&entry, &paths, &terminal) {
@@ -111,9 +121,23 @@ impl App {
                         .collect();
                     self.report_new(Operation::OpenWith, failures);
                 }
-                Task::none()
+                remote
             }
             ui::dirview::Event::OpenTerminal(location, is_dir) => {
+                // A terminal needs a real directory: not available on a
+                // backend without a local path.
+                if !has_local_path(&location) {
+                    let folder = if is_dir {
+                        location.clone()
+                    } else {
+                        location.parent().unwrap_or_else(|| location.clone())
+                    };
+                    let err = VfsError::Unsupported {
+                        operation: tr!("open-terminal-operation"),
+                    };
+                    self.report_new(Operation::OpenTerminal, vec![Failure::at(&folder, err)]);
+                    return Task::none();
+                }
                 let terminal = core::apps::resolve_terminal_from_env(self.terminal.as_deref());
                 if let Err(err) = core::apps::open_terminal_here(&terminal, is_dir, &location.path)
                 {
@@ -131,6 +155,11 @@ impl App {
                 Task::none()
             }
             ui::dirview::Event::RunCustomAction(exec, locations) => {
+                let (locations, remote) =
+                    self.divert_remote(locations, Launch::Custom(exec.clone()));
+                if locations.is_empty() {
+                    return remote;
+                }
                 let paths: Vec<PathBuf> = locations.iter().map(|l| l.path.clone()).collect();
                 let mut failures = Vec::new();
                 for argv in core::apps::build_argv(&exec, &paths) {
@@ -143,7 +172,7 @@ impl App {
                     }
                 }
                 self.report_new(Operation::RunAction, failures);
-                Task::none()
+                remote
             }
             ui::dirview::Event::CopyRequested(locations) => {
                 self.clipboard.set_copy(locations.clone());
