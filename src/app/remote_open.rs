@@ -272,7 +272,7 @@ impl App {
                 }
                 Some(Task::none())
             }
-            ops::OpEvent::Finished { errors } => {
+            ops::OpEvent::Finished { errors, .. } => {
                 let pending = self.pending_open.take()?;
                 self.clear_active_op();
                 if pending.conflicted {
@@ -642,7 +642,12 @@ where
 
     // Refuse before downloading when the cache folder is known not to have
     // room. An unknown answer (no statfs) does not block the open.
-    let needed: u64 = sizes.iter().flatten().sum();
+    // Saturating: server-reported sizes are untrusted, and a plain sum
+    // could overflow (panic in debug, wrap past the check in release).
+    let needed: u64 = sizes
+        .iter()
+        .flatten()
+        .fold(0u64, |total, size| total.saturating_add(*size));
     let here = Location::local(slot.clone());
     if let Some(backend) = backend_for(&here)
         && let Ok(stats) = backend.statfs(&here).await
@@ -1081,5 +1086,36 @@ mod tests {
         open_copy::remove_slot(&slot);
         assert!(!slot.exists());
         let _ = std::fs::remove_dir_all(scratch_top(&base));
+    }
+
+    #[test]
+    fn huge_reported_sizes_do_not_overflow_the_space_check() {
+        let root = scratch_root("huge");
+        let huge = |_: &Location| -> Option<Box<dyn Backend>> {
+            let mut big = entry("a.bin", EntryKind::File);
+            big.size = u64::MAX;
+            let mut big2 = entry("b.bin", EntryKind::File);
+            big2.size = u64::MAX;
+            Some(Box::new(
+                FakeBackend::new()
+                    .with_caps(Caps::STATFS)
+                    .with_stats(saola_files::core::vfs::FsStats {
+                        total: u64::MAX,
+                        free: u64::MAX - 1,
+                        available: u64::MAX - 1,
+                    })
+                    .with_dir("/srv", vec![big, big2]),
+            ))
+        };
+        let failures = runtime()
+            .block_on(prepare(
+                vec![remote("/srv/a.bin"), remote("/srv/b.bin")],
+                Some(root.clone()),
+                huge,
+            ))
+            .expect_err("two u64::MAX files cannot fit");
+        let sentence = core::failure::describe(Operation::Open, &failures[0]);
+        assert!(sentence.contains("free space"), "{sentence}");
+        let _ = std::fs::remove_dir_all(scratch_top(&root));
     }
 }

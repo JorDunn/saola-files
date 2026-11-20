@@ -172,8 +172,10 @@ impl SlotError {
 /// values (tests pass their own; nothing here reads the environment). An
 /// empty value counts as unset, the same XDG rule `core::thumbs` follows.
 pub fn open_root_from(xdg_cache_home: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    // An empty or relative `$XDG_CACHE_HOME` counts as unset (XDG says
+    // relative paths are invalid; `core::state` does the same).
     if let Some(xdg) = xdg_cache_home
-        && !xdg.is_empty()
+        && Path::new(&xdg).is_absolute()
     {
         return Some(PathBuf::from(xdg).join("saola-files").join("open"));
     }
@@ -518,6 +520,11 @@ mod tests {
             Some(PathBuf::from("/home/me/.cache/saola-files/open"))
         );
         assert_eq!(open_root_from(Some("".into()), Some("".into())), None);
+        // A relative XDG_CACHE_HOME is ignored just like an empty one.
+        assert_eq!(
+            open_root_from(Some("rel/cache".into()), Some("/home/me".into())),
+            Some(PathBuf::from("/home/me/.cache/saola-files/open"))
+        );
         assert_eq!(open_root_from(None, None), None);
     }
 
