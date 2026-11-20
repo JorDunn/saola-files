@@ -170,6 +170,14 @@ pub(crate) enum Message {
     /// A batch of background content-sniff head reads finished
     /// (`app::sniff`).
     SniffReady(Vec<sniff::SniffOutcome>),
+    /// An undo finished (`start_undo`): the incident minted when it
+    /// started, its result, and, for a bulk-rename undo that could not
+    /// finish, an entry to push back so a later Ctrl+Z can retry.
+    UndoFinished(
+        core::failure::Incident,
+        Result<(), String>,
+        Option<undo::UndoEntry>,
+    ),
 }
 
 /// Where a raw key event should go; see [`App::keyboard_target`].
@@ -647,6 +655,9 @@ impl App {
             Message::RemoteOpen(inner) => self.handle_remote_open(inner),
             Message::Session(inner) => self.handle_session_message(inner),
             Message::SniffReady(outcomes) => self.handle_sniff_ready(outcomes),
+            Message::UndoFinished(incident, result, retry) => {
+                self.handle_undo_finished(incident, result, retry)
+            }
         }
     }
 
@@ -1043,6 +1054,37 @@ mod tests {
             core::fs::bulk_rename::ApplyReport::default(),
         );
         assert!(!app.bulk_rename_running);
+    }
+
+    #[test]
+    fn undo_waits_for_a_running_bulk_rename_and_keeps_its_entry() {
+        let mut app = app();
+        app.undo_stack.push(undo::UndoEntry::New {
+            created: Location::local("/tmp/x"),
+        });
+        app.bulk_rename_running = true;
+        let _ = app.start_undo();
+        assert!(
+            !app.undo_stack.is_empty(),
+            "the entry must stay on the stack"
+        );
+        assert!(app.error_notice.is_showing());
+    }
+
+    #[test]
+    fn a_stuck_bulk_rename_undo_pushes_its_retry_entry_back() {
+        let mut app = app();
+        let retry = undo::UndoEntry::BulkRename {
+            dir: Location::local("/tmp"),
+            moves: vec![(".saola-tmp-1".into(), "a".into())],
+        };
+        let _ = app.handle_undo_finished(
+            core::failure::Incident::mint(),
+            Err("stuck".to_owned()),
+            Some(retry.clone()),
+        );
+        assert!(app.error_notice.is_showing());
+        assert_eq!(app.undo_stack.pop(), Some(retry));
     }
 
     #[test]

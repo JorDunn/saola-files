@@ -1016,6 +1016,94 @@ pub fn plan_undo(moves: &[(OsString, OsString)], present: &HashSet<OsString>) ->
     }
 }
 
+/// What an undo left behind.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UndoOutcome {
+    /// A worded problem, if the undo did not fully complete.
+    pub error: Option<String>,
+    /// `(current name, original name)` for the items an attempted undo left
+    /// away from their original names, so a retry entry can be pushed back.
+    /// Only filled when the undo itself failed; items skipped up front
+    /// (deleted or renamed since) are not retried.
+    pub remaining: Vec<(OsString, OsString)>,
+}
+
+/// Undoes a bulk rename: re-plans against the folder as it is now
+/// ([`plan_undo`]), runs the result through [`apply`] (checked renames,
+/// rollback that stops at a stuck step), and says what it left behind: the
+/// reason, the temporary name of any item stranded under one, and the items
+/// still away from their original names.
+pub async fn undo(
+    backend: &dyn Backend,
+    dir: &Location,
+    moves: &[(OsString, OsString)],
+) -> UndoOutcome {
+    let present: HashSet<OsString> = match backend.list(dir).await {
+        Ok(entries) => entries.into_iter().map(|entry| entry.name).collect(),
+        Err(error) => {
+            return UndoOutcome {
+                error: Some(error.to_string()),
+                remaining: moves.to_vec(),
+            };
+        }
+    };
+    let plan = plan_undo(moves, &present);
+    let report = apply(backend, dir, &plan.moves).await;
+
+    // `apply` talks about the names the undo *started* from; translate back
+    // to the true originals (the undo's targets).
+    let target_of: HashMap<&OsStr, &OsString> = plan
+        .moves
+        .iter()
+        .map(|(from, original)| (from.as_os_str(), original))
+        .collect();
+    let now_of: HashMap<&OsStr, &OsString> = report
+        .moved
+        .iter()
+        .map(|(now, from)| (from.as_os_str(), now))
+        .collect();
+
+    let remaining = if report.failure.is_some() {
+        plan.moves
+            .iter()
+            .filter_map(|(from, original)| {
+                let now = now_of.get(from.as_os_str()).copied().unwrap_or(from);
+                (now != original).then(|| (now.clone(), original.clone()))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let error = if let Some(failure) = &report.failure {
+        let reason = failure.error.to_string();
+        Some(match report.parked.first() {
+            Some((temp, from)) => {
+                let original = target_of.get(from.as_os_str()).copied().unwrap_or(from);
+                crate::tr!(
+                    "undo-bulk-rename-stuck",
+                    reason = reason,
+                    name = original.to_string_lossy().into_owned(),
+                    parked = crate::tr!(
+                        "bulk-rename-parked",
+                        temp = temp.to_string_lossy().into_owned()
+                    )
+                )
+            }
+            None => reason,
+        })
+    } else {
+        plan.skipped.first().map(|(name, _)| {
+            crate::tr!(
+                "undo-bulk-rename-skipped",
+                count = plan.skipped.len(),
+                name = name.to_string_lossy().into_owned()
+            )
+        })
+    };
+    UndoOutcome { error, remaining }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1595,6 +1683,16 @@ mod tests {
             }
         }
 
+        /// A copy of `other`'s files with no scripted failures.
+        fn from_files(other: &MemBackend) -> Self {
+            MemBackend {
+                files: Mutex::new(other.files.lock().map(|f| f.clone()).unwrap_or_default()),
+                calls: Mutex::new(0),
+                fail_calls: Vec::new(),
+                plant: None,
+            }
+        }
+
         fn names(&self) -> HashSet<OsString> {
             self.files
                 .lock()
@@ -1941,6 +2039,55 @@ mod tests {
         assert_eq!(report.moved.len(), N);
         assert_eq!(backend.names().len(), N);
         assert_eq!(backend.content_of("n1"), Some("content of n0".into()));
+    }
+
+    #[tokio::test]
+    async fn a_two_cycle_whose_second_step_and_rollback_both_fail_parks_the_item_safely() {
+        // Swap a<->b. a->tmp (1) ok, b->a (2) fails, rollback tmp->a (3)
+        // fails: `tmp` holds the original a, b is untouched.
+        let start = ["a", "b"];
+        let backend = MemBackend::new(&start, &[2, 3]);
+        let report = apply(&backend, &dir(), &pairs(&[("a", "b"), ("b", "a")])).await;
+        assert!(report.failure.is_some());
+        assert_eq!(report.stuck.len(), 1);
+        assert_eq!(report.parked, pairs(&[(".saola-tmp-1", "a")]));
+        assert_eq!(report.moved, pairs(&[(".saola-tmp-1", "a")]));
+        assert_eq!(
+            backend.content_of(".saola-tmp-1"),
+            Some("content of a".into())
+        );
+        assert_eq!(backend.content_of("b"), Some("content of b".into()));
+        assert_nothing_lost(&backend, &start);
+    }
+
+    #[tokio::test]
+    async fn an_undo_of_a_swap_whose_rollback_sticks_names_the_temp_file_and_keeps_a_retry() {
+        // Forward swap (calls 1-3). The undo's calls are 4 (b->tmp),
+        // 5 (a->b, fails) and 6 (rollback tmp->b, fails).
+        let start = ["a", "b"];
+        let backend = MemBackend::new(&start, &[5, 6]);
+        let forward = apply(&backend, &dir(), &pairs(&[("a", "b"), ("b", "a")])).await;
+        assert_eq!(forward.failure, None);
+
+        let outcome = undo(&backend, &dir(), &forward.moved).await;
+        let error = outcome.error.expect("the undo did not complete");
+        assert!(error.contains(".saola-tmp-1"), "{error}");
+        assert!(error.contains("“a”"), "{error}");
+        assert_nothing_lost(&backend, &start);
+        // The retry entry covers exactly the items still away from home:
+        // the original a is parked, the original b sits at `a`.
+        let mut remaining = outcome.remaining.clone();
+        remaining.sort();
+        assert_eq!(remaining, pairs(&[(".saola-tmp-1", "a"), ("a", "b")]));
+        assert_eq!(
+            backend.content_of(".saola-tmp-1"),
+            Some("content of a".into())
+        );
+        assert_eq!(backend.content_of("a"), Some("content of b".into()));
+
+        // And that retry entry works once the backend behaves.
+        let retry = undo(&MemBackend::from_files(&backend), &dir(), &remaining).await;
+        assert_eq!(retry.error, None);
     }
 
     #[tokio::test]

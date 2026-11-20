@@ -226,6 +226,7 @@ bulk-rename-preview-more =
     }
 bulk-rename-regex-hint = In the replacement, ${"{"}name{"}"} or $1 inserts a matched group. Write ${"{"}1{"}"}abc when letters follow the number.
 bulk-rename-parked = it is now stored as “{ $temp }”, a hidden file in the same folder
+undo-bulk-rename-stuck = { $reason }; for “{ $name }”, { $parked }
 bulk-rename-busy = another operation is still running; try again when it has finished
 bulk-rename-operation = renaming items
 bulk-rename-no-backend = nothing is connected for “{ $scheme }” locations

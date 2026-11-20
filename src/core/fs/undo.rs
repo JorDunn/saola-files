@@ -46,7 +46,6 @@
 //! a conflict is the simple, honest choice over trying to partially
 //! reconstruct which items are safe.
 
-use std::collections::HashSet;
 use std::ffi::OsString;
 
 use crate::core::fs::bulk_rename;
@@ -224,7 +223,7 @@ pub async fn apply(entry: UndoEntry) -> Result<(), String> {
             }
         }
         UndoEntry::Rename { from, to } => rename_back(&to, &from).await,
-        UndoEntry::BulkRename { dir, moves } => undo_bulk_rename(&dir, &moves).await,
+        UndoEntry::BulkRename { dir, moves } => undo_bulk_rename(&dir, &moves).await.0,
         UndoEntry::Trash { id, .. } => {
             // `restore` is blocking `std::fs` I/O (see `core::fs::trash`'s
             // own module doc comment on why it's allowed to be) — run on a
@@ -241,33 +240,38 @@ pub async fn apply(entry: UndoEntry) -> Result<(), String> {
     }
 }
 
-/// Inverts a [`UndoEntry::BulkRename`]: lists the folder as it is now,
-/// drops the pairs that can no longer be restored safely, and runs the rest
-/// through the same planner and executor the forward rename used (so a swap
-/// goes through a temporary name, and nothing is ever overwritten).
-async fn undo_bulk_rename(dir: &Location, moves: &[(OsString, OsString)]) -> Result<(), String> {
-    let Some(backend) = crate::modules::resolve(dir) else {
-        return Err(format!("no backend for scheme \"{}\"", dir.scheme));
-    };
-    let present: HashSet<OsString> = backend
-        .list(dir)
-        .await
-        .map_err(|err| err.to_string())?
-        .into_iter()
-        .map(|entry| entry.name)
-        .collect();
-    let plan = bulk_rename::plan_undo(moves, &present);
-    let report = bulk_rename::apply(backend.as_ref(), dir, &plan.moves).await;
-    if let Some(failure) = report.failure {
-        return Err(failure.error.to_string());
+/// [`apply`], but also hands back an entry to push onto the stack again
+/// when an undo of a bulk rename could not finish, covering exactly the
+/// items still away from their original names, so a later Ctrl+Z can retry.
+/// Every other kind of entry returns `None`.
+pub async fn apply_with_retry(entry: UndoEntry) -> (Result<(), String>, Option<UndoEntry>) {
+    match entry {
+        UndoEntry::BulkRename { dir, moves } => undo_bulk_rename(&dir, &moves).await,
+        other => (apply(other).await, None),
     }
-    match plan.skipped.first() {
-        Some((name, _)) => Err(tr!(
-            "undo-bulk-rename-skipped",
-            count = plan.skipped.len(),
-            name = name.to_string_lossy().into_owned()
-        )),
-        None => Ok(()),
+}
+
+/// Inverts a [`UndoEntry::BulkRename`] through `bulk_rename::undo` (planner,
+/// checked renames, stop-at-stuck rollback), turning what it left behind
+/// into the result and an optional retry entry.
+async fn undo_bulk_rename(
+    dir: &Location,
+    moves: &[(OsString, OsString)],
+) -> (Result<(), String>, Option<UndoEntry>) {
+    let Some(backend) = crate::modules::resolve(dir) else {
+        return (
+            Err(format!("no backend for scheme \"{}\"", dir.scheme)),
+            None,
+        );
+    };
+    let outcome = bulk_rename::undo(backend.as_ref(), dir, moves).await;
+    let retry = (!outcome.remaining.is_empty()).then(|| UndoEntry::BulkRename {
+        dir: dir.clone(),
+        moves: outcome.remaining,
+    });
+    match outcome.error {
+        Some(error) => (Err(error), retry),
+        None => (Ok(()), retry),
     }
 }
 

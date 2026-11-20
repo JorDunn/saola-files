@@ -244,22 +244,47 @@ impl App {
     /// worded to stderr, the same posture every other backend failure in
     /// this file already takes.
     pub(super) fn start_undo(&mut self) -> Task<Message> {
+        // A running bulk rename could pick the same temporary names in the
+        // same folder, so undo waits for it. (Undo has no check against a
+        // running engine op, `active_op`, on main; not added here.) Checked
+        // before popping, so the entry stays on the stack.
+        if self.bulk_rename_running && !self.undo_stack.is_empty() {
+            let busy = VfsError::Other {
+                message: tr!("bulk-rename-busy"),
+            };
+            self.report_new(Operation::Undo, vec![Failure::new(OsString::new(), busy)]);
+            return Task::none();
+        }
         let Some(entry) = self.undo_stack.pop() else {
             return Task::none();
         };
         self.undo_toast = None;
         let incident = self.new_incident();
-        Task::perform(undo::apply(entry), move |result| match result {
-            Ok(()) => Message::Noop,
-            Err(err) => {
-                eprintln!("saola-files: couldn't undo: {err}");
-                failed(
-                    incident,
-                    Operation::Undo,
-                    vec![Failure::new(OsString::new(), err)],
-                )
-            }
+        Task::perform(undo::apply_with_retry(entry), move |(result, retry)| {
+            Message::UndoFinished(incident, result, retry)
         })
+    }
+
+    /// `Message::UndoFinished`: word a failure, and put back the entry for
+    /// whatever a stuck bulk-rename undo left away from its original names.
+    pub(super) fn handle_undo_finished(
+        &mut self,
+        incident: Incident,
+        result: Result<(), String>,
+        retry: Option<undo::UndoEntry>,
+    ) -> Task<Message> {
+        if let Err(err) = result {
+            eprintln!("saola-files: couldn't undo: {err}");
+            self.report_failures(
+                incident,
+                Operation::Undo,
+                vec![Failure::new(OsString::new(), err)],
+            );
+        }
+        if let Some(entry) = retry {
+            self.push_undo(entry);
+        }
+        Task::none()
     }
 
     /// `Event::DeleteRequested`'s handling (Stage 9): trash where the
