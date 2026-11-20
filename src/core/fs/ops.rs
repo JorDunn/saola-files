@@ -951,10 +951,21 @@ mod tests {
     // `tokio::task::spawn_blocking` need, the same posture
     // `modules::local`'s own integration tests already take.
 
+    /// A fresh, empty directory for one test.
+    ///
+    /// The name carries a per-process counter as well as the pid and the
+    /// time: tests run on parallel threads, and two threads can read the
+    /// same nanosecond (measured: about one name in ten repeated with 16
+    /// threads asking at once). Without the counter two tests could share a
+    /// directory and delete or overwrite each other's files (issue #106).
+    /// `create_dir` (not `create_dir_all`) also refuses a name that somehow
+    /// exists already instead of silently sharing it.
     fn tempdir() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let mut dir = std::env::temp_dir();
         let unique = format!(
-            "saola-files-ops-test-{}-{}",
+            "saola-files-ops-test-{}-{}-{n}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -962,7 +973,7 @@ mod tests {
                 .as_nanos()
         );
         dir.push(unique);
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir(&dir).unwrap();
         dir
     }
 

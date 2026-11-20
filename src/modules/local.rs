@@ -1145,10 +1145,15 @@ mod tests {
 
     // ── tiny temp-dir helpers (no `tempfile` dependency for this alone) ──
 
+    /// A fresh, empty directory for one test. The per-process counter keeps
+    /// two parallel tests that read the same nanosecond from sharing a
+    /// directory (the cause of issue #106; see `core::fs::ops`'s helper).
     fn tempdir() -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut dir = std::env::temp_dir();
         let unique = format!(
-            "saola-files-test-{}-{}",
+            "saola-files-test-{}-{}-{n}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1156,7 +1161,7 @@ mod tests {
                 .as_nanos()
         );
         dir.push(unique);
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir(&dir).unwrap();
         dir
     }
 
