@@ -110,8 +110,10 @@ impl Notice {
     }
 
     /// Counts `failures`, keeps what fits, and rebuilds the text.
-    fn add(&mut self, failures: Vec<Failure>) {
-        self.total = self.total.saturating_add(failures.len());
+    fn add(&mut self, failures: Vec<Failure>, omitted: usize) {
+        self.total = self
+            .total
+            .saturating_add(failures.len().saturating_add(omitted));
         let room = MAX_DETAIL_LINES.saturating_sub(self.failures.len());
         self.failures.extend(failures.into_iter().take(room));
         if let Some(summary) = failure::summarize(self.operation, &self.failures, self.total) {
@@ -172,13 +174,25 @@ impl Slot {
         operation: Operation,
         failures: Vec<Failure>,
     ) -> bool {
+        self.report_omitting(incident, operation, failures, 0)
+    }
+
+    /// [`Self::report`] for an engine that kept only the first few
+    /// failures: `omitted` more failed and are counted in the headline.
+    pub fn report_omitting(
+        &mut self,
+        incident: Incident,
+        operation: Operation,
+        failures: Vec<Failure>,
+        omitted: usize,
+    ) -> bool {
         if failures.is_empty() {
             return false;
         }
         if let Some(notice) = self.notice.as_mut()
             && notice.incident == incident
         {
-            notice.add(failures);
+            notice.add(failures, omitted);
             return true;
         }
         if self.newest.is_some_and(|newest| incident <= newest) {
@@ -186,7 +200,7 @@ impl Slot {
         }
         self.newest = Some(incident);
         let mut notice = Notice::new(incident, operation);
-        notice.add(failures);
+        notice.add(failures, omitted);
         self.notice = Some(notice);
         true
     }
@@ -345,6 +359,19 @@ mod tests {
         assert_eq!(notice.operation(), Operation::Copy);
         assert_eq!(notice.total(), 1);
         assert!(!notice.is_expanded());
+    }
+
+    #[test]
+    fn omitted_failures_count_toward_the_total() {
+        let mut slot = Slot::default();
+        let incident = Incident::mint();
+        slot.report_omitting(
+            incident,
+            Operation::Delete,
+            vec![failure("a"), failure("b")],
+            98,
+        );
+        assert_eq!(slot.notice().expect("a notice").total(), 100);
     }
 
     #[test]

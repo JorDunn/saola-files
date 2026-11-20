@@ -51,6 +51,10 @@ dirview-name-with-counter = { $base } ({ $n })
 error-no-backend = no backend for scheme "{ $scheme }"
 error-create-failed = creating { $location } failed
 error-trash-internal = internal error talking to the trash: { $detail }
+error-op-busy = another file operation is still running
+error-too-deep = this folder is nested too deeply to delete safely, so it was left alone
+error-unsafe-entry-name = a folder entry has a name that cannot be used safely, so it was skipped
+error-unsupported-trash = moving items to the trash
 
 ## Context menu
 
@@ -107,6 +111,10 @@ progress-copying = Copying… { $done } of { $total }
 progress-copying-named = Copying { $name }… { $done } of { $total }
 progress-moving = Moving… { $done } of { $total }
 progress-moving-named = Moving { $name }… { $done } of { $total }
+progress-trashing = Moving to Trash… { $done } of { $total }
+progress-trashing-named = Moving { $name } to Trash… { $done } of { $total }
+progress-deleting = Deleting… { $done } of { $total }
+progress-deleting-named = Deleting { $name }… { $done } of { $total }
 
 ## Properties dialog
 

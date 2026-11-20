@@ -26,9 +26,8 @@
 //!
 //! # How each path identifies its incident
 //!
-//! - copy/move: one per engine op, minted in `submit_paste_op` and kept per
-//!   op id (`Incidents`);
-//! - trash/delete: one per `start_delete` call, shared by all its tasks;
+//! - copy/move/trash/delete: one per engine op, minted in
+//!   `submit_paste_op` / `start_delete` and kept per op id (`Incidents`);
 //! - undo, clipboard write, open, open with, open terminal, custom action:
 //!   one per user action, minted where the action is handled;
 //! - trash-browser restore/empty: minted by the browser when the request is
@@ -113,12 +112,16 @@ pub(super) fn op_failures(
     let operation = match kind {
         OpKind::Copy => Operation::Copy,
         OpKind::Move => Operation::Move,
+        OpKind::Trash => Operation::Trash,
+        OpKind::Delete => Operation::Delete,
     };
+    // Trash and delete have no destination: "to <folder>" would be wrong.
+    let has_destination = matches!(kind, OpKind::Copy | OpKind::Move);
     let failures = errors
         .iter()
         .map(|(location, err)| {
             let failure = Failure::at(location, err.clone());
-            if location == dest_dir {
+            if !has_destination || location == dest_dir {
                 failure
             } else {
                 failure.into_folder(dest_dir)
@@ -142,6 +145,19 @@ impl App {
         failures: Vec<Failure>,
     ) {
         self.error_notice.report(incident, operation, failures);
+    }
+
+    /// [`Self::report_failures`] when the engine kept only the first few
+    /// failures and `omitted` more were only counted.
+    pub(super) fn report_failures_omitting(
+        &mut self,
+        incident: Incident,
+        operation: Operation,
+        failures: Vec<Failure>,
+        omitted: usize,
+    ) {
+        self.error_notice
+            .report_omitting(incident, operation, failures, omitted);
     }
 
     /// [`Self::report_failures`] for an action that is complete in itself:
@@ -235,6 +251,15 @@ mod tests {
         let (op, failures) = op_failures(OpKind::Copy, &dest, &[denied("/home/me/Docs")]);
         assert_eq!(op, Operation::Copy);
         assert_eq!(failures[0].destination, None);
+    }
+
+    #[test]
+    fn trash_and_delete_failures_have_no_destination() {
+        let folder = Location::local("/home/me");
+        let (op, failures) = op_failures(OpKind::Delete, &folder, &[denied("/home/me/a.txt")]);
+        assert_eq!(op, Operation::Delete);
+        assert_eq!(failures[0].destination, None);
+        assert_eq!(op_failures(OpKind::Trash, &folder, &[]).0, Operation::Trash);
     }
 
     #[test]
