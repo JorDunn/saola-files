@@ -15,20 +15,82 @@
 //! `File::open` against the *target* file): a location's bytes may live on
 //! a remote backend, so [`MimeDb::guess`] only ever builds a guess from a
 //! file name plus an already-in-hand `sniff` buffer the caller fetched
-//! however its own backend does that (`Backend::read`, for a later stage
-//! that wires content sniffing through the open flow). This stage's own
-//! call sites (row-glyph selection in `ui::dirview::list`/`grid`,
-//! default-app resolution in `main.rs`) all pass `sniff: None` —
-//! extension/glob-based guessing, no I/O at all, which is what covers the
-//! overwhelming majority of real files and keeps "which icon does this row
-//! get" a synchronous, per-frame-cheap lookup rather than a per-row read.
-//! A later stage can thread a fetched sniff buffer through the same
-//! `sniff` parameter without any signature change here.
+//! through `Backend::read`.
+//!
+//! **Content sniffing** (this module's other half) is deliberately
+//! *opt-in and asynchronous*. Per-frame glyph lookups still resolve from
+//! the name alone ([`MimeDb::guess_entry`] is a hash lookup, no I/O). Only
+//! when the name gives no type ([`needs_sniff`]) does the app read the
+//! first [`SNIFF_BYTES`] of a *visible, local* file in the background and
+//! hand them to [`MimeDb::record_sniff`]; the verdict is cached per
+//! (directory, name, mtime), so the same file is never sniffed twice until
+//! it changes, and a `.txt` (a name that already says what it is) is never
+//! sniffed at all.
 
-use std::ffi::OsStr;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::panic::{self, AssertUnwindSafe};
+use std::time::SystemTime;
 
 use xdg_mime::SharedMimeInfo;
+
+use crate::core::vfs::Location;
+
+/// How many leading bytes a content sniff reads. 4 KiB covers every magic
+/// signature in shared-mime-info that matters for a glyph, and is small
+/// enough that reading it never feels like "opening" the file.
+pub const SNIFF_BYTES: usize = 4096;
+
+/// Upper bound on cached sniff verdicts. When exceeded the whole cache is
+/// dropped (a cheap, predictable policy: verdicts are recomputed lazily
+/// for whatever is on screen, so the worst case is a few repeated reads).
+const SNIFF_CACHE_CAPACITY: usize = 8192;
+
+/// Whether a name-only mimetype is too vague to trust, so the file's
+/// leading bytes are worth reading. Pure, so the decision is unit-tested
+/// without touching a file system.
+///
+/// Only "no type" (`application/octet-stream`, which is what the glob
+/// matcher returns for an unmatched name such as `README` or `picture`)
+/// qualifies. A name that already resolves to a specific type (`.txt`,
+/// `.png`, `.rs`) is trusted and never re-sniffed.
+pub fn needs_sniff(name_mime: &str) -> bool {
+    name_mime.is_empty() || name_mime == "application/octet-stream"
+}
+
+/// One cached sniff verdict: the mtime it was computed for, and the result.
+type SniffVerdict = (SystemTime, String);
+
+/// Sniff verdicts, keyed by directory, then file name. The two-level shape
+/// lets a per-frame lookup borrow `&Location` and `&OsStr` directly
+/// (`HashMap::get` accepts any borrowed form of the key), so a render pass
+/// allocates nothing.
+#[derive(Default)]
+struct SniffCache {
+    dirs: HashMap<Location, HashMap<OsString, SniffVerdict>>,
+    len: usize,
+}
+
+impl SniffCache {
+    /// The verdict for `name`, but only if it was computed for exactly
+    /// `modified` — a changed mtime is a clean miss, never a stale answer.
+    fn get(&self, dir: &Location, name: &OsStr, modified: SystemTime) -> Option<&str> {
+        let (mtime, mime) = self.dirs.get(dir)?.get(name)?;
+        (*mtime == modified).then_some(mime.as_str())
+    }
+
+    fn insert(&mut self, dir: &Location, name: &OsStr, modified: SystemTime, mime: String) {
+        if self.len >= SNIFF_CACHE_CAPACITY {
+            self.dirs.clear();
+            self.len = 0;
+        }
+        let names = self.dirs.entry(dir.clone()).or_default();
+        if names.insert(name.to_owned(), (modified, mime)).is_none() {
+            self.len += 1;
+        }
+    }
+}
 
 /// Wraps the loaded shared-MIME-info database. Expensive-ish to build (it
 /// walks and parses every `globs2`/`magic`/`subclasses` file in the
@@ -37,6 +99,11 @@ use xdg_mime::SharedMimeInfo;
 /// per view or per row.
 pub struct MimeDb {
     inner: SharedMimeInfo,
+    /// Content-sniff verdicts. `RefCell` because `view()` only holds
+    /// `&MimeDb` yet the update path records into it; both run on the one
+    /// UI thread and no borrow crosses an `.await`, so it never panics
+    /// from a double borrow (every borrow below is short and non-nested).
+    sniffed: RefCell<SniffCache>,
 }
 
 impl MimeDb {
@@ -63,7 +130,64 @@ impl MimeDb {
                 SharedMimeInfo::new_for_directory("/nonexistent-saola-files-mime-fallback")
             },
         );
-        MimeDb { inner }
+        MimeDb {
+            inner,
+            sniffed: RefCell::default(),
+        }
+    }
+
+    /// The mimetype to show for the file `name` inside `dir`: the cached
+    /// content-sniff verdict when one exists for exactly this `modified`
+    /// time, otherwise the name-only guess. Never does I/O, so it is safe
+    /// to call per row, per frame.
+    pub fn guess_entry(
+        &self,
+        dir: &Location,
+        name: &OsStr,
+        modified: Option<SystemTime>,
+    ) -> String {
+        let by_name = self.guess(name, None);
+        if !needs_sniff(&by_name) {
+            return by_name;
+        }
+        modified
+            .and_then(|mtime| {
+                self.sniffed
+                    .borrow()
+                    .get(dir, name, mtime)
+                    .map(str::to_owned)
+            })
+            .unwrap_or(by_name)
+    }
+
+    /// Whether this file still wants a content sniff: its name gives no
+    /// type *and* no verdict is cached for this `modified` time. A file
+    /// with no known mtime is never sniffed (nothing to key the cache on).
+    pub fn wants_sniff(&self, dir: &Location, name: &OsStr, modified: Option<SystemTime>) -> bool {
+        let Some(mtime) = modified else {
+            return false;
+        };
+        needs_sniff(&self.guess(name, None))
+            && self.sniffed.borrow().get(dir, name, mtime).is_none()
+    }
+
+    /// Records the verdict for `bytes` (the file's leading bytes) so later
+    /// [`Self::guess_entry`] calls for the same `modified` time return it.
+    /// An unrecognised file is recorded too (as `application/octet-stream`)
+    /// so it is not re-read on every refresh.
+    pub fn record_sniff(&self, dir: &Location, name: &OsStr, modified: SystemTime, bytes: &[u8]) {
+        let mime = self.guess(name, Some(bytes));
+        self.sniffed.borrow_mut().insert(dir, name, modified, mime);
+    }
+
+    /// Records that reading this file's bytes failed (permissions, a race
+    /// with a delete), so the name-only guess stands and the read is not
+    /// retried on every scroll until the file's mtime changes.
+    pub fn record_unsniffable(&self, dir: &Location, name: &OsStr, modified: SystemTime) {
+        let generic = "application/octet-stream".to_owned();
+        self.sniffed
+            .borrow_mut()
+            .insert(dir, name, modified, generic);
     }
 
     /// Best-guess mimetype essence (`"text/plain"`, never
@@ -284,6 +408,102 @@ mod tests {
             category("application/x-made-up-vendor-type"),
             Category::Generic
         );
+    }
+
+    // ── content sniffing ────────────────────────────────────────────────
+
+    #[test]
+    fn only_an_untyped_name_needs_a_sniff() {
+        assert!(needs_sniff("application/octet-stream"));
+        assert!(needs_sniff(""));
+        // A name that already says what it is is trusted: `.txt` is never
+        // re-sniffed.
+        assert!(!needs_sniff("text/plain"));
+        assert!(!needs_sniff("image/png"));
+    }
+
+    /// The PNG signature plus an IHDR chunk header, enough for
+    /// shared-mime-info's magic rule.
+    const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+
+    fn t(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn sniffing_an_extensionless_png_finds_the_image_type() {
+        let db = MimeDb::new();
+        assert_eq!(
+            db.guess(OsStr::new("picture"), Some(PNG_MAGIC)),
+            "image/png"
+        );
+    }
+
+    #[test]
+    fn extensionless_file_is_sniffed_once_then_served_from_the_cache() {
+        let db = MimeDb::new();
+        let dir = Location::local("/scratch");
+        let name = OsStr::new("picture");
+        assert!(db.wants_sniff(&dir, name, Some(t(1))));
+        // Before the sniff lands the glyph falls back to the name guess.
+        assert_eq!(
+            db.guess_entry(&dir, name, Some(t(1))),
+            "application/octet-stream"
+        );
+
+        db.record_sniff(&dir, name, t(1), PNG_MAGIC);
+        assert!(!db.wants_sniff(&dir, name, Some(t(1))));
+        assert_eq!(db.guess_entry(&dir, name, Some(t(1))), "image/png");
+    }
+
+    #[test]
+    fn a_changed_mtime_invalidates_the_cached_verdict() {
+        let db = MimeDb::new();
+        let dir = Location::local("/scratch");
+        let name = OsStr::new("picture");
+        db.record_sniff(&dir, name, t(1), PNG_MAGIC);
+
+        assert!(db.wants_sniff(&dir, name, Some(t(2))));
+        assert_eq!(
+            db.guess_entry(&dir, name, Some(t(2))),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn the_same_name_in_another_directory_does_not_share_a_verdict() {
+        let db = MimeDb::new();
+        let name = OsStr::new("picture");
+        db.record_sniff(&Location::local("/a"), name, t(1), PNG_MAGIC);
+        assert!(db.wants_sniff(&Location::local("/b"), name, Some(t(1))));
+    }
+
+    #[test]
+    fn a_typed_name_never_wants_a_sniff() {
+        let db = MimeDb::new();
+        let dir = Location::local("/scratch");
+        assert!(!db.wants_sniff(&dir, OsStr::new("notes.txt"), Some(t(1))));
+        // ...and its name guess wins even if bytes were somehow recorded.
+        db.record_sniff(&dir, OsStr::new("notes.txt"), t(1), PNG_MAGIC);
+        assert_eq!(
+            db.guess_entry(&dir, OsStr::new("notes.txt"), Some(t(1))),
+            "text/plain"
+        );
+    }
+
+    #[test]
+    fn a_file_with_no_known_mtime_is_not_sniffed() {
+        let db = MimeDb::new();
+        assert!(!db.wants_sniff(&Location::local("/s"), OsStr::new("picture"), None));
+    }
+
+    #[test]
+    fn an_unrecognised_file_is_recorded_so_it_is_not_re_read() {
+        let db = MimeDb::new();
+        let dir = Location::local("/scratch");
+        let name = OsStr::new("blob");
+        db.record_sniff(&dir, name, t(1), &[0xfe, 0xed, 0x00, 0x01, 0x02, 0x03]);
+        assert!(!db.wants_sniff(&dir, name, Some(t(1))));
     }
 
     // ── `MimeDb::guess` — needs the real system MIME database ───────────

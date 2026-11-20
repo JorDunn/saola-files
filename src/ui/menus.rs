@@ -65,7 +65,7 @@ use crate::config::CustomAction;
 use crate::core::apps::{AppsDb, DesktopEntry};
 use crate::core::fs::entry::{EntryKind, FileEntry};
 use crate::core::mime::MimeDb;
-use crate::core::vfs::Caps;
+use crate::core::vfs::{Caps, Location};
 use crate::{msg, tr_static};
 
 use super::dirview::{DirectoryView, Message, menu};
@@ -219,7 +219,7 @@ fn context_menu<'a>(
         let scheme = state.location().scheme.clone();
         let mimetypes: Vec<String> = selected
             .iter()
-            .map(|entry| entry_mimetype(entry, mime_db))
+            .map(|entry| entry_mimetype(state.location(), entry, mime_db))
             .collect();
         for (index, action) in state.actions().iter().enumerate() {
             let applies = mimetypes
@@ -249,7 +249,7 @@ fn open_with_popover<'a>(
     let Some(first) = selected.first() else {
         return popover_container(t, empty_note(t, tr_static!("menu-nothing-selected")));
     };
-    let mimetype = entry_mimetype(first, mime_db);
+    let mimetype = entry_mimetype(state.location(), first, mime_db);
     let candidates = apps_db.candidates_for(&mimetype);
     let default_id = apps_db.default_for(&mimetype).map(|entry| entry.id.clone());
 
@@ -268,11 +268,11 @@ fn open_with_popover<'a>(
     popover_container(t, column(items).width(t.sizes.menu_width))
 }
 
-fn entry_mimetype(entry: &FileEntry, mime_db: &MimeDb) -> String {
+fn entry_mimetype(dir: &Location, entry: &FileEntry, mime_db: &MimeDb) -> String {
     if entry.kind == EntryKind::Directory {
         "inode/directory".to_owned()
     } else {
-        mime_db.guess(&entry.name, None)
+        mime_db.guess_entry(dir, &entry.name, entry.modified)
     }
 }
 

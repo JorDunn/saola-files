@@ -115,14 +115,18 @@ impl DirectoryView {
 /// presentations pick the same icon for the same entry. Directories skip
 /// the `MimeDb` call entirely (`inode/directory` is a fixed, free
 /// classification — no glob lookup needed); everything else resolves a
-/// mimetype from the name alone (no content sniff — see `core::mime`'s
-/// module docs for why that's the right tradeoff for a per-frame,
-/// per-row call).
-pub(in crate::ui) fn row_icon(entry: &FileEntry, mime_db: &MimeDb) -> saola_theme::icon::Icon {
+/// mimetype from the name, sharpened by a content-sniff verdict only when
+/// the background sniff has already cached one for `dir` (see
+/// `core::mime`'s module docs) — a per-frame lookup, never I/O.
+pub(in crate::ui) fn row_icon(
+    dir: &crate::core::vfs::Location,
+    entry: &FileEntry,
+    mime_db: &MimeDb,
+) -> saola_theme::icon::Icon {
     let category = if entry.kind == EntryKind::Directory {
         crate::core::mime::Category::Directory
     } else {
-        crate::core::mime::category(&mime_db.guess(&entry.name, None))
+        crate::core::mime::category(&mime_db.guess_entry(dir, &entry.name, entry.modified))
     };
     crate::icons::for_entry(entry.kind, entry.is_symlink, category)
 }
