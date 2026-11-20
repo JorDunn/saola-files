@@ -35,6 +35,7 @@ use crate::core::fs::format::{format_system_time, human_size};
 use crate::core::fs::size::{self, SizeEvent, SizeRequest};
 use crate::core::mime::MimeDb;
 use crate::core::vfs::{Caps, Location};
+use crate::{tr, tr_static};
 
 /// The label column's fixed width — layout-specific to this dialog's own
 /// two-column row shape, not a saola-theme design-system size (same
@@ -97,17 +98,13 @@ impl Properties {
     /// Progress::percent`'s shape.
     fn size_text(&self) -> String {
         if !self.size_done && self.size_files == 0 && self.size_bytes == 0 {
-            return "Calculating…".to_owned();
+            return tr!("properties-calculating");
         }
-        let noun = if self.size_files == 1 {
-            "item"
-        } else {
-            "items"
-        };
-        format!(
-            "{} — {} {noun}",
-            human_size(self.size_bytes),
-            self.size_files
+        // The singular/plural "item(s)" choice lives in the catalogue.
+        tr!(
+            "properties-size-and-count",
+            size = human_size(self.size_bytes),
+            count = self.size_files
         )
     }
 }
@@ -133,7 +130,7 @@ pub fn view<'a>(
 ) -> Element<'a, Message> {
     let title_text = match properties.items.as_slice() {
         [(_, entry)] => entry.display_name().into_owned(),
-        items => format!("{} items selected", items.len()),
+        items => tr!("properties-items-selected", count = items.len()),
     };
     let title = text(title_text)
         .size(t.typography.size.dialog_title)
@@ -142,18 +139,43 @@ pub fn view<'a>(
 
     let mut rows: Vec<Element<'a, Message>> = Vec::new();
     if let Some(parent) = properties.items.first().and_then(|(loc, _)| loc.parent()) {
-        rows.push(info_row(t, "Location", parent.to_string(), false));
+        rows.push(info_row(
+            t,
+            tr_static!("properties-location"),
+            parent.to_string(),
+            false,
+        ));
     }
     if let [(_, entry)] = properties.items.as_slice() {
-        rows.push(info_row(t, "Kind", kind_text(entry, mime_db), false));
+        rows.push(info_row(
+            t,
+            tr_static!("properties-kind"),
+            kind_text(entry, mime_db),
+            false,
+        ));
     }
-    rows.push(info_row(t, "Size", properties.size_text(), true));
+    rows.push(info_row(
+        t,
+        tr_static!("properties-size"),
+        properties.size_text(),
+        true,
+    ));
     if let [(_, entry)] = properties.items.as_slice() {
         if let Some(modified) = entry.modified {
-            rows.push(info_row(t, "Modified", format_system_time(modified), true));
+            rows.push(info_row(
+                t,
+                tr_static!("properties-modified"),
+                format_system_time(modified),
+                true,
+            ));
         }
         if let Some(mode) = entry.mode {
-            rows.push(info_row(t, "Permissions", format_mode(mode), true));
+            rows.push(info_row(
+                t,
+                tr_static!("properties-permissions"),
+                format_mode(mode),
+                true,
+            ));
         }
     }
 
@@ -197,7 +219,7 @@ fn info_row<'a>(t: &'a Theme, label: &'a str, value: String, mono: bool) -> Elem
 
 fn footer<'a>(t: &'a Theme) -> Element<'a, Message> {
     let close = button(
-        text("Close")
+        text(tr!("action-close"))
             .size(t.typography.size.body)
             .font(convert::ui_font(t)),
     )
@@ -224,10 +246,10 @@ fn footer<'a>(t: &'a Theme) -> Element<'a, Message> {
 /// its visibility for a single other caller).
 fn kind_text(entry: &FileEntry, mime_db: &MimeDb) -> String {
     if entry.is_symlink {
-        return "Symlink".to_owned();
+        return tr!("properties-kind-symlink");
     }
     match entry.kind {
-        EntryKind::Directory => "Folder".to_owned(),
+        EntryKind::Directory => tr!("properties-kind-folder"),
         _ => mime_db.guess(&entry.name, None),
     }
 }
@@ -255,7 +277,11 @@ fn format_mode(mode: u32) -> String {
     ]
     .into_iter()
     .collect();
-    format!("{symbolic} ({mode:03o})")
+    tr!(
+        "properties-mode",
+        symbolic = symbolic,
+        octal = format!("{mode:03o}")
+    )
 }
 
 #[cfg(test)]

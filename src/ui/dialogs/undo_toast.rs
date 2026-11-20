@@ -35,6 +35,8 @@ use iced::{Center, Element, Fill, Subscription};
 use saola_theme::icon::{self, Icon};
 use saola_theme::{ColorExt, Surface, Theme, convert, motion, style};
 
+use crate::tr;
+
 /// How often the strip re-renders while a toast is up — coarse enough to
 /// cost nothing (this is a fade, not `saola-capture::modules::toast`'s
 /// life-rule countdown, which needs its own finer 32 ms per that module's
@@ -140,7 +142,7 @@ pub fn view<'a>(t: &'a Theme, toast: &'a Toast, now: Instant) -> Element<'a, Mes
         .color(text_color);
 
     let undo = button(
-        text("Undo")
+        text(tr!("undo-button"))
             .size(t.typography.size.secondary)
             .font(convert::ui_font(t))
             .color(accent_text),

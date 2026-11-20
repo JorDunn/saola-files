@@ -17,6 +17,7 @@ use saola_theme::{ColorExt, Surface, Theme, convert, style, widget};
 
 use crate::core::vfs::Location;
 use crate::keymap::Action;
+use crate::tr_static;
 use crate::ui::dirview::{self, DirectoryView};
 
 /// Widget id for the path/URI editor. `ui::dirview`'s `Action::EditPath`
@@ -41,7 +42,7 @@ pub fn view<'a>(
 }
 
 fn editor<'a>(t: &'a Theme, s: Surface, buffer: &'a str) -> Element<'a, dirview::Message> {
-    text_input("scheme://host/path or /a/local/path", buffer)
+    text_input(tr_static!("breadcrumb-path-placeholder"), buffer)
         .id(PATH_INPUT_ID)
         .on_input(dirview::Message::PathInputChanged)
         .on_submit(dirview::Message::PathSubmitted)

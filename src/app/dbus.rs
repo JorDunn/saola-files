@@ -8,7 +8,7 @@ use iced::{Task, window};
 
 use core::fs::entry::FileEntry;
 use core::vfs::Location;
-use saola_files::{core, integration, modules, ui};
+use saola_files::{core, integration, modules, tr, ui};
 
 use super::properties::resolve_dbus_properties;
 use super::{App, Message, directory_task};
@@ -104,7 +104,7 @@ async fn list_for_reveal(
     let listing = match modules::resolve(&parent) {
         Some(backend) => backend.list(&parent).await,
         None => Err(core::vfs::VfsError::Unavailable {
-            message: format!("no backend for scheme \"{}\"", parent.scheme),
+            message: tr!("error-no-backend", scheme = parent.scheme.as_str()),
         }),
     };
     (parent, Some(name), listing)

@@ -27,6 +27,7 @@ use iced::Task;
 
 use crate::core::fs::entry::FileEntry;
 use crate::core::vfs::{Location, VfsError};
+use crate::tr;
 
 // A module importing itself by name: the methods below moved here from
 // `mod.rs`, where they spelled these items `rename::RenameState` etc.;
@@ -93,7 +94,7 @@ pub fn unique_name(existing: &[FileEntry], base: &str) -> OsString {
         return OsString::from(base);
     }
     for n in 2..1000u32 {
-        let candidate = format!("{base} ({n})");
+        let candidate = tr!("dirview-name-with-counter", base = base, n = n);
         if !name_taken(existing, &candidate) {
             return OsString::from(candidate);
         }
@@ -222,7 +223,7 @@ impl DirectoryView {
         };
         let trimmed = state.buffer.trim().to_owned();
         if trimmed.is_empty() || trimmed == "." || trimmed == ".." || trimmed.contains('/') {
-            state.error = Some("Enter a valid name".to_owned());
+            state.error = Some(tr!("dirview-rename-invalid"));
             self.rename = Some(state);
             return Task::none();
         }
@@ -243,7 +244,7 @@ impl DirectoryView {
             async move {
                 let Some(backend) = crate::modules::resolve(&from) else {
                     return Err(VfsError::Other {
-                        message: format!("no backend for scheme \"{}\"", from.scheme),
+                        message: tr!("error-no-backend", scheme = from.scheme.as_str()),
                     });
                 };
                 backend.rename(&from, &to).await
@@ -273,10 +274,10 @@ impl DirectoryView {
     /// reloads the listing and starts renaming the new entry on success.
     pub(super) fn create_new(&mut self, kind: NewKind) -> Task<Message> {
         let base = match kind {
-            NewKind::Folder => "New Folder",
-            NewKind::File => "New File",
+            NewKind::Folder => tr!("dirview-new-folder-name"),
+            NewKind::File => tr!("dirview-new-file-name"),
         };
-        let name = rename::unique_name(&self.entries, base);
+        let name = rename::unique_name(&self.entries, &base);
         let location = self.location.join(&name);
         let dir_location = self.location.clone();
         let name_for_message = name.clone();
@@ -285,7 +286,7 @@ impl DirectoryView {
             async move {
                 let Some(backend) = crate::modules::resolve(&location) else {
                     return Err(VfsError::Other {
-                        message: format!("no backend for scheme \"{}\"", location.scheme),
+                        message: tr!("error-no-backend", scheme = location.scheme.as_str()),
                     });
                 };
                 match kind {
@@ -299,7 +300,7 @@ impl DirectoryView {
                         // a genuine empty-file creation, not a partial one.
                         let mut sink = backend.write(&location).await?;
                         sink.close().await.map_err(|_| VfsError::Other {
-                            message: format!("creating {location} failed"),
+                            message: tr!("error-create-failed", location = location.to_string()),
                         })
                     }
                 }

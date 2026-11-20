@@ -29,6 +29,7 @@ use saola_theme::{Chrome, ColorExt, Surface, Theme, convert, style, widget};
 
 use crate::config::SavedServer;
 use crate::core::remote::{AuthStage, ConnectEvent, ConnectRequest, HostKeyPrompt};
+use crate::{tr, tr_static};
 
 /// The saved-servers list's fixed height — layout-specific to this
 /// dialog's own body, not a saola-theme design-system size (same
@@ -129,17 +130,22 @@ pub fn subscription(request: &ConnectRequest) -> Subscription<ConnectEvent> {
 }
 
 pub fn view<'a>(t: &'a Theme, connect: &'a Connect) -> Element<'a, Message> {
-    let title = text("Connect to Server")
+    let title = text(tr!("connect-title"))
         .size(t.typography.size.dialog_title)
         .font(convert::display_font(t))
         .color(t.on_paper.primary.into_iced());
 
     let body: Element<'a, Message> = match &connect.phase {
         Phase::Entering => entering_body(t, connect),
-        Phase::Connecting => status_body(t, Icon::Globe, "Connecting\u{2026}", None),
+        Phase::Connecting => status_body(t, Icon::Globe, tr_static!("connect-connecting"), None),
         Phase::HostKey(prompt) => host_key_body(t, prompt),
         Phase::Auth(stage, input) => auth_body(t, stage, input),
-        Phase::Failed(message) => status_body(t, Icon::X, message, Some(cancel_row(t, "Close"))),
+        Phase::Failed(message) => status_body(
+            t,
+            Icon::X,
+            message,
+            Some(cancel_row(t, tr_static!("action-close"))),
+        ),
     };
 
     let content = column![title, body]
@@ -156,7 +162,7 @@ pub fn view<'a>(t: &'a Theme, connect: &'a Connect) -> Element<'a, Message> {
 }
 
 fn entering_body<'a>(t: &'a Theme, connect: &'a Connect) -> Element<'a, Message> {
-    let field = text_input("sftp://user@host/path", &connect.uri)
+    let field = text_input(tr_static!("connect-uri-placeholder"), &connect.uri)
         .on_input(Message::UriChanged)
         .on_submit(Message::ConnectRequested)
         .style(style::text_input::rest(t, Surface::Paper))
@@ -167,14 +173,18 @@ fn entering_body<'a>(t: &'a Theme, connect: &'a Connect) -> Element<'a, Message>
     let mut rows: Vec<Element<'a, Message>> = Vec::new();
     if connect.servers.is_empty() {
         rows.push(
-            text("No saved servers yet — add a [[server]] entry to files.toml.")
+            text(tr!("connect-no-saved-servers"))
                 .size(t.typography.size.secondary)
                 .font(convert::ui_font_regular(t))
                 .color(t.on_paper.secondary.into_iced())
                 .into(),
         );
     } else {
-        rows.push(widget::section_label(t, Surface::Paper, "SAVED SERVERS"));
+        rows.push(widget::section_label(
+            t,
+            Surface::Paper,
+            tr_static!("connect-saved-servers"),
+        ));
         rows.extend(connect.servers.iter().map(|server| server_row(t, server)));
     }
 
@@ -190,7 +200,7 @@ fn entering_body<'a>(t: &'a Theme, connect: &'a Connect) -> Element<'a, Message>
     let connect_button = button(
         row![
             icon::icon(Icon::Globe, t.sizes.icon_row, t.palette.paper.into_iced()),
-            text("Connect")
+            text(tr!("connect-connect"))
                 .size(t.typography.size.body)
                 .font(convert::ui_font(t)),
         ]
@@ -278,9 +288,10 @@ fn status_body<'a>(
 fn host_key_body<'a>(t: &'a Theme, prompt: &'a HostKeyPrompt) -> Element<'a, Message> {
     let title = row![
         icon::icon(Icon::Lock, t.sizes.icon_row, t.on_paper.primary.into_iced()),
-        text(format!(
-            "{}:{} presented a new host key",
-            prompt.host, prompt.port
+        text(tr!(
+            "connect-host-key-title",
+            host = prompt.host.as_str(),
+            port = prompt.port
         ))
         .size(t.typography.size.body)
         .font(convert::ui_font(t)),
@@ -288,16 +299,17 @@ fn host_key_body<'a>(t: &'a Theme, prompt: &'a HostKeyPrompt) -> Element<'a, Mes
     .spacing(t.sizes.pill_gap)
     .align_y(Center);
 
-    let detail = text(format!(
-        "{} {}\nThis server has never been connected to before. Only trust it if you recognize this fingerprint.",
-        prompt.key_type, prompt.fingerprint
+    let detail = text(tr!(
+        "connect-host-key-detail",
+        key_type = prompt.key_type.as_str(),
+        fingerprint = prompt.fingerprint.as_str()
     ))
     .size(t.typography.size.secondary)
     .font(convert::mono_font(t))
     .color(t.on_paper.secondary.into_iced());
 
     let trust = button(
-        text("Trust & Connect")
+        text(tr!("connect-trust"))
             .size(t.typography.size.body)
             .font(convert::ui_font(t)),
     )
@@ -314,7 +326,11 @@ fn host_key_body<'a>(t: &'a Theme, prompt: &'a HostKeyPrompt) -> Element<'a, Mes
         t,
         Surface::Paper,
         row![
-            cancel_labeled_button(t, "Don't Trust", Message::HostKeyDecided(false)),
+            cancel_labeled_button(
+                t,
+                tr_static!("connect-dont-trust"),
+                Message::HostKeyDecided(false)
+            ),
             Space::new().width(Fill),
             trust
         ]
@@ -330,10 +346,16 @@ fn host_key_body<'a>(t: &'a Theme, prompt: &'a HostKeyPrompt) -> Element<'a, Mes
 fn auth_body<'a>(t: &'a Theme, stage: &'a AuthStage, input: &'a str) -> Element<'a, Message> {
     let (label, placeholder) = match stage {
         AuthStage::KeyPassphrase { key_path } => (
-            format!("Passphrase for {}", key_path.display()),
-            "Passphrase",
+            tr!(
+                "connect-passphrase-for",
+                path = key_path.display().to_string()
+            ),
+            tr_static!("connect-passphrase-placeholder"),
         ),
-        AuthStage::Password { user } => (format!("Password for {user}"), "Password"),
+        AuthStage::Password { user } => (
+            tr!("connect-password-for", user = user.as_str()),
+            tr_static!("connect-password-placeholder"),
+        ),
     };
 
     let title = row![
@@ -355,7 +377,7 @@ fn auth_body<'a>(t: &'a Theme, stage: &'a AuthStage, input: &'a str) -> Element<
         .width(Fill);
 
     let submit = button(
-        text("Submit")
+        text(tr!("connect-submit"))
             .size(t.typography.size.body)
             .font(convert::ui_font(t)),
     )
@@ -374,7 +396,7 @@ fn auth_body<'a>(t: &'a Theme, stage: &'a AuthStage, input: &'a str) -> Element<
     // and is exactly what "Cancel" already means.
     let secondary: Element<'a, Message> = match stage {
         AuthStage::KeyPassphrase { .. } => {
-            cancel_labeled_button(t, "Skip This Key", Message::AuthSkipped)
+            cancel_labeled_button(t, tr_static!("connect-skip-key"), Message::AuthSkipped)
         }
         AuthStage::Password { .. } => cancel_button(t),
     };
@@ -393,7 +415,7 @@ fn auth_body<'a>(t: &'a Theme, stage: &'a AuthStage, input: &'a str) -> Element<
 }
 
 fn cancel_button<'a>(t: &'a Theme) -> Element<'a, Message> {
-    cancel_labeled_button(t, "Cancel", Message::CancelRequested)
+    cancel_labeled_button(t, tr_static!("action-cancel"), Message::CancelRequested)
 }
 
 fn cancel_row<'a>(t: &'a Theme, label: &'a str) -> Element<'a, Message> {

@@ -33,6 +33,7 @@ use saola_theme::{ColorExt, Surface, Theme, convert, style, widget};
 use crate::core::places::Place;
 use crate::core::udisks::{Mount, MountsSource, UdisksMounts};
 use crate::core::vfs::Location;
+use crate::tr_static;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -110,7 +111,7 @@ impl Sidebar {
             .collect();
 
         if !self.mounts.is_empty() {
-            rows.push(widget::section_label(t, s, "REMOVABLE"));
+            rows.push(widget::section_label(t, s, tr_static!("sidebar-removable")));
             rows.extend(self.mounts.iter().map(|mount| {
                 let location = Location::local(mount.mount_point.clone());
                 mount_row(t, s, mount, location == *current)
@@ -209,7 +210,7 @@ fn connect_row<'a>(t: &'a Theme, s: Surface) -> Element<'a, Message> {
         t,
         s,
         Icon::Globe,
-        "Connect to Server…",
+        tr_static!("sidebar-connect"),
         false,
         Message::ConnectClicked,
     )

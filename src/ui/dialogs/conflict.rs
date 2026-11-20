@@ -15,6 +15,7 @@ use saola_theme::icon::{self, Icon};
 use saola_theme::{Chrome, ColorExt, Surface, Theme, convert, style};
 
 use crate::core::fs::ops::{Conflict, ConflictChoice};
+use crate::{tr, tr_static};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Message {
@@ -38,33 +39,44 @@ pub fn view<'a>(t: &'a Theme, conflict: &'a Conflict, apply_to_all: bool) -> Ele
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| conflict.dest.to_string());
 
-    let title = text(format!("\"{dest_name}\" already exists"))
+    let title = text(tr!("conflict-title", name = dest_name.as_str()))
         .size(t.typography.size.dialog_title)
         .font(convert::display_font(t))
         .color(t.on_paper.primary.into_iced());
 
-    let body = text(format!(
-        "{} is already there. What should happen to {}?",
-        conflict.dest, conflict.source
+    let body = text(tr!(
+        "conflict-body",
+        dest = conflict.dest.to_string(),
+        source = conflict.source.to_string()
     ))
     .size(t.typography.size.secondary)
     .font(convert::ui_font_regular(t))
     .color(t.on_paper.secondary.into_iced());
 
     let buttons = column![
-        choice_button(t, "Keep both", Icon::Copy, ConflictChoice::RenameCopy),
         choice_button(
             t,
-            "Overwrite",
+            tr_static!("conflict-keep-both"),
+            Icon::Copy,
+            ConflictChoice::RenameCopy
+        ),
+        choice_button(
+            t,
+            tr_static!("conflict-overwrite"),
             Icon::ClipboardPaste,
             ConflictChoice::Overwrite
         ),
-        choice_button(t, "Skip", Icon::X, ConflictChoice::Skip),
+        choice_button(
+            t,
+            tr_static!("conflict-skip"),
+            Icon::X,
+            ConflictChoice::Skip
+        ),
     ]
     .spacing(t.sizes.pill_gap / 2.0);
 
     let apply_all = checkbox(apply_to_all)
-        .label("Apply to all conflicts in this operation")
+        .label(tr_static!("conflict-apply-to-all"))
         .on_toggle(Message::ApplyToAllToggled)
         .style(style::toggles::checkbox(t, Surface::Paper))
         .text_size(t.typography.size.secondary)
