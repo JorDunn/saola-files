@@ -138,6 +138,10 @@ pub enum Action {
 /// there is no value it could ever be called with. The first feature that
 /// adds a variant here turns that match into an ordinary one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+//
+// When a variant is added: give it a `BINDINGS` row and extend the exhaustive
+// `match` in `coverage` (keymap tests), or `Keymap::resolve` can never
+// produce it.
 pub enum AppAction {
     // --- features (alphabetical) ---
 }
@@ -1263,6 +1267,127 @@ mod tests {
             warnings.iter().filter(|w| w.contains("ignoring")).count(),
             2
         );
+    }
+
+    /// How a variant is covered by [`BINDINGS`].
+    enum Coverage {
+        /// Has a row with this name.
+        Row(&'static str),
+        // `Exempt(&'static str)` (the reason) goes here the day an action
+        // is deliberately unbound by default: add the variant and its arm.
+    }
+
+    /// Exhaustive on purpose (no wildcard arm): adding an `Action` variant
+    /// breaks the build here until it is given a row name, so a new action
+    /// cannot be silently unreachable from the keyboard. `Keymap::resolve`
+    /// is table-only.
+    fn coverage(action: Action) -> Coverage {
+        match action {
+            Action::MoveCursorUp => Coverage::Row("move_cursor_up"),
+            Action::MoveCursorDown => Coverage::Row("move_cursor_down"),
+            Action::MoveCursorLeft => Coverage::Row("move_cursor_left"),
+            Action::MoveCursorRight => Coverage::Row("move_cursor_right"),
+            Action::MoveCursorHome => Coverage::Row("move_cursor_home"),
+            Action::MoveCursorEnd => Coverage::Row("move_cursor_end"),
+            Action::MoveCursorPageUp => Coverage::Row("move_cursor_page_up"),
+            Action::MoveCursorPageDown => Coverage::Row("move_cursor_page_down"),
+            Action::ExtendSelectionUp => Coverage::Row("extend_selection_up"),
+            Action::ExtendSelectionDown => Coverage::Row("extend_selection_down"),
+            Action::ExtendSelectionLeft => Coverage::Row("extend_selection_left"),
+            Action::ExtendSelectionRight => Coverage::Row("extend_selection_right"),
+            Action::ExtendSelectionHome => Coverage::Row("extend_selection_home"),
+            Action::ExtendSelectionEnd => Coverage::Row("extend_selection_end"),
+            Action::ExtendSelectionPageUp => Coverage::Row("extend_selection_page_up"),
+            Action::ExtendSelectionPageDown => Coverage::Row("extend_selection_page_down"),
+            Action::ToggleCursorSelected => Coverage::Row("toggle_cursor_selected"),
+            Action::SelectAll => Coverage::Row("select_all"),
+            Action::Descend => Coverage::Row("descend"),
+            Action::Ascend => Coverage::Row("ascend"),
+            Action::ToggleHidden => Coverage::Row("toggle_hidden"),
+            Action::HistoryBack => Coverage::Row("history_back"),
+            Action::HistoryForward => Coverage::Row("history_forward"),
+            Action::EditPath => Coverage::Row("edit_path"),
+            Action::SetViewList => Coverage::Row("set_view_list"),
+            Action::SetViewGrid => Coverage::Row("set_view_grid"),
+            Action::Refresh => Coverage::Row("refresh"),
+            Action::Copy => Coverage::Row("copy"),
+            Action::Cut => Coverage::Row("cut"),
+            Action::Paste => Coverage::Row("paste"),
+            Action::Rename => Coverage::Row("rename"),
+            Action::NewFolder => Coverage::Row("new_folder"),
+            Action::Delete => Coverage::Row("delete"),
+            Action::PermanentDelete => Coverage::Row("permanent_delete"),
+            Action::Undo => Coverage::Row("undo"),
+            Action::Properties => Coverage::Row("properties"),
+            Action::OpenContextMenu => Coverage::Row("open_context_menu"),
+            // `AppAction` has no variants yet, so this match is empty. When
+            // one is added, extend it with one arm per variant.
+            Action::App(app) => match app {},
+        }
+    }
+
+    /// One of each variant. The exhaustive `match` above sends an author
+    /// to this spot; add the new variant here too.
+    const ALL_ACTIONS: &[Action] = &[
+        Action::MoveCursorUp,
+        Action::MoveCursorDown,
+        Action::MoveCursorLeft,
+        Action::MoveCursorRight,
+        Action::MoveCursorHome,
+        Action::MoveCursorEnd,
+        Action::MoveCursorPageUp,
+        Action::MoveCursorPageDown,
+        Action::ExtendSelectionUp,
+        Action::ExtendSelectionDown,
+        Action::ExtendSelectionLeft,
+        Action::ExtendSelectionRight,
+        Action::ExtendSelectionHome,
+        Action::ExtendSelectionEnd,
+        Action::ExtendSelectionPageUp,
+        Action::ExtendSelectionPageDown,
+        Action::ToggleCursorSelected,
+        Action::SelectAll,
+        Action::Descend,
+        Action::Ascend,
+        Action::ToggleHidden,
+        Action::HistoryBack,
+        Action::HistoryForward,
+        Action::EditPath,
+        Action::SetViewList,
+        Action::SetViewGrid,
+        Action::Refresh,
+        Action::Copy,
+        Action::Cut,
+        Action::Paste,
+        Action::Rename,
+        Action::NewFolder,
+        Action::Delete,
+        Action::PermanentDelete,
+        Action::Undo,
+        Action::Properties,
+        Action::OpenContextMenu,
+    ];
+
+    #[test]
+    fn every_action_variant_has_a_binding_row() {
+        for action in ALL_ACTIONS {
+            match coverage(*action) {
+                Coverage::Row(name) => assert!(
+                    BINDINGS
+                        .iter()
+                        .any(|b| b.name == name && b.action == *action),
+                    "{action:?} promises a row named {name} that does not exist"
+                ),
+            }
+        }
+        // The list is not missing a row's action either.
+        for binding in BINDINGS {
+            assert!(
+                ALL_ACTIONS.contains(&binding.action),
+                "{:?} missing from ALL_ACTIONS",
+                binding.action
+            );
+        }
     }
 
     #[test]

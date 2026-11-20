@@ -214,7 +214,13 @@ undo = []                          # unbound (`""` works too)
   type Latin letters, bind named keys or digits.
 * A character key must carry `ctrl` or `alt` (bare letters are type-ahead),
   and `escape` cannot be bound.
-* Matching is exact: `ctrl+a` does not fire when Shift is also held.
+* **Shifted symbols:** the app is told the key *without* Shift, so write
+  the unshifted key plus `shift`. On a US layout `ctrl+plus` can never fire
+  (the event is `=` with Ctrl+Shift): write `ctrl+shift+=`. Likewise `?` is
+  `ctrl+shift+/`.
+* Ctrl, Shift and Alt are matched exactly: `ctrl+a` does not fire when Shift
+  is also held. Super is ignored (the compositor owns Super chords), so
+  `alt+x` also fires with Super held.
 * A value **replaces** that action's defaults. Names are the first column
   above.
 * **Problems warn once, by name, on stderr, and never stop the app.** An
