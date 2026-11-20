@@ -60,6 +60,7 @@ mod listing;
 pub mod menu;
 mod navigation;
 mod pointer;
+mod prefs;
 mod rename;
 mod selection;
 #[cfg(test)]
@@ -376,6 +377,10 @@ pub struct DirectoryView {
     /// then type its name".
     pending_rename: bool,
     // --- features (alphabetical) ---
+    /// Whether the current location has listed successfully (session
+    /// state records a folder as "last location" only once this is true).
+    /// Cleared whenever a new listing starts (`load`).
+    listed: bool,
 }
 
 impl DirectoryView {
@@ -408,6 +413,7 @@ impl DirectoryView {
             rename: None,
             pending_rename: false,
             // --- features (alphabetical) ---
+            listed: false,
         }
     }
 

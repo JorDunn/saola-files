@@ -63,7 +63,9 @@ impl App {
         let Some(view) = ui::explorer::find_mut(&mut self.views, id) else {
             return Task::none();
         };
-        directory_task(id, view.navigate(location))
+        let task = view.navigate(location);
+        let session_task = self.session_view_updated(id);
+        Task::batch([directory_task(id, task), session_task])
     }
 
     /// The owner's response to an `Event` from the view with id `id` — the view only

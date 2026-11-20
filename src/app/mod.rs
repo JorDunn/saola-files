@@ -19,6 +19,7 @@ mod dbus;
 mod file_ops;
 mod navigation;
 mod properties;
+mod session;
 mod sniff;
 mod subscription;
 mod thumbs;
@@ -139,6 +140,8 @@ pub(crate) enum Message {
     /// the menu instead of doing nothing).
     Noop,
     // --- features (alphabetical) ---
+    /// Session-state events (`session.rs`): window resizes.
+    Session(session::Message),
     /// A batch of background content-sniff head reads finished
     /// (`app::sniff`).
     SniffReady(Vec<sniff::SniffOutcome>),
@@ -338,13 +341,20 @@ pub(crate) struct App {
     /// gets to do anything else with it.
     activation: cli::Cli,
     // --- features (alphabetical) ---
+    /// Remembered window size, last location and per-folder view
+    /// settings (`session.rs`).
+    session: session::Session,
     /// Files with a content-sniff head read in flight (`app::sniff`), so a
     /// second scroll batch does not queue a duplicate read.
     sniff_inflight: HashSet<Location>,
 }
 
 impl App {
-    pub(crate) fn new(config: config::Config, args: cli::Cli) -> (Self, Task<Message>) {
+    pub(crate) fn new(
+        config: config::Config,
+        args: cli::Cli,
+        state: core::state::Store,
+    ) -> (Self, Task<Message>) {
         // `$HOME` unset (e.g. a minimal CI sandbox) falls back to `/`
         // rather than failing to start — the config loader takes the same
         // posture for its own directory chain.
@@ -380,12 +390,21 @@ impl App {
         // launched with, for `integration::dbus::subscription` to forward
         // if this turns out to be a second instance.
         let activation = args.clone();
-        let (view, task) = if let Some(select) = args.select {
+        let mut session = session::Session::new(state, fallback.clone());
+        let (mut view, task) = if let Some(select) = args.select {
             ui::dirview::DirectoryView::open_select(select, fallback, &config)
         } else if let Some(target) = args.target {
             ui::dirview::DirectoryView::open_target(target, fallback, &config)
         } else {
-            ui::dirview::DirectoryView::open(fallback, &config)
+            // No path given: reopen where the last session ended.
+            let start = match session.last_location() {
+                Some(last) => {
+                    session.begin_restore(last.clone());
+                    last
+                }
+                None => fallback,
+            };
+            ui::dirview::DirectoryView::open(start, &config)
         };
 
         // The one-arm translation of the config vocabulary ("paper"/"ink")
@@ -399,6 +418,8 @@ impl App {
 
         let mut view_ids = ViewIdSource::default();
         let view_id = view_ids.alloc();
+        // Apply this folder's saved view settings to the first view.
+        session.view_updated(view_id, &mut view);
 
         let app = App {
             theme: Theme::saola(),
@@ -435,6 +456,7 @@ impl App {
             pending_connect: None,
             activation,
             // --- features (alphabetical) ---
+            session,
             sniff_inflight: HashSet::new(),
         };
         // Stage 14: publish this `App`'s `RemoteManager` pool for
@@ -447,7 +469,13 @@ impl App {
 
     pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Window(event) => ui::window::update(event),
+            Message::Window(event) => {
+                // The header's close button: flush session state first.
+                if matches!(event, ui::window::Event::Close) {
+                    self.session_flush();
+                }
+                ui::window::update(event)
+            }
             Message::Explorer(ui::explorer::Message::Sidebar(inner)) => {
                 match self.sidebar.update(inner) {
                     Some(ui::sidebar::Event::OpenDirectory(location)) => {
@@ -522,6 +550,7 @@ impl App {
             Message::Dbus(event) => self.handle_dbus_event(event),
             Message::DbusPropertiesResolved(items) => self.open_properties(items),
             // --- features (alphabetical) ---
+            Message::Session(inner) => self.handle_session_message(inner),
             Message::SniffReady(outcomes) => self.handle_sniff_ready(outcomes),
         }
     }
@@ -535,7 +564,9 @@ impl App {
             return Task::none();
         };
         let (task, event) = view.update(message);
-        let mut tasks = vec![directory_task(id, task)];
+        // A view-mode or sort change (or back/forward) is a session event.
+        let session_task = self.session_view_updated(id);
+        let mut tasks = vec![directory_task(id, task), session_task];
         if let Some(event) = event {
             tasks.push(self.handle_directory_event(id, event));
         }
@@ -618,7 +649,12 @@ mod tests {
     use super::*;
 
     fn app() -> App {
-        App::new(config::Config::default(), cli::Cli::default()).0
+        App::new(
+            config::Config::default(),
+            cli::Cli::default(),
+            core::state::Store::default(),
+        )
+        .0
     }
 
     /// Opens the copy-conflict prompt the way a running op does.

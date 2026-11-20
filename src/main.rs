@@ -17,6 +17,7 @@ use iced::{Size, window};
 use saola_theme::{Theme, convert};
 
 use app::App;
+use saola_files::core::state;
 use saola_files::{cli, config};
 
 fn main() -> iced::Result {
@@ -41,6 +42,12 @@ fn main() -> iced::Result {
 
     let config_path = config::Config::resolve_path(args.config_dir.as_deref());
     let config = config::Config::load(config_path.as_deref());
+    // Session state (window size, last folder, per-folder view settings):
+    // loaded here because the window size is needed before iced starts.
+    let state = state::Store::load(state::resolve_path());
+    let window_size = state.state.window.map_or(Size::new(1100.0, 720.0), |w| {
+        Size::new(w.width as f32, w.height as f32)
+    });
 
     // `default_font` wants an owned `Font` up front, before any `App`
     // exists, so build a throwaway theme just for the font lookup. (The
@@ -49,7 +56,7 @@ fn main() -> iced::Result {
     let ui_font = convert::ui_font(&Theme::saola());
 
     iced::application(
-        move || App::new(config.clone(), args.clone()),
+        move || App::new(config.clone(), args.clone(), state.clone()),
         App::update,
         App::view,
     )
@@ -68,6 +75,9 @@ fn main() -> iced::Result {
         decorations: false,
         transparent: true,
         minimizable: false,
+        // The app closes the window itself after flushing session state
+        // (`app::session`'s module docs, "Closing").
+        exit_on_close_request: false,
         platform_specific: window::settings::PlatformSpecific {
             // iced's own doc on this field: pick an app id matching the
             // .desktop file's basename and its Icon= key — so the desktop
@@ -81,6 +91,6 @@ fn main() -> iced::Result {
         },
         ..window::Settings::default()
     })
-    .window_size(Size::new(1100.0, 720.0))
+    .window_size(window_size)
     .run()
 }

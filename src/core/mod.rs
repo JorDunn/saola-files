@@ -8,6 +8,7 @@ pub mod fs;
 pub mod mime;
 pub mod places;
 pub mod remote;
+pub mod state;
 pub mod thumbs;
 pub mod udisks;
 pub mod vfs;
