@@ -61,6 +61,9 @@ pub enum Message {
     /// (`Action::Properties`).
     PropertiesRequested,
     // --- features (alphabetical) ---
+    /// A click on the popover's own padding: swallowed, so it neither
+    /// reaches the scrim (which would close the menu) nor the list behind.
+    Swallow,
 }
 
 impl DirectoryView {
@@ -84,6 +87,7 @@ impl DirectoryView {
             Message::DeleteRequested => self.on_menu_delete_requested(),
             Message::PropertiesRequested => self.on_menu_properties_requested(),
             // --- features (alphabetical) ---
+            Message::Swallow => (Task::none(), None),
         }
     }
 
@@ -91,6 +95,8 @@ impl DirectoryView {
     pub(super) fn on_open_menu(&mut self) -> (Task<ViewMessage>, Option<Event>) {
         self.menu_open = true;
         self.open_with_open = false;
+        // The header button, not a click or key: legacy top-right anchor.
+        self.menu_anchor = None;
         (Task::none(), None)
     }
 

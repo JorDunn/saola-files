@@ -113,6 +113,8 @@ pub enum Action {
     /// adds its variant to [`AppAction`] instead.
     App(AppAction),
     // --- features (alphabetical) ---
+    /// Menu key or Shift+F10: open the context menu at the cursor row.
+    OpenContextMenu,
 }
 
 /// Keyboard commands that belong to the whole app rather than to one
@@ -217,6 +219,9 @@ pub fn resolve(key: &Key, modifiers: Modifiers) -> Option<Action> {
         (Named::F2, false) => Some(Action::Rename),
         (Named::Delete, false) => Some(Action::Delete),
         (Named::Delete, true) => Some(Action::PermanentDelete),
+        // The dedicated Menu key (winit's `ContextMenu`, iced_core
+        // `key::Named::ContextMenu`) and its keyboard-only equivalent.
+        (Named::ContextMenu, _) | (Named::F10, true) => Some(Action::OpenContextMenu),
         _ => None,
     }
 }
@@ -325,6 +330,23 @@ mod tests {
             resolve(&Key::Character("2".into()), Modifiers::CTRL),
             Some(Action::SetViewGrid)
         );
+    }
+
+    #[test]
+    fn menu_key_and_shift_f10_open_the_context_menu() {
+        assert_eq!(
+            resolve(&named(Named::ContextMenu), Modifiers::empty()),
+            Some(Action::OpenContextMenu)
+        );
+        assert_eq!(
+            resolve(&named(Named::F10), Modifiers::SHIFT),
+            Some(Action::OpenContextMenu)
+        );
+    }
+
+    #[test]
+    fn plain_f10_is_not_the_context_menu() {
+        assert_eq!(resolve(&named(Named::F10), Modifiers::empty()), None);
     }
 
     #[test]

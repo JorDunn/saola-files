@@ -52,6 +52,7 @@
 // its parent's private fields, so the struct's fields stay private here;
 // methods one file calls from another are `pub(super)` (visible inside
 // `dirview` only, never to `ui::explorer` or the app).
+pub mod context;
 mod cursor;
 mod grid;
 mod keys;
@@ -85,6 +86,7 @@ use crate::core::thumbs::ThumbCache;
 use crate::core::vfs::{Caps, DirEvent, Location, VfsError};
 use crate::keymap::{Action, AppAction};
 use crate::ui::menus;
+use crate::ui::right_click::RightClick;
 // `row_icon`/`thumbnail_for` moved to `thumbs.rs`; re-exported here so
 // `list.rs`/`grid.rs` keep importing them as `super::{row_icon, thumbnail_for}`.
 pub(super) use thumbs::{row_icon, thumbnail_for};
@@ -182,6 +184,9 @@ pub enum Message {
     /// second F2.
     CreateResult(Incident, Location, OsString, Result<(), VfsError>),
     // --- features (alphabetical) ---
+    /// Right-click placement and selection for the context menu — see
+    /// `context.rs`.
+    Context(context::Message),
 }
 
 /// What the owner (the app, via `ui::explorer`) decides to act on. The
@@ -386,6 +391,12 @@ pub struct DirectoryView {
     /// state records a folder as "last location" only once this is true).
     /// Cleared whenever a new listing starts (`load`).
     listed: bool,
+    /// What the open popover hangs from; `None` = the header's overflow
+    /// button. See `context.rs`.
+    menu_anchor: Option<context::MenuAnchor>,
+    /// Where the latest right button press landed, held between the
+    /// position message and the row/empty message that follows it.
+    last_press: Option<iced::Point>,
 }
 
 impl DirectoryView {
@@ -419,6 +430,8 @@ impl DirectoryView {
             pending_rename: false,
             // --- features (alphabetical) ---
             listed: false,
+            menu_anchor: None,
+            last_press: None,
         }
     }
 
@@ -585,7 +598,9 @@ impl DirectoryView {
             }
             Message::CreateResult(incident, dir, name, result) => {
                 self.on_create_result(incident, dir, name, result)
-            } // --- features (alphabetical) ---
+            }
+            // --- features (alphabetical) ---
+            Message::Context(inner) => self.on_context(inner),
         }
     }
 
@@ -606,6 +621,15 @@ impl DirectoryView {
             View::List => list::view(self, theme, s, mime_db, thumb_cache),
             View::Grid => grid::view(self, theme, s, mime_db, thumb_cache),
         };
+        // Report right-clicks with their position (see `context.rs`); the
+        // popover overlay is stacked over this same area, so both share one
+        // coordinate frame.
+        let content = RightClick::new(
+            content,
+            |point| Message::Context(context::Message::PointerPressed(point)),
+            Message::Context(context::Message::EmptyPressed),
+        )
+        .into();
         menus::overlay(
             theme,
             self,

@@ -323,6 +323,10 @@ impl DirectoryView {
             // them up unchanged for `App` to handle.
             Action::App(app_action) => (Task::none(), Some(Event::App(app_action))),
             // --- features (alphabetical) ---
+            Action::OpenContextMenu => {
+                self.open_context_menu_at_cursor();
+                (Task::none(), None)
+            }
         }
     }
 }
