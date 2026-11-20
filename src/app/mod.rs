@@ -16,6 +16,7 @@
 
 mod connect;
 mod dbus;
+mod failures;
 mod file_ops;
 mod navigation;
 mod properties;
@@ -140,6 +141,9 @@ pub(crate) enum Message {
     /// the menu instead of doing nothing).
     Noop,
     // --- features (alphabetical) ---
+    /// The error notice's buttons, and the way anything reports a failure
+    /// into it (`error_notice::Message::Report`; see `failures::failed`).
+    ErrorNotice(ui::dialogs::error_notice::Message),
     /// Session-state events (`session.rs`): window resizes.
     Session(session::Message),
     /// A batch of background content-sniff head reads finished
@@ -154,6 +158,22 @@ pub(crate) enum KeyboardTarget {
     FocusedView,
     /// A modal or the Trash view owns the screen: drop the event.
     Nobody,
+    /// The Trash view is showing (no modal) and an error notice is up: the
+    /// view takes no keys, but a bare Esc may still dismiss the notice, so
+    /// the keyboard is listened to and [`App::key_route`] lets only that
+    /// one key through.
+    NoticeOnly,
+}
+
+/// What [`App::key_route`] decided for one key event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyRoute {
+    /// Hand it to the focused `DirectoryView`.
+    View,
+    /// A bare Esc that dismisses the error notice.
+    DismissNotice,
+    /// Nobody wants it.
+    Drop,
 }
 
 pub(crate) struct App {
@@ -341,6 +361,11 @@ pub(crate) struct App {
     /// gets to do anything else with it.
     activation: cli::Cli,
     // --- features (alphabetical) ---
+    /// The failure notice in the footer band, if one is showing. Persists
+    /// until dismissed; see `ui::dialogs::error_notice` and `failures`.
+    error_notice: ui::dialogs::error_notice::Slot,
+    /// Incident bookkeeping for failure notices (see `failures`).
+    incidents: failures::Incidents,
     /// Remembered window size, last location and per-folder view
     /// settings (`session.rs`).
     session: session::Session,
@@ -456,6 +481,8 @@ impl App {
             pending_connect: None,
             activation,
             // --- features (alphabetical) ---
+            error_notice: ui::dialogs::error_notice::Slot::default(),
+            incidents: failures::Incidents::default(),
             session,
             sniff_inflight: HashSet::new(),
         };
@@ -490,13 +517,17 @@ impl App {
             Message::Explorer(ui::explorer::Message::Directory(id, inner)) => {
                 self.update_view(id, inner)
             }
-            Message::Keyboard(event) => match self.keyboard_target() {
+            Message::Keyboard(event) => match self.key_route(&event) {
                 // Checked here as well as in `subscription`: an event
                 // already queued when a modal opened must not slip through.
-                KeyboardTarget::FocusedView => {
+                KeyRoute::View => {
                     self.update_view(self.focused, ui::dirview::Message::Keyboard(event))
                 }
-                KeyboardTarget::Nobody => Task::none(),
+                KeyRoute::DismissNotice => {
+                    self.error_notice.dismiss();
+                    Task::none()
+                }
+                KeyRoute::Drop => Task::none(),
             },
             Message::OpEvent(event) => self.handle_op_event(event),
             Message::Progress(ui::dialogs::progress::Message::CancelRequested) => {
@@ -516,7 +547,10 @@ impl App {
                 Task::none()
             }
             Message::Noop => Task::none(),
-            Message::Trash(inner) => trash_task(self.trash_view.update(inner)),
+            Message::Trash(inner) => {
+                self.report_trash_failure(&inner);
+                trash_task(self.trash_view.update(inner))
+            }
             Message::UndoToast(ui::dialogs::undo_toast::Message::UndoClicked) => self.start_undo(),
             Message::UndoToast(ui::dialogs::undo_toast::Message::Tick) => {
                 if let Some(toast) = &self.undo_toast
@@ -550,6 +584,7 @@ impl App {
             Message::Dbus(event) => self.handle_dbus_event(event),
             Message::DbusPropertiesResolved(items) => self.open_properties(items),
             // --- features (alphabetical) ---
+            Message::ErrorNotice(inner) => self.handle_error_notice(inner),
             Message::Session(inner) => self.handle_session_message(inner),
             Message::SniffReady(outcomes) => self.handle_sniff_ready(outcomes),
         }
@@ -573,7 +608,6 @@ impl App {
         Task::batch(tasks)
     }
 
-    /// The focused directory view, if it is still open.
     /// The single routing decision for raw key events: who gets them?
     ///
     /// Every App-level modal must be listed here. A new dialog that is not
@@ -588,10 +622,46 @@ impl App {
         let modal_open = self.pending_conflict.is_some()
             || self.pending_properties.is_some()
             || self.pending_connect.is_some();
-        if self.trash_active || modal_open {
+        if modal_open {
             KeyboardTarget::Nobody
+        } else if self.trash_active {
+            if self.error_notice.is_showing() {
+                KeyboardTarget::NoticeOnly
+            } else {
+                KeyboardTarget::Nobody
+            }
         } else {
             KeyboardTarget::FocusedView
+        }
+    }
+
+    /// Where one key event goes: [`Self::keyboard_target`] first, then the
+    /// Esc rule for the error notice. This and `keyboard_target` are the
+    /// only places key routing is decided.
+    ///
+    /// - A modal (conflict, properties, connect) is open: nothing, Esc
+    ///   included. Nothing reaches behind a modal.
+    /// - The Trash view is up: only a bare Esc, and only to dismiss the
+    ///   notice (`KeyboardTarget::NoticeOnly`). Every other key is dropped.
+    /// - Otherwise the focused view gets the key, except a bare Esc while a
+    ///   notice is showing and the view has nothing of its own for Esc to
+    ///   close (menu, Open with, rename, path editor): that one dismisses
+    ///   the notice. So with a popover open, the first Esc closes the
+    ///   popover and the second dismisses the notice.
+    pub(crate) fn key_route(&self, event: &keyboard::Event) -> KeyRoute {
+        let escape = failures::is_bare_escape(event);
+        match self.keyboard_target() {
+            KeyboardTarget::Nobody => KeyRoute::Drop,
+            KeyboardTarget::NoticeOnly if escape => KeyRoute::DismissNotice,
+            KeyboardTarget::NoticeOnly => KeyRoute::Drop,
+            KeyboardTarget::FocusedView => {
+                let view_owns_escape = self.focused_view().is_some_and(|v| v.owns_escape());
+                if escape && self.error_notice.is_showing() && !view_owns_escape {
+                    KeyRoute::DismissNotice
+                } else {
+                    KeyRoute::View
+                }
+            }
         }
     }
 
@@ -668,6 +738,164 @@ mod tests {
             },
             reply,
         });
+    }
+
+    fn key(named: keyboard::key::Named, modifiers: keyboard::Modifiers) -> keyboard::Event {
+        keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(named),
+            modified_key: keyboard::Key::Named(named),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        }
+    }
+
+    fn esc() -> keyboard::Event {
+        key(keyboard::key::Named::Escape, keyboard::Modifiers::empty())
+    }
+
+    /// Puts a notice on screen the way a failed action would.
+    fn show_notice(app: &mut App) {
+        let failure = core::failure::Failure::new(
+            "a.txt",
+            core::vfs::VfsError::PermissionDenied {
+                location: "a.txt".to_owned(),
+            },
+        );
+        app.report_new(core::failure::Operation::Open, vec![failure]);
+        assert!(app.error_notice.is_showing());
+    }
+
+    #[test]
+    fn esc_dismisses_a_notice_when_the_view_has_nothing_to_close() {
+        let mut app = app();
+        show_notice(&mut app);
+        assert_eq!(app.key_route(&esc()), KeyRoute::DismissNotice);
+    }
+
+    #[test]
+    fn esc_goes_to_the_view_when_there_is_no_notice() {
+        assert_eq!(app().key_route(&esc()), KeyRoute::View);
+    }
+
+    #[test]
+    fn other_keys_and_modified_esc_still_reach_the_view_under_a_notice() {
+        let mut app = app();
+        show_notice(&mut app);
+        let delete = key(keyboard::key::Named::Delete, keyboard::Modifiers::empty());
+        assert_eq!(app.key_route(&delete), KeyRoute::View);
+        let shift_esc = key(keyboard::key::Named::Escape, keyboard::Modifiers::SHIFT);
+        assert_eq!(app.key_route(&shift_esc), KeyRoute::View);
+    }
+
+    #[test]
+    fn esc_dismisses_a_notice_shown_over_the_trash_view_and_nothing_else_does() {
+        let mut app = app();
+        app.trash_active = true;
+        show_notice(&mut app);
+        assert_eq!(app.keyboard_target(), KeyboardTarget::NoticeOnly);
+        assert_eq!(app.key_route(&esc()), KeyRoute::DismissNotice);
+        let delete = key(keyboard::key::Named::Delete, keyboard::Modifiers::empty());
+        assert_eq!(app.key_route(&delete), KeyRoute::Drop);
+        let ctrl_esc = key(keyboard::key::Named::Escape, keyboard::Modifiers::CTRL);
+        assert_eq!(app.key_route(&ctrl_esc), KeyRoute::Drop);
+    }
+
+    #[test]
+    fn a_modal_keeps_esc_from_reaching_anything() {
+        let mut app = app();
+        show_notice(&mut app);
+        open_conflict(&mut app);
+        assert_eq!(app.key_route(&esc()), KeyRoute::Drop);
+        // Also over the Trash view.
+        app.trash_active = true;
+        assert_eq!(app.key_route(&esc()), KeyRoute::Drop);
+    }
+
+    #[test]
+    fn esc_closes_the_views_own_popup_first_then_the_notice() {
+        let mut app = app();
+        show_notice(&mut app);
+        // Opens the path editor in the focused view (Ctrl+L's effect).
+        let focused = app.focused;
+        let ctrl_l = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character("l".into()),
+            modified_key: keyboard::Key::Character("l".into()),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::CTRL,
+            text: None,
+            repeat: false,
+        };
+        let _ = app.update_view(focused, ui::dirview::Message::Keyboard(ctrl_l));
+        assert!(app.focused_view().is_some_and(|v| v.owns_escape()));
+        assert_eq!(app.key_route(&esc()), KeyRoute::View);
+        // The view handles that Esc by closing the editor.
+        let _ = app.update_view(focused, ui::dirview::Message::Keyboard(esc()));
+        assert!(app.focused_view().is_some_and(|v| !v.owns_escape()));
+        assert_eq!(app.key_route(&esc()), KeyRoute::DismissNotice);
+    }
+
+    fn denied() -> core::vfs::VfsError {
+        core::vfs::VfsError::PermissionDenied {
+            location: "x".to_owned(),
+        }
+    }
+
+    #[test]
+    fn two_failed_trash_requests_are_two_incidents_not_one_count() {
+        use ui::trashview::Message as Trash;
+        let mut app = app();
+        let first = core::failure::Incident::mint();
+        let second = core::failure::Incident::mint();
+        // The second request's failure lands first, then the first's late
+        // one: the straggler is dropped, not merged ("2 items ...").
+        app.report_trash_failure(&Trash::RestoreResult(second, "b".into(), Err(denied())));
+        app.report_trash_failure(&Trash::RestoreResult(first, "a".into(), Err(denied())));
+        let notice = app.error_notice.notice().expect("a notice");
+        assert_eq!(notice.incident(), second);
+        assert_eq!(notice.total(), 1);
+    }
+
+    #[test]
+    fn a_failed_empty_reports_under_its_own_incident() {
+        use ui::trashview::Message as Trash;
+        let mut app = app();
+        let restore = core::failure::Incident::mint();
+        let empty = core::failure::Incident::mint();
+        app.report_trash_failure(&Trash::RestoreResult(restore, "a".into(), Err(denied())));
+        app.report_trash_failure(&Trash::EmptyResult(empty, Err(denied())));
+        let notice = app.error_notice.notice().expect("a notice");
+        assert_eq!(notice.incident(), empty);
+        assert_eq!(notice.operation(), core::failure::Operation::EmptyTrash);
+    }
+
+    #[test]
+    fn each_op_keeps_its_own_incident() {
+        let mut incidents = failures::Incidents::default();
+        let mut ids = ops::OpIdSource::default();
+        let (a, b) = (ids.alloc(), ids.alloc());
+        incidents.begin_op(a);
+        incidents.begin_op(b);
+        let first = incidents.end_op(Some(a));
+        let second = incidents.end_op(Some(b));
+        assert!(first < second);
+        // Ending an unknown op still yields a usable (newer) incident.
+        assert!(incidents.end_op(Some(a)) > second);
+    }
+
+    #[test]
+    fn a_notice_survives_navigation_and_other_incidents_replace_it() {
+        let mut app = app();
+        show_notice(&mut app);
+        let _ = app.navigate_active(Location::local(PathBuf::from("/nonexistent")));
+        assert!(app.error_notice.is_showing());
     }
 
     #[test]

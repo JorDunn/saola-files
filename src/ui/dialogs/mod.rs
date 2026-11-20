@@ -15,6 +15,7 @@
 
 pub mod conflict;
 pub mod connect;
+pub mod error_notice;
 pub mod progress;
 pub mod properties;
 pub mod undo_toast;

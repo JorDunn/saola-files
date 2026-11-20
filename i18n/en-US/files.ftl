@@ -136,3 +136,98 @@ trash-empty-state = Trash is empty
 trash-empty-button = Empty Trash
 trash-confirm-empty = Permanently delete everything in the trash?
 trash-restore = Restore
+
+## Failures
+##
+## Sentences for operations that didn't work (src/core/failure.rs). Severity
+## is carried by the wording alone: no colour. `{ $reason }` is one of the
+## `failure-reason-*` phrases below.
+
+failure-copy-to = Couldn't copy “{ $name }” to “{ $destination }”: { $reason }.
+failure-copy = Couldn't copy “{ $name }”: { $reason }.
+failure-move-to = Couldn't move “{ $name }” to “{ $destination }”: { $reason }.
+failure-move = Couldn't move “{ $name }”: { $reason }.
+failure-rename-to = Couldn't rename “{ $name }” to “{ $destination }”: { $reason }.
+failure-rename = Couldn't rename “{ $name }”: { $reason }.
+failure-trash = Couldn't move “{ $name }” to the trash: { $reason }.
+failure-delete = Couldn't delete “{ $name }”: { $reason }.
+failure-create-in = Couldn't create “{ $name }” in “{ $destination }”: { $reason }.
+failure-create = Couldn't create “{ $name }”: { $reason }.
+failure-open = Couldn't open “{ $name }”: { $reason }.
+failure-open-with = Couldn't open “{ $name }” with { $destination }: { $reason }.
+failure-open-terminal = Couldn't open a terminal in “{ $name }”: { $reason }.
+failure-run-action = Couldn't run “{ $name }”: { $reason }.
+failure-undo = Couldn't undo that: { $reason }.
+failure-restore = Couldn't restore “{ $name }” from the trash: { $reason }.
+failure-restore-unnamed = Couldn't restore an item from the trash: { $reason }.
+failure-empty-trash = Couldn't empty the trash: { $reason }.
+failure-clipboard = Couldn't share the copied items with other apps: { $reason }.
+
+failure-reason-permission-denied = permission denied
+failure-reason-not-found = it no longer exists
+failure-reason-already-exists = something with that name already exists
+failure-reason-no-space = there isn't enough space
+failure-reason-cross-device = the folders are on different drives
+failure-reason-read-only = the location is read-only
+failure-reason-disconnected = the connection was lost
+failure-reason-not-a-folder = it isn't a folder
+failure-reason-is-a-folder = it is a folder
+failure-reason-no-default-app = no app is set up to open this kind of file
+failure-reason-app-uninstalled = that app is no longer installed
+failure-reason-program-missing = the app couldn't be found
+failure-reason-other = { $message }
+failure-reason-unknown = something went wrong
+failure-reason-unsupported = this location doesn't support { $operation }
+
+failure-summary-copy =
+    { $count ->
+        [one] { $count } item couldn't be copied
+       *[other] { $count } items couldn't be copied
+    }
+failure-summary-move =
+    { $count ->
+        [one] { $count } item couldn't be moved
+       *[other] { $count } items couldn't be moved
+    }
+failure-summary-rename =
+    { $count ->
+        [one] { $count } item couldn't be renamed
+       *[other] { $count } items couldn't be renamed
+    }
+failure-summary-trash =
+    { $count ->
+        [one] { $count } item couldn't be moved to the trash
+       *[other] { $count } items couldn't be moved to the trash
+    }
+failure-summary-delete =
+    { $count ->
+        [one] { $count } item couldn't be deleted
+       *[other] { $count } items couldn't be deleted
+    }
+failure-summary-create =
+    { $count ->
+        [one] { $count } item couldn't be created
+       *[other] { $count } items couldn't be created
+    }
+failure-summary-open =
+    { $count ->
+        [one] { $count } item couldn't be opened
+       *[other] { $count } items couldn't be opened
+    }
+failure-summary-restore =
+    { $count ->
+        [one] { $count } item couldn't be restored
+       *[other] { $count } items couldn't be restored
+    }
+failure-summary-other =
+    { $count ->
+        [one] { $count } thing went wrong
+       *[other] { $count } things went wrong
+    }
+
+## Error notice
+
+error-notice-dismiss = Dismiss
+error-notice-details = Details
+error-notice-hide-details = Hide details
+error-notice-more = …and { $count } more

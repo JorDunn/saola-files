@@ -62,6 +62,11 @@ impl App {
             }
         };
 
+        // The error notice sits directly under the body, so everything the
+        // footer adds below (progress strip, undo toast) stays below it and
+        // is never covered: see `ui::dialogs::error_notice`'s ordering rule.
+        let body = self.with_error_notice(body);
+
         // Stage 8: the ops strip, stacked below the explorer body (a
         // persistent bar, not a popover) whenever a copy/move is running.
         // Stage 10: the undo toast takes the exact same footer position

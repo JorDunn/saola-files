@@ -30,6 +30,7 @@
 //!   touches `std::fs` itself, keeping the "trash is local-only,
 //!   core/fs/trash.rs is the one exception" boundary in one place.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use iced::widget::{Space, button, column, container, row, scrollable, text};
@@ -37,6 +38,7 @@ use iced::{Center, Element, Fill, Length, Task};
 use saola_theme::icon::{self, Icon};
 use saola_theme::{Chrome, ColorExt, Surface, Theme, convert, style};
 
+use crate::core::failure::Incident;
 use crate::core::fs::entry::EntryKind;
 use crate::core::fs::trash::{self, TrashedItem};
 use crate::core::vfs::VfsError;
@@ -123,7 +125,11 @@ pub enum Message {
     /// Either outcome reloads the list (see `update`'s doc comment on that
     /// arm) — there's no per-item error slot this stage, a failed restore
     /// is worded to stderr and the row simply stays put.
-    RestoreResult(usize, Result<PathBuf, VfsError>),
+    ///
+    /// Carries the [`Incident`] minted when the request was made and the
+    /// item's name captured then (the list may have reloaded since), so a
+    /// late failure reports under its own request.
+    RestoreResult(Incident, OsString, Result<PathBuf, VfsError>),
     /// The toolbar's "Empty Trash" button.
     EmptyRequested,
     /// The inline confirm strip's "Empty Trash" button (only reachable
@@ -131,7 +137,8 @@ pub enum Message {
     EmptyConfirmClicked,
     /// The inline confirm strip's "Cancel" button.
     EmptyCancelClicked,
-    EmptyResult(Result<(), VfsError>),
+    /// The empty's outcome, with the incident minted when it was requested.
+    EmptyResult(Incident, Result<(), VfsError>),
 }
 
 pub struct TrashView {
@@ -158,6 +165,19 @@ impl TrashView {
             confirm_empty_trash,
             confirming_empty: false,
         }
+    }
+
+    /// The name `index`'s item had before it was trashed, for wording a
+    /// failed restore ("Couldn't restore “a.txt” ..."). `None` when `index`
+    /// is out of range (or the entry has no name at all).
+    fn original_name(&self, index: usize) -> Option<OsString> {
+        let item = self.items.get(index)?;
+        // Falls back to the entry's own name inside the trash when the
+        // recorded original path has none; `None` only if neither does.
+        item.original_path
+            .file_name()
+            .or_else(|| item.id.files_path().file_name())
+            .map(|n| n.to_owned())
     }
 
     /// Fetches the trash's current contents — the owner calls this once
@@ -190,12 +210,15 @@ impl TrashView {
                 let Some(item) = self.items.get(index).cloned() else {
                     return Task::none();
                 };
+                // Minted now, per request: two restores are two incidents.
+                let incident = Incident::mint();
+                let name = self.original_name(index).unwrap_or_default();
                 Task::perform(
                     run_blocking(move || trash::restore(&item.id)),
-                    move |result| Message::RestoreResult(index, result),
+                    move |result| Message::RestoreResult(incident, name.clone(), result),
                 )
             }
-            Message::RestoreResult(_index, result) => {
+            Message::RestoreResult(_incident, _name, result) => {
                 if let Err(err) = &result {
                     eprintln!("saola-files: couldn't restore from trash: {err}");
                 }
@@ -221,7 +244,7 @@ impl TrashView {
                 self.confirming_empty = false;
                 Task::none()
             }
-            Message::EmptyResult(result) => {
+            Message::EmptyResult(_incident, result) => {
                 if let Err(err) = &result {
                     eprintln!("saola-files: couldn't empty the trash: {err}");
                 }
@@ -231,7 +254,10 @@ impl TrashView {
     }
 
     fn start_empty(&mut self) -> Task<Message> {
-        Task::perform(run_blocking(trash::empty), Message::EmptyResult)
+        let incident = Incident::mint();
+        Task::perform(run_blocking(trash::empty), move |result| {
+            Message::EmptyResult(incident, result)
+        })
     }
 
     /// `s` is the window's ground (`files.toml`'s `surface` knob). The trash

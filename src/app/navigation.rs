@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use iced::Task;
 
+use core::failure::{Cause, Failure, Operation};
 use core::fs::{ops, undo};
 use core::vfs::Location;
 use saola_files::{core, ui};
@@ -91,12 +92,24 @@ impl App {
             ui::dirview::Event::OpenWith(locations, desktop_id) => {
                 let Some(entry) = self.apps_db.entry(&desktop_id).cloned() else {
                     eprintln!("saola-files: {desktop_id} is no longer installed");
+                    // The app's name is gone with its launcher entry, so the
+                    // desktop id stands in for it.
+                    let failures = locations
+                        .iter()
+                        .map(|l| Failure::at(l, Cause::AppUninstalled).to(desktop_id.as_str()))
+                        .collect();
+                    self.report_new(Operation::OpenWith, failures);
                     return Task::none();
                 };
                 let terminal = core::apps::resolve_terminal_from_env(self.terminal.as_deref());
                 let paths: Vec<PathBuf> = locations.iter().map(|l| l.path.clone()).collect();
                 if let Err(err) = core::apps::open(&entry, &paths, &terminal) {
                     eprintln!("saola-files: could not open with {}: {err}", entry.name);
+                    let failures = locations
+                        .iter()
+                        .map(|l| Failure::at(l, Cause::launch(&err)).to(entry.name.as_str()))
+                        .collect();
+                    self.report_new(Operation::OpenWith, failures);
                 }
                 Task::none()
             }
@@ -105,28 +118,42 @@ impl App {
                 if let Err(err) = core::apps::open_terminal_here(&terminal, is_dir, &location.path)
                 {
                     eprintln!("saola-files: could not open a terminal at {location}: {err}");
+                    // The terminal opens *in* a folder: name the folder, not
+                    // a file inside it.
+                    let folder = if is_dir {
+                        location.clone()
+                    } else {
+                        location.parent().unwrap_or_else(|| location.clone())
+                    };
+                    let failure = Failure::at(&folder, Cause::launch(&err));
+                    self.report_new(Operation::OpenTerminal, vec![failure]);
                 }
                 Task::none()
             }
             ui::dirview::Event::RunCustomAction(exec, locations) => {
                 let paths: Vec<PathBuf> = locations.iter().map(|l| l.path.clone()).collect();
+                let mut failures = Vec::new();
                 for argv in core::apps::build_argv(&exec, &paths) {
                     let Some((program, args)) = argv.split_first() else {
                         continue;
                     };
                     if let Err(err) = core::apps::spawn_argv(program, args) {
                         eprintln!("saola-files: custom action \"{exec}\" failed: {err}");
+                        failures.push(Failure::new(program.clone(), Cause::launch(&err)));
                     }
                 }
+                self.report_new(Operation::RunAction, failures);
                 Task::none()
             }
             ui::dirview::Event::CopyRequested(locations) => {
                 self.clipboard.set_copy(locations.clone());
-                write_foreign_clipboard(ops::ClipboardOp::Copy, locations)
+                let incident = self.new_incident();
+                write_foreign_clipboard(incident, ops::ClipboardOp::Copy, locations)
             }
             ui::dirview::Event::CutRequested(locations) => {
                 self.clipboard.set_cut(locations.clone());
-                write_foreign_clipboard(ops::ClipboardOp::Cut, locations)
+                let incident = self.new_incident();
+                write_foreign_clipboard(incident, ops::ClipboardOp::Cut, locations)
             }
             ui::dirview::Event::PasteRequested(dest_dir) => self.start_paste(dest_dir),
             ui::dirview::Event::DeleteRequested(locations, mode) => {
@@ -152,6 +179,10 @@ impl App {
             ui::dirview::Event::PropertiesRequested(items) => self.open_properties(items),
             ui::dirview::Event::App(action) => self.handle_app_action(action),
             // --- features (alphabetical) ---
+            ui::dirview::Event::Failed(incident, operation, failures) => {
+                self.report_failures(incident, operation, failures);
+                Task::none()
+            }
         }
     }
 
@@ -161,7 +192,8 @@ impl App {
     /// resolvable mimetype association, or an association naming an app
     /// this database never found all degrade to a worded `eprintln!`
     /// rather than silently doing nothing or panicking.
-    fn open_with_default_app(&self, id: ViewId, locations: &[Location]) {
+    fn open_with_default_app(&mut self, id: ViewId, locations: &[Location]) {
+        let mut failures = Vec::new();
         for location in locations {
             let Some(name) = location.path.file_name() else {
                 continue;
@@ -177,6 +209,7 @@ impl App {
             };
             let Some(entry) = self.apps_db.default_for(&mimetype) else {
                 eprintln!("saola-files: no app is associated with {mimetype} for {location}");
+                failures.push(Failure::at(location, Cause::NoDefaultApp));
                 continue;
             };
             let terminal = core::apps::resolve_terminal_from_env(self.terminal.as_deref());
@@ -184,7 +217,9 @@ impl App {
                 core::apps::open(entry, std::slice::from_ref(&location.path), &terminal)
             {
                 eprintln!("saola-files: could not open {location}: {err}");
+                failures.push(Failure::at(location, Cause::launch(&err)));
             }
         }
+        self.report_new(Operation::Open, failures);
     }
 }

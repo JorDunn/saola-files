@@ -4,6 +4,7 @@
 
 pub mod apps;
 pub mod clipboard_interop;
+pub mod failure;
 pub mod fs;
 pub mod mime;
 pub mod places;

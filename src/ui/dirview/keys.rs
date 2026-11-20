@@ -20,6 +20,15 @@ use super::{DeleteMode, DirectoryView, Event, Message};
 const PAGE_ROWS: isize = 10;
 
 impl DirectoryView {
+    /// True while this view has something its own Escape handling would
+    /// close or cancel (the menu, the Open-with popover, an inline rename,
+    /// the path editor). `App` asks before using Escape to dismiss the
+    /// error notice, so one press closes the thing in front of the person,
+    /// not the notice behind it.
+    pub fn owns_escape(&self) -> bool {
+        self.menu_open || self.open_with_open || self.rename.is_some() || self.path_edit.is_some()
+    }
+
     // ── keyboard/action handling ────────────────────────────────────────
 
     pub(super) fn handle_keyboard(
