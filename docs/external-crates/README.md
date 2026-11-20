@@ -13,4 +13,6 @@ calls the consuming saola-files module needs, as Rust signatures where
 possible); **Test strategy** (how the crate proves it is correct, for
 example reference files, a test server, or fuzzing); and **Licence notes**
 (constraints on the format or on reimplementing it). Current briefs: `smb2-client.md` and `mtp.md`, both contingency briefs (a
-suitable crate was found; see `docs/decisions/smb-mtp.md`).
+suitable crate was found; see `docs/decisions/smb-mtp.md`), and
+`rar-decoder.md` and `zstd-encoder.md`, also contingency briefs (see
+`docs/decisions/archive-codecs.md`).
