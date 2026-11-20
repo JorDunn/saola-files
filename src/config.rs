@@ -17,6 +17,8 @@
 //! `~/.config/saola`, where an env var set to the empty string counts as
 //! unset (the XDG spec's own rule, applied uniformly).
 //!
+//! `[keys]` rebinds keyboard shortcuts (see `keymap.rs` and the README).
+//!
 //! Two array-of-tables sections extend the flat knobs:
 //! - `[[action]]` — user-defined context-menu actions (name + exec, with
 //!   optional mimetype/scheme filters). Consumed by the menu layer in
@@ -46,8 +48,11 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use toml::Table;
+
+use crate::keymap::Keymap;
 
 /// Default cap on the size of files we'll generate thumbnails for, in MiB.
 const DEFAULT_THUMBNAIL_MAX_MB: u64 = 64;
@@ -158,6 +163,11 @@ pub struct Config {
     pub actions: Vec<CustomAction>,
     pub servers: Vec<SavedServer>,
     // --- features (alphabetical) ---
+    /// Resolved shortcuts: defaults plus the `[keys]` overrides. An `Arc`
+    /// because every `DirectoryView` holds a handle and the table is
+    /// read-only after load (cloning the `Arc` copies a pointer, not the
+    /// table).
+    pub keys: Arc<Keymap>,
 }
 
 impl Default for Config {
@@ -175,6 +185,7 @@ impl Default for Config {
             actions: Vec::new(),
             servers: Vec::new(),
             // --- features (alphabetical) ---
+            keys: Arc::new(Keymap::default()),
         }
     }
 }
@@ -265,6 +276,7 @@ impl Config {
         let actions = read_actions(&body);
         let servers = read_servers(&body);
         // --- features (alphabetical) ---
+        let keys = read_keys(&body);
 
         Ok(Config {
             terminal,
@@ -279,6 +291,7 @@ impl Config {
             actions,
             servers,
             // --- features (alphabetical) ---
+            keys,
         })
     }
 }
@@ -422,6 +435,18 @@ fn read_actions(body: &Table) -> Vec<CustomAction> {
             })
         })
         .collect()
+}
+
+/// The `[keys] table, resolved against the built-in bindings. Every
+/// problem (unknown action, bad chord, conflict) is one named warning from
+/// `Keymap::from_config`; this wrapper only prints them. See the README's
+/// "Keyboard shortcuts" section for the format.
+fn read_keys(body: &Table) -> Arc<Keymap> {
+    let (keymap, warnings) = Keymap::from_config(body.get("keys"));
+    for warning in warnings {
+        eprintln!("saola-files: files.toml: {warning}");
+    }
+    Arc::new(keymap)
 }
 
 /// Every valid `[[server]]` entry; missing `name` or `uri` skips that entry.
@@ -661,5 +686,39 @@ mod tests {
         .unwrap();
         assert_eq!(config.servers.len(), 1);
         assert_eq!(config.servers[0].uri, "sftp://jordan@10.0.0.10/srv");
+    }
+
+    #[test]
+    fn keys_table_rebinds_and_a_bad_entry_leaves_other_knobs_alone() {
+        let config = Config::parse(
+            r#"
+            show-hidden = true
+
+            [keys]
+            new_folder = "ctrl+alt+n"
+            bogus_action = "ctrl+b"
+            undo = "ctrl+nonsense"
+            "#,
+        )
+        .unwrap();
+        assert!(config.show_hidden);
+        assert_eq!(
+            config.keys.chords_for("new_folder").map(|c| c.len()),
+            Some(1)
+        );
+        assert_eq!(
+            config.keys.chords_for("new_folder").unwrap()[0].to_string(),
+            "ctrl+alt+n"
+        );
+        // The unparseable undo chord kept the default.
+        assert_eq!(
+            config.keys.chords_for("undo").unwrap()[0].to_string(),
+            "ctrl+z"
+        );
+    }
+
+    #[test]
+    fn no_keys_table_means_the_default_keymap() {
+        assert_eq!(*Config::parse("").unwrap().keys, Keymap::default());
     }
 }

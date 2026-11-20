@@ -71,6 +71,7 @@ mod typeahead;
 mod watch;
 
 use std::ffi::OsString;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use iced::widget::scrollable;
@@ -84,7 +85,7 @@ use crate::core::fs::entry::FileEntry;
 use crate::core::mime::MimeDb;
 use crate::core::thumbs::ThumbCache;
 use crate::core::vfs::{Caps, DirEvent, Location, VfsError};
-use crate::keymap::{Action, AppAction};
+use crate::keymap::{Action, AppAction, Keymap};
 use crate::ui::menus;
 use crate::ui::right_click::RightClick;
 // `row_icon`/`thumbnail_for` moved to `thumbs.rs`; re-exported here so
@@ -391,6 +392,9 @@ pub struct DirectoryView {
     /// then type its name".
     pending_rename: bool,
     // --- features (alphabetical) ---
+    /// The resolved shortcut table (`files.toml`'s `[keys]` over the
+    /// defaults), shared with every other view through one `Arc`.
+    keymap: Arc<Keymap>,
     /// Whether the current location has listed successfully (session
     /// state records a folder as "last location" only once this is true).
     /// Cleared whenever a new listing starts (`load`).
@@ -433,6 +437,7 @@ impl DirectoryView {
             rename: None,
             pending_rename: false,
             // --- features (alphabetical) ---
+            keymap: Arc::clone(&config.keys),
             listed: false,
             menu_anchor: None,
             last_press: None,
