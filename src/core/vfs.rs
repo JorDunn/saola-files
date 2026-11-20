@@ -294,6 +294,11 @@ pub struct WriteOptions {
     /// `close` also flushes the file to stable storage before it reports
     /// success; a failed flush is a failed write. See [`WriteSink`].
     pub sync: bool,
+    /// A newly created file starts readable and writable by its owner only
+    /// (mode `0o600`), so nobody else can read it while it is written; the
+    /// caller sets the final permissions afterwards. Has no effect on an
+    /// existing file that is truncated.
+    pub owner_only: bool,
 }
 
 /// Every protocol backend implements this. Object-safe (`Box<dyn Backend>`
@@ -331,21 +336,30 @@ pub trait Backend: Send + Sync {
     /// exclusively, and flush to stable storage on close.
     ///
     /// The default body is a *checked* fallback for a backend that has no
-    /// native exclusive create: it refuses with `AlreadyExists` when
-    /// `metadata` finds something at `location`, then calls `write`. That
-    /// check and the create are two steps, so something created in between
-    /// would be truncated; and `sync` is only as strong as that backend's
-    /// `write`. Both real backends (local, SFTP) override it with the
-    /// single-step version.
+    /// native exclusive create: with `create_new` it goes on to the
+    /// truncating `write` only when `metadata` says definitely
+    /// [`VfsError::NotFound`]; something there is `AlreadyExists`, and any
+    /// other answer (permission denied, a lost connection) is returned as
+    /// is, because "couldn't look" is not "nothing there". The check and
+    /// the create are still two steps, so something created in between
+    /// would be truncated; `sync` is only as strong as that backend's
+    /// `write`, and `owner_only` is not honoured. Both real backends
+    /// (local, SFTP) override it with the single-step version.
     async fn write_with(
         &self,
         location: &Location,
         options: WriteOptions,
     ) -> Result<WriteSink, VfsError> {
-        if options.create_new && self.metadata(location).await.is_ok() {
-            return Err(VfsError::AlreadyExists {
-                location: location.to_string(),
-            });
+        if options.create_new {
+            match self.metadata(location).await {
+                Ok(_) => {
+                    return Err(VfsError::AlreadyExists {
+                        location: location.to_string(),
+                    });
+                }
+                Err(VfsError::NotFound { .. }) => {}
+                Err(err) => return Err(err),
+            }
         }
         self.write(location).await
     }
@@ -358,17 +372,22 @@ pub trait Backend: Send + Sync {
     /// Beyond that a backend answers what it can tell: local compares
     /// device and inode after following symlinks (hard links, a symlink to
     /// the file, a path through a symlinked folder); SFTP compares the
-    /// server's canonical paths (symlinks, not hard links). The default,
-    /// and the answer when either side cannot be examined, is the plain
-    /// comparison. Not a [`Caps`] bit: every backend can answer, some just
-    /// see less.
+    /// server's canonical paths (symlinks, not hard links). The default is
+    /// the plain comparison. Not a [`Caps`] bit: every backend can answer,
+    /// some just see less.
+    ///
+    /// `Ok(false)` when one side doesn't exist (a dangling symlink can't be
+    /// the source). `Err` when a side exists but can't be examined
+    /// (permission denied, a symlink loop, a lost connection): the caller
+    /// then cannot rule out that they are the same file. The ops engine
+    /// refuses a Move in that case, since it would remove the source.
     ///
     /// A trait method rather than an inode field on `FileEntry` because
     /// identity has to follow symlinks while `metadata` deliberately does
     /// not, and because adding a field touches every `FileEntry` literal in
     /// the tree.
-    async fn same_file(&self, a: &Location, b: &Location) -> bool {
-        a == b
+    async fn same_file(&self, a: &Location, b: &Location) -> Result<bool, VfsError> {
+        Ok(a == b)
     }
 
     async fn mkdir(&self, location: &Location) -> Result<(), VfsError>;
@@ -466,7 +485,7 @@ impl Backend for std::sync::Arc<dyn Backend> {
         self.as_ref().write_with(location, options).await
     }
 
-    async fn same_file(&self, a: &Location, b: &Location) -> bool {
+    async fn same_file(&self, a: &Location, b: &Location) -> Result<bool, VfsError> {
         self.as_ref().same_file(a, b).await
     }
 
@@ -671,12 +690,12 @@ impl Backend for FakeBackend {
     }
 
     /// Recorded, then the plain location comparison.
-    async fn same_file(&self, a: &Location, b: &Location) -> bool {
+    async fn same_file(&self, a: &Location, b: &Location) -> Result<bool, VfsError> {
         self.record(FakeCall::SameFile {
             a: a.clone(),
             b: b.clone(),
         });
-        a == b
+        Ok(a == b)
     }
 
     async fn mkdir(&self, location: &Location) -> Result<(), VfsError> {
@@ -1082,11 +1101,12 @@ mod tests {
         let options = WriteOptions {
             create_new: true,
             sync: true,
+            owner_only: true,
         };
         // A missing forwarder would run the trait's default bodies, which
         // call `metadata`/`write` (or compare locations) and record nothing.
         let _ = Backend::write_with(&inner, &here, options).await;
-        assert!(!Backend::same_file(&inner, &here, &there).await);
+        assert_eq!(Backend::same_file(&inner, &here, &there).await, Ok(false));
         assert_eq!(
             fake.calls(),
             vec![
@@ -1103,9 +1123,10 @@ mod tests {
     async fn default_same_file_compares_locations_component_by_component() {
         let backend = BareBackend;
         let plain = Location::local("/d/f");
-        assert!(backend.same_file(&plain, &Location::local("/d/./f")).await);
-        assert!(backend.same_file(&plain, &Location::local("/d//f")).await);
-        assert!(!backend.same_file(&plain, &Location::local("/d/g")).await);
+        for (other, expected) in [("/d/./f", true), ("/d//f", true), ("/d/g", false)] {
+            let other = Location::local(other);
+            assert_eq!(backend.same_file(&plain, &other).await, Ok(expected));
+        }
     }
 
     /// `BareBackend` with one file, to exercise the default `write_with`.
@@ -1125,6 +1146,11 @@ mod tests {
         async fn metadata(&self, l: &Location) -> Result<FileEntry, VfsError> {
             if l.path == Path::new("/taken") {
                 Ok(entry("taken", EntryKind::File))
+            } else if l.path == Path::new("/denied") {
+                // Something may well be there; this backend can't tell.
+                Err(VfsError::PermissionDenied {
+                    location: l.to_string(),
+                })
             } else {
                 Err(VfsError::NotFound {
                     location: l.to_string(),
@@ -1166,7 +1192,7 @@ mod tests {
         let backend = OneFileBackend;
         let new = WriteOptions {
             create_new: true,
-            sync: false,
+            ..WriteOptions::default()
         };
         let taken = Location::local("/taken");
         assert!(matches!(
@@ -1179,6 +1205,12 @@ mod tests {
                 .await
                 .is_ok()
         );
+        // "Couldn't look" is not "nothing there": never on to the
+        // truncating `write`.
+        assert!(matches!(
+            backend.write_with(&Location::local("/denied"), new).await,
+            Err(VfsError::PermissionDenied { .. })
+        ));
         // Without `create_new` it is plain `write`, which truncates.
         assert!(
             backend

@@ -265,7 +265,7 @@ impl Backend for SftpBackend {
         let path = wire_path(location);
         let file = self
             .sftp
-            .open_with_flags(path, open_flags(options))
+            .open_with_flags_and_attributes(path, open_flags(options), open_attrs(options))
             .await
             .map_err(|err| sftp_error(location, err))?;
 
@@ -291,15 +291,21 @@ impl Backend for SftpBackend {
     /// reports no inode numbers, so two hard links to one file are not
     /// recognised; the ops engine's replace-by-rename is safe for them
     /// anyway (see `core::fs::ops`).
-    async fn same_file(&self, a: &Location, b: &Location) -> bool {
+    ///
+    /// A side the server says doesn't exist is `Ok(false)`; any other
+    /// failure (a lost connection, permission denied) is the error, since
+    /// it can't rule out the same file.
+    async fn same_file(&self, a: &Location, b: &Location) -> Result<bool, VfsError> {
         if a == b {
-            return true;
+            return Ok(true);
         }
-        let (a, b) = (
-            self.sftp.canonicalize(wire_path(a)).await,
-            self.sftp.canonicalize(wire_path(b)).await,
-        );
-        matches!((a, b), (Ok(a), Ok(b)) if a == b)
+        match (
+            canonical_path(&self.sftp, a).await?,
+            canonical_path(&self.sftp, b).await?,
+        ) {
+            (Some(a), Some(b)) => Ok(a == b),
+            _ => Ok(false),
+        }
     }
 
     async fn mkdir(&self, location: &Location) -> Result<(), VfsError> {
@@ -538,6 +544,36 @@ fn open_flags(options: WriteOptions) -> OpenFlags {
         flags |= OpenFlags::TRUNCATE;
     }
     flags
+}
+
+/// The server's canonical path for `location` (`SSH_FXP_REALPATH`), or
+/// `None` when the server says it doesn't exist; see `same_file`.
+async fn canonical_path(
+    sftp: &SftpSession,
+    location: &Location,
+) -> Result<Option<String>, VfsError> {
+    match sftp.canonicalize(wire_path(location)).await {
+        Ok(path) => Ok(Some(path)),
+        Err(err) => match sftp_error(location, err) {
+            VfsError::NotFound { .. } => Ok(None),
+            other => Err(other),
+        },
+    }
+}
+
+/// `SSH_FXP_OPEN` attributes for [`SftpBackend::write_with`]: with
+/// `owner_only`, permissions `0o600` (OpenSSH's server passes them to
+/// `open(2)` as the creation mode, so they apply only to a new file, and
+/// its umask can only narrow them); otherwise none, the server's default.
+fn open_attrs(options: WriteOptions) -> FileAttributes {
+    if options.owner_only {
+        FileAttributes {
+            permissions: Some(0o600),
+            ..FileAttributes::default()
+        }
+    } else {
+        FileAttributes::empty()
+    }
 }
 
 /// The writer task's body: writes each chunk in order and returns the
@@ -1400,10 +1436,21 @@ mod tests {
     }
 
     #[test]
+    fn open_attrs_ask_for_owner_only_permissions_only_when_told() {
+        let private = open_attrs(WriteOptions {
+            owner_only: true,
+            ..WriteOptions::default()
+        });
+        assert_eq!(private.permissions, Some(0o600));
+        assert_eq!(open_attrs(WriteOptions::default()).permissions, None);
+    }
+
+    #[test]
     fn open_flags_create_exclusively_or_truncate() {
         let new = open_flags(WriteOptions {
             create_new: true,
             sync: false,
+            owner_only: false,
         });
         assert!(new.contains(OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUDE));
         assert!(!new.contains(OpenFlags::TRUNCATE));

@@ -315,9 +315,16 @@ impl SyncWrite for fs::File {
 /// Opens `location` for [`LocalBackend::write_with`]. `create_new` maps to
 /// `O_CREAT | O_EXCL`, which also refuses a symlink at the name rather than
 /// following it; otherwise create-or-truncate, like `File::create`.
+/// `owner_only` creates the file as `0o600` (`OpenOptionsExt::mode`, which
+/// only applies when the file is created; the umask can narrow it further,
+/// never widen it).
 fn open_for_write(location: &Location, options: WriteOptions) -> Result<fs::File, VfsError> {
+    use std::os::unix::fs::OpenOptionsExt;
     let mut open = fs::OpenOptions::new();
     open.write(true);
+    if options.owner_only {
+        open.mode(0o600);
+    }
     if options.create_new {
         open.create_new(true);
     } else {
@@ -352,11 +359,20 @@ fn write_chunks<W: SyncWrite>(
 /// [`LocalBackend::same_file`]'s check: same device and inode, following
 /// symlinks (`fs::metadata`, not `symlink_metadata`), so a hard link, a
 /// symlink to the file and a path through a symlinked folder all count.
-/// `None` when either side cannot be examined.
-fn same_inode(a: &Path, b: &Path) -> Option<bool> {
+/// A side that doesn't exist (a dangling symlink included) is `Ok(false)`;
+/// any other failure to look (permission denied, a symlink loop) is the
+/// error, because it can't rule out the same file.
+fn same_inode(a: &Location, b: &Location) -> Result<bool, VfsError> {
     use std::os::unix::fs::MetadataExt;
-    let (a, b) = (fs::metadata(a).ok()?, fs::metadata(b).ok()?);
-    Some(a.dev() == b.dev() && a.ino() == b.ino())
+    let stat = |location: &Location| match fs::metadata(&location.path) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(io_error(location, err)),
+    };
+    match (stat(a)?, stat(b)?) {
+        (Some(a), Some(b)) => Ok(a.dev() == b.dev() && a.ino() == b.ino()),
+        _ => Ok(false),
+    }
 }
 
 /// The [`WriteSink`] `LocalBackend::write` returns.
@@ -562,15 +578,12 @@ impl Backend for LocalBackend {
         }))
     }
 
-    async fn same_file(&self, a: &Location, b: &Location) -> bool {
+    async fn same_file(&self, a: &Location, b: &Location) -> Result<bool, VfsError> {
         if a == b {
-            return true;
+            return Ok(true);
         }
-        let (a_path, b_path) = (a.path.clone(), b.path.clone());
-        let inode = run_blocking(a, move || Ok(same_inode(&a_path, &b_path))).await;
-        // Either side unreadable (or the blocking task failed): the plain
-        // comparison already answered `false` above.
-        matches!(inode, Ok(Some(true)))
+        let (a_owned, b_owned) = (a.clone(), b.clone());
+        run_blocking(a, move || same_inode(&a_owned, &b_owned)).await
     }
 
     async fn mkdir(&self, location: &Location) -> Result<(), VfsError> {
@@ -1348,6 +1361,7 @@ mod tests {
         let options = WriteOptions {
             create_new: true,
             sync: false,
+            owner_only: false,
         };
         let result = backend().write_with(&Location::local(&path), options).await;
         assert!(matches!(result, Err(VfsError::AlreadyExists { .. })));
@@ -1365,6 +1379,7 @@ mod tests {
         let options = WriteOptions {
             create_new: true,
             sync: true,
+            owner_only: false,
         };
         let result = backend().write_with(&Location::local(&link), options).await;
         assert!(matches!(result, Err(VfsError::AlreadyExists { .. })));
@@ -1389,6 +1404,7 @@ mod tests {
         let options = WriteOptions {
             create_new: true,
             sync: true,
+            owner_only: false,
         };
         let mut sink = backend()
             .write_with(&Location::local(&path), options)
@@ -1414,13 +1430,19 @@ mod tests {
         std::os::unix::fs::symlink(&dir, dir.join("via")).unwrap();
         let at = |name: &str| Location::local(dir.join(name));
         let b = backend();
-        assert!(b.same_file(&at("file"), &at("file")).await);
-        assert!(b.same_file(&at("file"), &at("hard")).await);
-        assert!(b.same_file(&at("file"), &at("soft")).await);
-        assert!(b.same_file(&at("file"), &at("via/file")).await);
-        assert!(!b.same_file(&at("file"), &at("other")).await);
+        assert_eq!(b.same_file(&at("file"), &at("file")).await, Ok(true));
+        assert_eq!(b.same_file(&at("file"), &at("hard")).await, Ok(true));
+        assert_eq!(b.same_file(&at("file"), &at("soft")).await, Ok(true));
+        assert_eq!(b.same_file(&at("file"), &at("via/file")).await, Ok(true));
+        assert_eq!(b.same_file(&at("file"), &at("other")).await, Ok(false));
         // Missing on one side: not the same, and no error.
-        assert!(!b.same_file(&at("file"), &at("missing")).await);
+        assert_eq!(b.same_file(&at("file"), &at("missing")).await, Ok(false));
+        // A dangling symlink can't be the file either.
+        std::os::unix::fs::symlink(dir.join("gone"), dir.join("dangling")).unwrap();
+        assert_eq!(b.same_file(&at("file"), &at("dangling")).await, Ok(false));
+        // A symlink loop can't be examined: an error, not a guess.
+        std::os::unix::fs::symlink(dir.join("loop"), dir.join("loop")).unwrap();
+        assert!(b.same_file(&at("file"), &at("loop")).await.is_err());
         cleanup(dir);
     }
 

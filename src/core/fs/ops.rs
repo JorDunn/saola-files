@@ -530,6 +530,7 @@ impl ExecContext {
             let options = WriteOptions {
                 create_new: true,
                 sync: self.is_move,
+                owner_only: false,
             };
             let outcome = copy_bytes(
                 source_backend,
@@ -553,13 +554,36 @@ impl ExecContext {
         // for any taken name) so that no answer can copy a file onto itself:
         // reading and writing one file at once is how an Overwrite used to
         // empty it, and a Move would then remove the only copy.
-        let same =
-            same_backend(&source, &dest) && self.dest_backend.same_file(&source, &dest).await;
+        let identity = if same_backend(&source, &dest) {
+            self.dest_backend.same_file(&source, &dest).await
+        } else {
+            Ok(false)
+        };
+        let same = matches!(identity, Ok(true));
         let Some(choice) = self.ask_conflict(&source, &dest).await else {
             return; // cancelled (`ask_conflict` set `self.cancelled`)
         };
         match choice {
             ConflictChoice::Skip => self.count_unwritten(size),
+            // Identity unknown (the backend couldn't examine one side): a
+            // Copy may go on, because it never removes its source and a file
+            // replaced by a copy of itself through a rename keeps its
+            // content. A Move could be about to remove the only copy, so it
+            // stops here for this item, with the reason.
+            ConflictChoice::Overwrite | ConflictChoice::RenameCopy
+                if self.is_move && identity.is_err() =>
+            {
+                let reason = identity
+                    .err()
+                    .map(|err| err.to_string())
+                    .unwrap_or_default();
+                self.errors.push((
+                    source,
+                    VfsError::Other {
+                        message: crate::tr!("copy-identity-unknown", reason = reason),
+                    },
+                ));
+            }
             // The file already is its own destination: nothing to write,
             // and for a Move nothing to remove.
             ConflictChoice::Overwrite if same => self.count_unwritten(size),
@@ -587,6 +611,7 @@ impl ExecContext {
                 let options = WriteOptions {
                     create_new: true,
                     sync: self.is_move && !same,
+                    owner_only: false,
                 };
                 let outcome = copy_bytes(
                     source_backend,
@@ -865,8 +890,14 @@ fn temp_name(prefix: &str) -> OsString {
 
 /// Creates a temporary file beside `dest` (same folder, so on a local
 /// disk the final rename is atomic: same filesystem), exclusively and
-/// with `sync` set, trying a fresh name from `names` whenever one is
-/// taken. Returns the temporary location and its open sink.
+/// with `sync` and `owner_only` set (nobody else can read the new content
+/// while it is written; `replace_file` sets the final mode), trying a
+/// fresh name from `names` whenever one is taken. Returns the temporary
+/// location and its open sink.
+///
+/// "Taken" is either `AlreadyExists` or any failure after which the name
+/// turns out to exist: OpenSSH answers an `EXCLUDE` clash with a generic
+/// failure, not a specific status, so the error kind alone can't tell.
 ///
 /// Any other failure is returned as is. In particular a folder that isn't
 /// writable fails here even when the file itself is: replacing a file
@@ -885,12 +916,16 @@ async fn open_temp_sibling(
     let options = WriteOptions {
         create_new: true,
         sync: true,
+        owner_only: true,
     };
     for _ in 0..TEMP_NAME_ATTEMPTS {
         let temp = parent.join(names());
         match dest_backend.write_with(&temp, options).await {
             Ok(sink) => return Ok((temp, sink)),
             Err(VfsError::AlreadyExists { .. }) => continue,
+            // Not ours (the create failed), so nothing to remove: just a
+            // name somebody else holds.
+            Err(_) if dest_backend.metadata(&temp).await.is_ok() => continue,
             Err(err) => return Err(err),
         }
     }
@@ -913,6 +948,13 @@ async fn open_temp_sibling(
 /// symlinks): a folder is refused, as the old in-place write refused it;
 /// a regular file's permission bits are carried over to the new file,
 /// which the old in-place write kept implicitly (it reused the inode).
+///
+/// Permissions never widen: the temporary file is created owner-only
+/// (`0o600`), and the old file's mode is set on it before it is put in
+/// place. If that fails, the Overwrite fails (temporary removed, original
+/// intact) rather than placing a file with different permissions. When the
+/// old mode is unknown (a symlink was there, or the backend reports no
+/// mode or can't chmod), the new file stays owner-only.
 async fn replace_file(
     source_backend: &dyn Backend,
     dest_backend: &dyn Backend,
@@ -932,17 +974,17 @@ async fn replace_file(
     if let CopyOutcome::Cancelled = stream_into(read, write, dest_backend, &temp, transfer).await? {
         return Ok(CopyOutcome::Cancelled);
     }
-    // Best effort, like the rest of the metadata this engine doesn't copy:
-    // a failure here leaves the new file with default permissions, which
-    // is not worth failing a complete copy over. Set-id bits are dropped
-    // (`0o777`): the kernel clears them when a file is written in place,
-    // so carrying them onto new content would grant more than before.
+    // Set-id bits are dropped (`0o777`): the kernel clears them when a
+    // file is written in place, so carrying them onto new content would
+    // grant more than before.
     if existing.kind == EntryKind::File
         && !existing.is_symlink
         && dest_backend.caps().contains(Caps::SET_PERMISSIONS)
         && let Some(mode) = existing.mode
+        && let Err(err) = dest_backend.set_permissions(&temp, mode & 0o777).await
     {
-        let _ = dest_backend.set_permissions(&temp, mode & 0o777).await;
+        let _ = dest_backend.remove(&temp).await;
+        return Err(err);
     }
     place_over(dest_backend, &temp, dest).await
 }
@@ -968,9 +1010,14 @@ async fn replace_file(
 /// - only removing the old file fails: the copy is done, and the leftover
 ///   is reported ([`CopyOutcome::DoneLeavingOldFile`]).
 ///
-/// If `dest` is gone after the first failure, or can't be moved aside,
-/// the first error is returned and `temp` removed (the source still has
-/// the data).
+/// The fallback runs only for the case it exists for: the plain rename
+/// failed *and* `dest` (looked at again now, without following a symlink)
+/// still exists as a non-folder. A folder there now (it can have been
+/// swapped in while the conflict prompt was open) is refused with the
+/// usual "is a folder" wording and is never moved aside. If `dest` is
+/// gone, can't be examined, or can't be moved aside, the first error is
+/// returned. In every failure `temp` is removed (the source still has the
+/// data), except the stranded case above, where it is the new copy.
 async fn place_over(
     dest_backend: &dyn Backend,
     temp: &Location,
@@ -980,20 +1027,27 @@ async fn place_over(
         Ok(()) => return Ok(CopyOutcome::Done),
         Err(err) => err,
     };
+    let refused = match dest_backend.metadata(dest).await {
+        // A symlink is fine: it is replaced, never followed.
+        Ok(entry) if entry.kind != EntryKind::Directory => None,
+        Ok(_) => Some(VfsError::IsADirectory {
+            location: dest.to_string(),
+        }),
+        Err(_) => Some(first.clone()),
+    };
     let backup = dest
         .parent()
         .map(|parent| parent.join(temp_name(REPLACED_PREFIX)));
-    let moved_aside = match &backup {
-        Some(backup) if dest_backend.metadata(dest).await.is_ok() => {
-            dest_backend.metadata(backup).await.is_err()
-                && dest_backend.rename(dest, backup).await.is_ok()
-        }
-        _ => false,
+    let (None, Some(backup)) = (refused.clone(), backup) else {
+        let _ = dest_backend.remove(temp).await;
+        return Err(refused.unwrap_or(first));
     };
-    let (true, Some(backup)) = (moved_aside, backup) else {
+    if dest_backend.metadata(&backup).await.is_ok()
+        || dest_backend.rename(dest, &backup).await.is_err()
+    {
         let _ = dest_backend.remove(temp).await;
         return Err(first);
-    };
+    }
     match dest_backend.rename(temp, dest).await {
         Ok(()) => match dest_backend.remove(&backup).await {
             Ok(()) => Ok(CopyOutcome::Done),
@@ -1238,6 +1292,9 @@ mod safety_tests {
         CancelAtSend(usize, Arc<AtomicBool>),
         /// At `close`, record whether this source path still exists.
         WatchSource(PathBuf, Arc<Mutex<Option<bool>>>),
+        /// At the first `send`, record the permission bits of the file
+        /// being written (what others could read while it is written).
+        RecordMode(Arc<Mutex<Option<u32>>>),
     }
 
     /// How [`FaultyBackend::rename`] behaves.
@@ -1250,15 +1307,37 @@ mod safety_tests {
         /// `NoReplace`, and also refuses to rename a `PARTIAL_PREFIX`
         /// temporary at all, so the new file can never be put in place.
         NoReplaceNoTemp,
+        /// `NoReplaceNoTemp`, and a `REPLACED_PREFIX` file can't be renamed
+        /// back either: the connection "dropped" mid-replace.
+        Stranded,
+        /// `NoReplace`, and moving anything aside to a `REPLACED_PREFIX`
+        /// name fails.
+        NoAside,
+        /// Every rename fails.
+        RefuseAll,
     }
 
-    /// The local backend with a [`Fault`] in its sink and a choice of
-    /// rename semantics: a stand-in for a remote (or failing) destination,
-    /// since there is no fake SFTP session.
+    /// The local backend with injected faults and a choice of rename
+    /// semantics: a stand-in for a remote (or failing) backend, since
+    /// there is no fake SFTP session.
     struct FaultyBackend {
         inner: LocalBackend,
         fault: Fault,
         renames: Renames,
+        /// Every rename asked for, `(from, to)`, refused ones included.
+        renamed: Arc<Mutex<Vec<(PathBuf, PathBuf)>>>,
+        /// Removing a `REPLACED_PREFIX` file fails.
+        keep_replaced: bool,
+        /// `read` streams this many chunks, then fails.
+        read_fails_after: Option<usize>,
+        /// `same_file` can't examine its arguments.
+        identity_fails: bool,
+        /// An exclusive create onto a taken name fails the way OpenSSH
+        /// answers it: a generic failure, not `AlreadyExists`.
+        generic_exclusive_clash: bool,
+        /// When a `PARTIAL_PREFIX` temporary is renamed, record whether
+        /// this source path still exists.
+        source_at_place: Option<(PathBuf, Arc<Mutex<Option<bool>>>)>,
     }
 
     impl FaultyBackend {
@@ -1267,6 +1346,12 @@ mod safety_tests {
                 inner: LocalBackend::new(),
                 fault,
                 renames: Renames::Replace,
+                renamed: Arc::new(Mutex::new(Vec::new())),
+                keep_replaced: false,
+                read_fails_after: None,
+                identity_fails: false,
+                generic_exclusive_clash: false,
+                source_at_place: None,
             }
         }
 
@@ -1276,8 +1361,14 @@ mod safety_tests {
         }
     }
 
+    fn name_starts(path: &Path, prefix: &str) -> bool {
+        path.file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(prefix))
+    }
+
     struct FaultySink {
         inner: WriteSink,
+        path: PathBuf,
         sent: usize,
         fault: Fault,
     }
@@ -1302,6 +1393,12 @@ mod safety_tests {
                 Fault::FailSend(n) if *n == this.sent => return Err(injected("write")),
                 Fault::CancelAtSend(n, flag) if *n == this.sent => {
                     flag.store(true, Ordering::Relaxed);
+                }
+                Fault::RecordMode(seen) if this.sent == 1 => {
+                    let mode = std::fs::symlink_metadata(&this.path)
+                        .map(|meta| meta.permissions().mode() & 0o777)
+                        .ok();
+                    *seen.lock().unwrap() = mode;
                 }
                 _ => {}
             }
@@ -1341,7 +1438,14 @@ mod safety_tests {
             self.inner.metadata(l).await
         }
         async fn read(&self, l: &Location) -> Result<ReadStream, VfsError> {
-            self.inner.read(l).await
+            let stream = self.inner.read(l).await?;
+            let Some(good) = self.read_fails_after else {
+                return Ok(stream);
+            };
+            // `good` real chunks, then one error: a source that fails
+            // part-way (a disk error, a dropped connection).
+            let failure = futures::stream::once(async { Err(injected("read")) });
+            Ok(stream.take(good).chain(failure).boxed())
         }
         async fn write(&self, l: &Location) -> Result<WriteSink, VfsError> {
             self.write_with(l, WriteOptions::default()).await
@@ -1351,38 +1455,63 @@ mod safety_tests {
             l: &Location,
             options: WriteOptions,
         ) -> Result<WriteSink, VfsError> {
-            let inner = self.inner.write_with(l, options).await?;
+            let inner = match self.inner.write_with(l, options).await {
+                Err(VfsError::AlreadyExists { .. }) if self.generic_exclusive_clash => {
+                    return Err(VfsError::Other {
+                        message: "Failure".to_owned(),
+                    });
+                }
+                other => other?,
+            };
             Ok(Box::pin(FaultySink {
                 inner,
+                path: l.path.clone(),
                 sent: 0,
                 fault: self.fault.clone(),
             }))
         }
-        async fn same_file(&self, a: &Location, b: &Location) -> bool {
+        async fn same_file(&self, a: &Location, b: &Location) -> Result<bool, VfsError> {
+            if self.identity_fails {
+                return Err(VfsError::Unavailable {
+                    message: "the connection to the server was lost".to_owned(),
+                });
+            }
             self.inner.same_file(a, b).await
         }
         async fn mkdir(&self, l: &Location) -> Result<(), VfsError> {
             self.inner.mkdir(l).await
         }
         async fn rename(&self, from: &Location, to: &Location) -> Result<(), VfsError> {
-            let is_temp = from
-                .path
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with(PARTIAL_PREFIX));
+            self.renamed
+                .lock()
+                .unwrap()
+                .push((from.path.clone(), to.path.clone()));
+            let from_temp = name_starts(&from.path, PARTIAL_PREFIX);
+            let from_replaced = name_starts(&from.path, REPLACED_PREFIX);
+            let to_replaced = name_starts(&to.path, REPLACED_PREFIX);
             let target_taken = std::fs::symlink_metadata(&to.path).is_ok();
             let refused = match self.renames {
                 Renames::Replace => false,
                 Renames::NoReplace => target_taken,
-                Renames::NoReplaceNoTemp => target_taken || is_temp,
+                Renames::NoReplaceNoTemp => target_taken || from_temp,
+                Renames::Stranded => target_taken || from_temp || from_replaced,
+                Renames::NoAside => target_taken || to_replaced,
+                Renames::RefuseAll => true,
             };
             if refused {
                 return Err(VfsError::Other {
                     message: "Failure".to_owned(),
                 });
             }
+            if from_temp && let Some((source, seen)) = &self.source_at_place {
+                *seen.lock().unwrap() = Some(source.exists());
+            }
             self.inner.rename(from, to).await
         }
         async fn remove(&self, l: &Location) -> Result<(), VfsError> {
+            if self.keep_replaced && name_starts(&l.path, REPLACED_PREFIX) {
+                return Err(injected("remove"));
+            }
             self.inner.remove(l).await
         }
         async fn set_times(
@@ -1441,10 +1570,32 @@ mod safety_tests {
         source: &Path,
         dest: &Path,
     ) -> ExecContext {
+        copy_one_from(
+            &LocalBackend::new(),
+            dest_backend,
+            is_move,
+            choice,
+            cancel,
+            source,
+            dest,
+        )
+        .await
+    }
+
+    /// [`copy_one`] reading through `source_backend`.
+    async fn copy_one_from(
+        source_backend: &dyn Backend,
+        dest_backend: impl Backend + 'static,
+        is_move: bool,
+        choice: ConflictChoice,
+        cancel: Arc<AtomicBool>,
+        source: &Path,
+        dest: &Path,
+    ) -> ExecContext {
         let (mut ctx, _rx) = context(Box::new(dest_backend), is_move, choice, cancel);
         let size = std::fs::metadata(source).map(|m| m.len()).unwrap_or(0);
         ctx.copy_file(
-            &LocalBackend::new(),
+            source_backend,
             Location::local(source),
             Location::local(dest),
             size,
@@ -1768,7 +1919,7 @@ mod safety_tests {
                             })
                             .unwrap();
                     }
-                    OpEvent::Finished { errors: e } => {
+                    OpEvent::Finished { errors: e, .. } => {
                         errors = Some(e);
                         break;
                     }
@@ -1938,6 +2089,322 @@ mod safety_tests {
         assert_eq!(std::fs::read(&source).unwrap(), new_bytes());
         assert!(temporaries(&root.join("dst")).is_empty());
         cleanup(root);
+    }
+
+    // ── review round: the fallback, identity, permissions, clashes ──────
+
+    fn transfer_parts() -> (
+        AtomicBool,
+        u64,
+        mpsc::Sender<OpEvent>,
+        mpsc::Receiver<OpEvent>,
+    ) {
+        let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        (AtomicBool::new(false), 0, tx, rx)
+    }
+
+    /// The names of the engine temporaries in `dir` with `prefix`, and
+    /// their contents.
+    fn temporaries_with(dir: &Path, prefix: &str) -> Vec<(String, Vec<u8>)> {
+        temporaries(dir)
+            .into_iter()
+            .filter(|name| name.starts_with(prefix))
+            .map(|name| {
+                let bytes = std::fs::read(dir.join(&name)).unwrap();
+                (name, bytes)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_folder_swapped_in_during_the_prompt_is_never_moved_aside() {
+        // `existing` says "a file" (what the conflict was raised for); by
+        // the time the copy is placed, a folder holds the name.
+        let (root, source, dest) = overwrite_fixture();
+        let stale = LocalBackend::new()
+            .metadata(&Location::local(&dest))
+            .await
+            .unwrap();
+        std::fs::remove_file(&dest).unwrap();
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("inside"), OLD).unwrap();
+        let backend = FaultyBackend::new(Fault::None);
+        let renamed = backend.renamed.clone();
+        let (cancel, mut bytes_done, mut tx, _rx) = transfer_parts();
+        let result = replace_file(
+            &LocalBackend::new(),
+            &backend,
+            &Location::local(&source),
+            &Location::local(&dest),
+            &stale,
+            &mut Transfer {
+                cancel: &cancel,
+                bytes_done: &mut bytes_done,
+                tx: &mut tx,
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(VfsError::IsADirectory { .. })));
+        assert_eq!(std::fs::read(dest.join("inside")).unwrap(), OLD);
+        assert_eq!(renamed.lock().unwrap().len(), 1, "only the plain rename");
+        assert!(temporaries(&root.join("dst")).is_empty(), "temp removed");
+        cleanup(root);
+    }
+
+    #[tokio::test]
+    async fn a_rename_failing_with_no_destination_tries_nothing_else() {
+        let dir = tempdir();
+        let temp = dir.join(format!("{PARTIAL_PREFIX}x"));
+        std::fs::write(&temp, b"new").unwrap();
+        let backend = FaultyBackend::new(Fault::None).renames(Renames::RefuseAll);
+        let renamed = backend.renamed.clone();
+        let result = place_over(
+            &backend,
+            &Location::local(&temp),
+            &Location::local(dir.join("absent")),
+        )
+        .await;
+        assert!(matches!(result, Err(VfsError::Other { message }) if message == "Failure"));
+        assert_eq!(renamed.lock().unwrap().len(), 1, "no aside attempt");
+        assert!(temporaries(&dir).is_empty());
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn a_stranded_replace_keeps_both_files_under_the_names_it_reports() {
+        let (root, source, dest) = overwrite_fixture();
+        let dst = root.join("dst");
+        let ctx = copy_one(
+            FaultyBackend::new(Fault::None).renames(Renames::Stranded),
+            true,
+            ConflictChoice::Overwrite,
+            no_cancel(),
+            &source,
+            &dest,
+        )
+        .await;
+        let [(_, VfsError::Other { message })] = ctx.errors.as_slice() else {
+            panic!("one worded error expected: {:?}", ctx.errors);
+        };
+        let partial = temporaries_with(&dst, PARTIAL_PREFIX);
+        let replaced = temporaries_with(&dst, REPLACED_PREFIX);
+        assert_eq!(partial.len(), 1);
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(partial[0].1, new_bytes(), "the new copy is kept");
+        assert_eq!(replaced[0].1, OLD, "the old file is kept");
+        assert!(message.contains(&partial[0].0), "{message}");
+        assert!(message.contains(&replaced[0].0), "{message}");
+        assert!(!dest.exists());
+        assert_eq!(std::fs::read(&source).unwrap(), new_bytes(), "Move kept it");
+        cleanup(root);
+    }
+
+    #[tokio::test]
+    async fn an_old_file_that_cannot_be_removed_is_reported_and_the_move_finishes() {
+        let (root, source, dest) = overwrite_fixture();
+        let dst = root.join("dst");
+        let mut backend = FaultyBackend::new(Fault::None).renames(Renames::NoReplace);
+        backend.keep_replaced = true;
+        let ctx = copy_one(
+            backend,
+            true,
+            ConflictChoice::Overwrite,
+            no_cancel(),
+            &source,
+            &dest,
+        )
+        .await;
+        assert_eq!(ctx.files_done, 1, "the copy itself is done");
+        assert_eq!(std::fs::read(&dest).unwrap(), new_bytes());
+        let replaced = temporaries_with(&dst, REPLACED_PREFIX);
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(replaced[0].1, OLD);
+        let [(_, VfsError::Other { message })] = ctx.errors.as_slice() else {
+            panic!("the leftover is reported: {:?}", ctx.errors);
+        };
+        assert!(message.contains(&replaced[0].0), "{message}");
+        assert!(!source.exists(), "the destination is complete, so it went");
+        cleanup(root);
+    }
+
+    #[tokio::test]
+    async fn an_old_file_that_cannot_be_moved_aside_stays_and_the_move_keeps_its_source() {
+        let (root, source, dest) = overwrite_fixture();
+        let ctx = copy_one(
+            FaultyBackend::new(Fault::None).renames(Renames::NoAside),
+            true,
+            ConflictChoice::Overwrite,
+            no_cancel(),
+            &source,
+            &dest,
+        )
+        .await;
+        assert_eq!(ctx.errors.len(), 1);
+        assert_eq!(std::fs::read(&dest).unwrap(), OLD);
+        assert_eq!(std::fs::read(&source).unwrap(), new_bytes());
+        assert!(temporaries(&root.join("dst")).is_empty());
+        cleanup(root);
+    }
+
+    #[tokio::test]
+    async fn a_source_read_failing_part_way_through_an_overwrite_keeps_everything() {
+        let (root, source, dest) = overwrite_fixture();
+        let mut reader = FaultyBackend::new(Fault::None);
+        reader.read_fails_after = Some(20); // past the first 1 MiB write
+        let ctx = copy_one_from(
+            &reader,
+            LocalBackend::new(),
+            true,
+            ConflictChoice::Overwrite,
+            no_cancel(),
+            &source,
+            &dest,
+        )
+        .await;
+        assert!(
+            matches!(ctx.errors.as_slice(), [(_, VfsError::Other { message })] if message.contains("read"))
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), OLD);
+        assert_eq!(std::fs::read(&source).unwrap(), new_bytes());
+        assert!(temporaries(&root.join("dst")).is_empty());
+        cleanup(root);
+    }
+
+    #[tokio::test]
+    async fn a_move_overwrite_removes_its_source_only_after_the_copy_is_in_place() {
+        // The failure half (placement fails, source kept) is
+        // `a_no_replace_backend_that_cannot_place_the_copy_restores_the_original`.
+        let (root, source, dest) = overwrite_fixture();
+        let seen = Arc::new(Mutex::new(None));
+        let mut backend = FaultyBackend::new(Fault::None);
+        backend.source_at_place = Some((source.clone(), seen.clone()));
+        let ctx = copy_one(
+            backend,
+            true,
+            ConflictChoice::Overwrite,
+            no_cancel(),
+            &source,
+            &dest,
+        )
+        .await;
+        assert!(ctx.errors.is_empty(), "{:?}", ctx.errors);
+        assert_eq!(*seen.lock().unwrap(), Some(true), "there while placing");
+        assert!(!source.exists(), "removed after");
+        assert_eq!(std::fs::read(&dest).unwrap(), new_bytes());
+        cleanup(root);
+    }
+
+    #[tokio::test]
+    async fn overwriting_a_private_file_keeps_it_private_throughout() {
+        let (root, source, dest) = overwrite_fixture();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let during = Arc::new(Mutex::new(None));
+        let ctx = copy_one(
+            FaultyBackend::new(Fault::RecordMode(during.clone())),
+            false,
+            ConflictChoice::Overwrite,
+            no_cancel(),
+            &source,
+            &dest,
+        )
+        .await;
+        assert!(ctx.errors.is_empty(), "{:?}", ctx.errors);
+        let while_written = during.lock().unwrap().expect("the temp was examined");
+        assert_eq!(while_written & 0o077, 0, "owner-only while written");
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(std::fs::read(&dest).unwrap(), new_bytes());
+        cleanup(root);
+    }
+
+    #[tokio::test]
+    async fn a_move_overwrite_that_cannot_check_identity_is_refused_with_a_reason() {
+        let (root, source, dest) = overwrite_fixture();
+        let mut backend = FaultyBackend::new(Fault::None);
+        backend.identity_fails = true;
+        let ctx = copy_one(
+            backend,
+            true,
+            ConflictChoice::Overwrite,
+            no_cancel(),
+            &source,
+            &dest,
+        )
+        .await;
+        let [(_, VfsError::Other { message })] = ctx.errors.as_slice() else {
+            panic!("one worded error expected: {:?}", ctx.errors);
+        };
+        assert!(message.contains("same file"), "{message}");
+        assert!(
+            message.contains("connection"),
+            "the reason is kept: {message}"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), OLD);
+        assert_eq!(std::fs::read(&source).unwrap(), new_bytes());
+        assert!(temporaries(&root.join("dst")).is_empty());
+        cleanup(root);
+    }
+
+    #[tokio::test]
+    async fn a_copy_overwrite_goes_on_when_identity_cannot_be_checked() {
+        // A Copy never removes its source, so replacing by rename is safe
+        // even if the two turn out to be one file.
+        let (root, source, dest) = overwrite_fixture();
+        let mut backend = FaultyBackend::new(Fault::None);
+        backend.identity_fails = true;
+        let ctx = copy_one(
+            backend,
+            false,
+            ConflictChoice::Overwrite,
+            no_cancel(),
+            &source,
+            &dest,
+        )
+        .await;
+        assert!(ctx.errors.is_empty(), "{:?}", ctx.errors);
+        assert_eq!(std::fs::read(&dest).unwrap(), new_bytes());
+        assert_eq!(std::fs::read(&source).unwrap(), new_bytes());
+        cleanup(root);
+    }
+
+    #[tokio::test]
+    async fn a_generic_failure_on_a_taken_temporary_name_retries_with_a_fresh_one() {
+        // OpenSSH answers an `EXCLUDE` clash with a plain failure.
+        let dir = tempdir();
+        std::fs::write(dir.join("taken"), b"leftover").unwrap();
+        let mut backend = FaultyBackend::new(Fault::None);
+        backend.generic_exclusive_clash = true;
+        let mut candidates = ["taken", "free"].into_iter();
+        let mut names = || OsString::from(candidates.next().unwrap_or("exhausted"));
+        let (temp, mut sink) =
+            open_temp_sibling(&backend, &Location::local(dir.join("dest")), &mut names)
+                .await
+                .unwrap();
+        assert_eq!(temp, Location::local(dir.join("free")));
+        sink.close().await.unwrap();
+        assert_eq!(std::fs::read(dir.join("taken")).unwrap(), b"leftover");
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn a_failed_temporary_create_with_the_name_still_free_is_returned_at_once() {
+        let dir = tempdir();
+        let mut tries = 0;
+        let mut names = || {
+            tries += 1;
+            OsString::from(format!("n{tries}"))
+        };
+        // The folder doesn't exist: no name can be created, and none is
+        // taken, so retrying would only hide the real error.
+        let result = open_temp_sibling(
+            &FaultyBackend::new(Fault::None),
+            &Location::local(dir.join("missing/dest")),
+            &mut names,
+        )
+        .await;
+        assert!(matches!(result, Err(VfsError::NotFound { .. })));
+        assert_eq!(tries, 1);
+        cleanup(dir);
     }
 }
 
