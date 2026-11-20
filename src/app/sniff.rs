@@ -56,8 +56,13 @@ impl App {
     /// `MimeDb` cache. iced re-runs `view` after any update, so the new
     /// glyphs appear without further plumbing.
     pub(super) fn handle_sniff_ready(&mut self, outcomes: Vec<SniffOutcome>) -> Task<Message> {
+        let sniffed: Vec<Location> = outcomes
+            .iter()
+            .map(|(location, _, _)| location.clone())
+            .collect();
         apply_outcomes(&self.mime_db, &mut self.sniff_inflight, outcomes);
-        Task::none()
+        // Files whose thumbnail was waiting on this verdict get another go.
+        self.request_awaiting_thumbnails(&sniffed)
     }
 
     /// The mtime of the entry `location` names in view `id` (selected or

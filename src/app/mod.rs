@@ -317,6 +317,11 @@ pub(crate) struct App {
     /// `core::thumbs`'s module doc comment's "Known gaps") — this resets
     /// every app restart.
     thumb_failed: HashMap<Location, SystemTime>,
+    /// Candidates whose *name* gave no thumbnailable type but whose content
+    /// sniff is still pending; re-requested once `Message::SniffReady`
+    /// lands (see `app/thumbs.rs`), so an extensionless image gets its
+    /// thumbnail.
+    thumb_awaiting_sniff: HashMap<Location, ui::dirview::ThumbCandidate>,
     /// `files.toml`'s `thumbnails` knob — `Self::request_thumbnails`'
     /// first gate, checked before any of the more granular ones.
     thumbnails_enabled: bool,
@@ -472,6 +477,7 @@ impl App {
             thumb_cache_root: core::thumbs::resolve_cache_root(),
             thumb_inflight: HashSet::new(),
             thumb_failed: HashMap::new(),
+            thumb_awaiting_sniff: HashMap::new(),
             thumbnails_enabled: config.thumbnails,
             thumbnail_max_mb: config.thumbnail_max_mb,
             pending_properties: None,

@@ -29,6 +29,12 @@ pub(super) const THUMB_LRU_CAPACITY: usize = 512;
 /// every blocking-pool thread with decode work at once.
 pub(super) const THUMB_MAX_CONCURRENT: usize = 4;
 
+/// The pixel size thumbnails are requested at; [`core::thumbs::ThumbSize::
+/// for_pixels`] turns it into a spec directory. Fixed at the `normal` size
+/// until the zoom steps (#24) land: the view then passes the tile's device
+/// pixels here (and must key `ThumbCache` by size, which it is not yet).
+pub(super) const THUMB_REQUEST_PIXELS: u32 = 128;
+
 impl App {
     /// `Event::ThumbnailsNeeded`'s handling (Stage 11): dispatches
     /// background generation for viewport-visible candidates the view
@@ -59,7 +65,7 @@ impl App {
         // every closure in a single chain is constructed before any of
         // them run. Collecting the filtered candidates first ends that
         // immutable borrow before the mutating loop starts.
-        let filtered: Vec<(ui::dirview::ThumbCandidate, String)> = candidates
+        let filtered: Vec<(ui::dirview::ThumbCandidate, core::vfs::Location, String)> = candidates
             .into_iter()
             .filter(|candidate| !core::thumbs::exceeds_max_size(candidate.size_bytes, max_mb))
             .filter(|candidate| {
@@ -72,11 +78,35 @@ impl App {
             })
             .filter(|candidate| !self.thumb_inflight.contains(&candidate.location))
             .filter_map(|candidate| {
+                let dir = candidate.location.parent()?;
                 let name = candidate.location.path.file_name()?;
-                let mimetype = self.mime_db.guess(name, None);
-                Some((candidate, mimetype))
+                // Name first, then any cached content-sniff verdict, so an
+                // extensionless image dispatches to the image thumbnailer.
+                let mimetype = self
+                    .mime_db
+                    .guess_entry(&dir, name, Some(candidate.modified));
+                Some((candidate, dir, mimetype))
             })
             .collect();
+
+        // Dispatch only types some thumbnailer claims. A type nobody claims
+        // is not a failure (no fail marker, no session-failed entry); if the
+        // name was untyped and a sniff may still sharpen it, park the
+        // candidate until `SniffReady`.
+        let mut dispatchable: Vec<(ui::dirview::ThumbCandidate, String)> = Vec::new();
+        for (candidate, dir, mimetype) in filtered {
+            if self.thumb_registry.handles(&mimetype) {
+                dispatchable.push((candidate, mimetype));
+            } else if let Some(name) = candidate.location.path.file_name()
+                && self
+                    .mime_db
+                    .wants_sniff(&dir, name, Some(candidate.modified))
+            {
+                self.thumb_awaiting_sniff
+                    .insert(candidate.location.clone(), candidate);
+            }
+        }
+        let filtered = dispatchable;
 
         let tasks: Vec<Task<Message>> = filtered
             .into_iter()
@@ -86,6 +116,7 @@ impl App {
                     location: candidate.location.clone(),
                     mimetype,
                     modified: candidate.modified,
+                    size: core::thumbs::ThumbSize::for_pixels(THUMB_REQUEST_PIXELS),
                 };
                 let registry = self.thumb_registry.clone();
                 let semaphore = self.thumb_semaphore.clone();
@@ -99,6 +130,20 @@ impl App {
             })
             .collect();
         Task::batch(tasks)
+    }
+
+    /// Re-requests thumbnails for parked candidates whose content sniff just
+    /// finished. `request_thumbnails` re-checks every gate, so a sniff that
+    /// found a non-image simply parks nothing and dispatches nothing.
+    pub(super) fn request_awaiting_thumbnails(&mut self, sniffed: &[Location]) -> Task<Message> {
+        let ready: Vec<ui::dirview::ThumbCandidate> = sniffed
+            .iter()
+            .filter_map(|location| self.thumb_awaiting_sniff.remove(location))
+            .collect();
+        if ready.is_empty() {
+            return Task::none();
+        }
+        self.request_thumbnails(ready)
     }
 
     /// `Message::ThumbnailReady`'s handling (Stage 11) — see that
