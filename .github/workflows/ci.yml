@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+    # `edited` re-runs CI when a PR is retitled, so `pr-title` checks the
+    # current title. It also fires on body edits and re-runs every job; the
+    # cost is accepted — skipping the build jobs on `edited` would post
+    # "skipped" check runs, which branch protection counts as passing.
+    types: [opened, synchronize, reopened, edited]
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,6 +18,30 @@ env:
   APT_BUILD_DEPS: libxkbcommon-dev libwayland-dev
 
 jobs:
+  # The PR title becomes the squash commit, and release-plz derives the
+  # version bump and changelog from it, so it must be a Conventional Commit.
+  # Runs on every pull_request event of this workflow (never left pending);
+  # on push to main it is skipped, where it is not required.
+  pr-title:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the title is a Conventional Commit
+        env:
+          # Passed through the environment, never interpolated into the
+          # script: a title is untrusted input (script injection).
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          pattern='^(feat|fix|perf|refactor|docs|test|build|ci|chore|style|revert)(\([a-z0-9._/-]+\))?!?: [^ ].*$'
+          if [[ "$TITLE" =~ $pattern ]]; then
+            echo "OK: $TITLE"
+          else
+            echo "::error::PR title is not a Conventional Commit: $TITLE"
+            echo "Expected '<type>[(scope)][!]: <description>', type one of:"
+            echo "feat fix perf refactor docs test build ci chore style revert"
+            exit 1
+          fi
+
   fmt:
     runs-on: ubuntu-latest
     steps:
