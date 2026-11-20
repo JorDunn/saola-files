@@ -78,7 +78,7 @@ use saola_theme::{Surface, Theme};
 
 use crate::config::{Config, CustomAction, SortKey, View};
 use crate::core::apps::AppsDb;
-use crate::core::failure::{Failure, Operation};
+use crate::core::failure::{Failure, Incident, Operation};
 use crate::core::fs::entry::FileEntry;
 use crate::core::mime::MimeDb;
 use crate::core::thumbs::ThumbCache;
@@ -180,7 +180,7 @@ pub enum Message {
     /// selects and starts renaming the freshly created entry, so the human
     /// can type its real name immediately instead of "New Folder" then a
     /// second F2.
-    CreateResult(Location, OsString, Result<(), VfsError>),
+    CreateResult(Incident, Location, OsString, Result<(), VfsError>),
     // --- features (alphabetical) ---
 }
 
@@ -272,7 +272,7 @@ pub enum Event {
     /// An operation this view started failed (today: New Folder / New File
     /// could not be created). The owner decides how to show it; see
     /// `ui::dialogs::error_notice`.
-    Failed(Operation, Vec<Failure>),
+    Failed(Incident, Operation, Vec<Failure>),
 }
 
 /// One thumbnail candidate bubbled via [`Event::ThumbnailsNeeded`] —
@@ -583,8 +583,9 @@ impl DirectoryView {
             Message::RenameResult(dir_location, old_name, result) => {
                 self.on_rename_result(dir_location, old_name, result)
             }
-            Message::CreateResult(dir, name, result) => self.on_create_result(dir, name, result),
-            // --- features (alphabetical) ---
+            Message::CreateResult(incident, dir, name, result) => {
+                self.on_create_result(incident, dir, name, result)
+            } // --- features (alphabetical) ---
         }
     }
 

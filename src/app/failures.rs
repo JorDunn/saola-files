@@ -26,28 +26,30 @@
 //!
 //! # How each path identifies its incident
 //!
-//! - copy/move: one per engine op, minted in `submit_paste_op`;
+//! - copy/move: one per engine op, minted in `submit_paste_op` and kept per
+//!   op id (`Incidents`);
 //! - trash/delete: one per `start_delete` call, shared by all its tasks;
 //! - undo, clipboard write, open, open with, open terminal, custom action:
 //!   one per user action, minted where the action is handled;
-//! - trash-browser restore/empty: minted when the request is seen, before
-//!   the browser handles it;
-//! - New Folder/File: minted when the result arrives (the view, not `App`,
-//!   starts it, and there is only ever one create in flight per view).
+//! - trash-browser restore/empty: minted by the browser when the request is
+//!   made and carried in its result message;
+//! - New Folder/File: minted by the view when the create starts and carried
+//!   in `CreateResult` and `Event::Failed`.
 //!
 //! # Escape
 //!
 //! The routing lives in `App::key_route` (`mod.rs`), the one place that
 //! decides where a key goes; this file only supplies [`is_bare_escape`].
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 
 use iced::keyboard;
 use iced::widget::column;
 use iced::{Element, Fill, Task};
 
-use saola_files::core::failure::{Failure, Incident, IncidentSource, Operation};
-use saola_files::core::fs::ops::OpKind;
+use saola_files::core::failure::{Failure, Incident, Operation};
+use saola_files::core::fs::ops::{self, OpKind};
 use saola_files::core::vfs::{Location, VfsError};
 use saola_files::ui;
 use saola_files::ui::dialogs::error_notice;
@@ -60,33 +62,29 @@ pub(super) fn failed(incident: Incident, operation: Operation, failures: Vec<Fai
     Message::ErrorNotice(error_notice::Message::Report(incident, operation, failures))
 }
 
-/// `App`'s incident bookkeeping: the mint, plus the incidents of the two
-/// actions whose result arrives apart from their start.
+/// Incidents of the copy/move ops in flight, keyed by [`ops::OpId`].
+///
+/// Today `submit_paste_op` refuses a second op while one runs, so at most
+/// one entry exists; it is a map keyed by op id anyway, so the incident
+/// travels with *its* op and a future queue of ops cannot make one op's
+/// failures merge into another's notice. (Every other path carries its
+/// incident in the task or message itself: no shared slot.)
 #[derive(Debug, Default)]
 pub(super) struct Incidents {
-    source: IncidentSource,
-    /// The running copy/move op's incident (set when it is submitted).
-    op: Option<Incident>,
-    /// The latest trash-browser restore/empty request's incident.
-    trash: Option<Incident>,
+    ops: HashMap<ops::OpId, Incident>,
 }
 
 impl Incidents {
-    pub(super) fn mint(&mut self) -> Incident {
-        self.source.mint()
+    /// Starts the incident for op `id`.
+    pub(super) fn begin_op(&mut self, id: ops::OpId) {
+        self.ops.insert(id, Incident::mint());
     }
 
-    /// Starts the incident for a copy/move op.
-    pub(super) fn begin_op(&mut self) {
-        self.op = Some(self.source.mint());
-    }
-
-    /// The finished op's incident (minting one if somehow absent).
-    pub(super) fn end_op(&mut self) -> Incident {
-        match self.op.take() {
-            Some(incident) => incident,
-            None => self.source.mint(),
-        }
+    /// Op `id` is over: hands back its incident (minting one if somehow
+    /// absent) and forgets it.
+    pub(super) fn end_op(&mut self, id: Option<ops::OpId>) -> Incident {
+        id.and_then(|id| self.ops.remove(&id))
+            .unwrap_or_else(Incident::mint)
     }
 }
 
@@ -133,7 +131,7 @@ pub(super) fn op_failures(
 impl App {
     /// A fresh incident for an action that is starting.
     pub(super) fn new_incident(&mut self) -> Incident {
-        self.incidents.mint()
+        Incident::mint()
     }
 
     /// Shows `failures` of `incident` in the window; see the module docs.
@@ -149,45 +147,32 @@ impl App {
     /// [`Self::report_failures`] for an action that is complete in itself:
     /// mints its incident first.
     pub(super) fn report_new(&mut self, operation: Operation, failures: Vec<Failure>) {
-        let incident = self.incidents.mint();
-        self.report_failures(incident, operation, failures);
+        self.report_failures(Incident::mint(), operation, failures);
     }
 
-    /// Called with a trash-browser message *before* the browser handles it
-    /// (so an item index still names the row the person clicked). A
-    /// request opens an incident; a failed result reports into it. The
+    /// Called with a trash-browser message *before* the browser handles it:
+    /// a failed restore or empty becomes a notice under the incident the
+    /// request carried (minted when it was made, so a late failure from an
+    /// older request is dropped when a newer notice is showing). The
     /// browser's own stderr line stays.
     pub(super) fn report_trash_failure(&mut self, message: &ui::trashview::Message) {
         use ui::trashview::Message as Trash;
         match message {
-            Trash::RestoreRequested(_) | Trash::EmptyRequested | Trash::EmptyConfirmClicked => {
-                self.incidents.trash = Some(self.incidents.mint());
-            }
-            Trash::RestoreResult(index, Err(err)) => {
-                let name = self.trash_view.original_name(*index).unwrap_or_default();
-                let incident = self.trash_incident();
+            Trash::RestoreResult(incident, name, Err(err)) => {
                 self.report_failures(
-                    incident,
+                    *incident,
                     Operation::Restore,
-                    vec![Failure::new(name, err.clone())],
+                    vec![Failure::new(name.clone(), err.clone())],
                 );
             }
-            Trash::EmptyResult(Err(err)) => {
-                let incident = self.trash_incident();
+            Trash::EmptyResult(incident, Err(err)) => {
                 self.report_failures(
-                    incident,
+                    *incident,
                     Operation::EmptyTrash,
                     vec![Failure::new(OsString::new(), err.clone())],
                 );
             }
             _ => {}
-        }
-    }
-
-    fn trash_incident(&mut self) -> Incident {
-        match self.incidents.trash {
-            Some(incident) => incident,
-            None => self.incidents.mint(),
         }
     }
 

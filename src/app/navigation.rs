@@ -179,8 +179,8 @@ impl App {
             ui::dirview::Event::PropertiesRequested(items) => self.open_properties(items),
             ui::dirview::Event::App(action) => self.handle_app_action(action),
             // --- features (alphabetical) ---
-            ui::dirview::Event::Failed(operation, failures) => {
-                self.report_new(operation, failures);
+            ui::dirview::Event::Failed(incident, operation, failures) => {
+                self.report_failures(incident, operation, failures);
                 Task::none()
             }
         }

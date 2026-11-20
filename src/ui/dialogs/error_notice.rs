@@ -63,8 +63,10 @@ pub const MAX_DETAIL_LINES: usize = 8;
 
 /// Width reserved for the Details button when working out how much of the
 /// headline fits: its label is the longer of two translated words, so its
-/// width is not known up front. Same posture as `trashview`'s
-/// `RESTORE_COLUMN`: a generous column rather than a measurement.
+/// width is not known up front. This is a local fixed column width, a
+/// generous guess rather than a measurement, pending a saola-theme token
+/// for it; the precedent is the fixed `SIZE_COLUMN`/`DATE_COLUMN` in
+/// `ui/dirview/list.rs`.
 const DETAILS_COLUMN: f32 = 120.0;
 
 #[derive(Debug, Clone)]
@@ -319,7 +321,6 @@ pub fn view<'a>(t: &'a Theme, notice: &'a Notice) -> Element<'a, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::failure::IncidentSource;
     use crate::core::vfs::VfsError;
 
     fn failure(name: &str) -> Failure {
@@ -332,8 +333,7 @@ mod tests {
     }
 
     fn two_incidents() -> (Incident, Incident) {
-        let mut source = IncidentSource::default();
-        (source.mint(), source.mint())
+        (Incident::mint(), Incident::mint())
     }
 
     #[test]
@@ -457,6 +457,18 @@ mod tests {
             notice.summary().headline,
             "100002 items couldn't be deleted"
         );
+    }
+
+    #[test]
+    fn a_slow_action_started_earlier_does_not_replace_a_newer_notice() {
+        // The ordering rule end to end: the incident is minted at the start
+        // of each action, so the earlier-started one is older whichever
+        // failure arrives first.
+        let (started_first, started_second) = two_incidents();
+        let mut slot = Slot::default();
+        slot.report(started_second, Operation::Open, vec![failure("fast")]);
+        assert!(!slot.report(started_first, Operation::Create, vec![failure("slow")]));
+        assert_eq!(slot.notice().map(Notice::incident), Some(started_second));
     }
 
     #[test]

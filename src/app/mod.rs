@@ -842,6 +842,54 @@ mod tests {
         assert_eq!(app.key_route(&esc()), KeyRoute::DismissNotice);
     }
 
+    fn denied() -> core::vfs::VfsError {
+        core::vfs::VfsError::PermissionDenied {
+            location: "x".to_owned(),
+        }
+    }
+
+    #[test]
+    fn two_failed_trash_requests_are_two_incidents_not_one_count() {
+        use ui::trashview::Message as Trash;
+        let mut app = app();
+        let first = core::failure::Incident::mint();
+        let second = core::failure::Incident::mint();
+        // The second request's failure lands first, then the first's late
+        // one: the straggler is dropped, not merged ("2 items ...").
+        app.report_trash_failure(&Trash::RestoreResult(second, "b".into(), Err(denied())));
+        app.report_trash_failure(&Trash::RestoreResult(first, "a".into(), Err(denied())));
+        let notice = app.error_notice.notice().expect("a notice");
+        assert_eq!(notice.incident(), second);
+        assert_eq!(notice.total(), 1);
+    }
+
+    #[test]
+    fn a_failed_empty_reports_under_its_own_incident() {
+        use ui::trashview::Message as Trash;
+        let mut app = app();
+        let restore = core::failure::Incident::mint();
+        let empty = core::failure::Incident::mint();
+        app.report_trash_failure(&Trash::RestoreResult(restore, "a".into(), Err(denied())));
+        app.report_trash_failure(&Trash::EmptyResult(empty, Err(denied())));
+        let notice = app.error_notice.notice().expect("a notice");
+        assert_eq!(notice.incident(), empty);
+        assert_eq!(notice.operation(), core::failure::Operation::EmptyTrash);
+    }
+
+    #[test]
+    fn each_op_keeps_its_own_incident() {
+        let mut incidents = failures::Incidents::default();
+        let mut ids = ops::OpIdSource::default();
+        let (a, b) = (ids.alloc(), ids.alloc());
+        incidents.begin_op(a);
+        incidents.begin_op(b);
+        let first = incidents.end_op(Some(a));
+        let second = incidents.end_op(Some(b));
+        assert!(first < second);
+        // Ending an unknown op still yields a usable (newer) incident.
+        assert!(incidents.end_op(Some(a)) > second);
+    }
+
     #[test]
     fn a_notice_survives_navigation_and_other_incidents_replace_it() {
         let mut app = app();

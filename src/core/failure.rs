@@ -50,23 +50,27 @@ use crate::tr;
 /// one notice only when they share an `Incident`, and a failure from an
 /// older incident never displaces a newer notice.
 ///
-/// Ordered: a later-minted incident compares greater. Minted by
-/// [`IncidentSource`] when the action *starts* and carried through its
-/// tasks, so ordering reflects when the person asked, not when a result
-/// happened to arrive.
+/// Ordered: a later-minted incident compares greater. Mint one with
+/// [`Incident::mint`] when the action *starts* and carry it (it is `Copy`)
+/// through the tasks and result messages the action spawns, so ordering
+/// reflects when the person asked, not when a result happened to arrive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Incident(u64);
 
-/// Mints [`Incident`]s, strictly increasing. One lives on `App`.
-#[derive(Debug, Default)]
-pub struct IncidentSource {
-    last: u64,
-}
-
-impl IncidentSource {
-    pub fn mint(&mut self) -> Incident {
-        self.last = self.last.saturating_add(1);
-        Incident(self.last)
+impl Incident {
+    /// A new incident, newer than every one minted before it.
+    ///
+    /// Teaching note: the counter is a process-wide `AtomicU64` rather than
+    /// a field on `App`, because incidents are minted from several places
+    /// (the app, a directory view starting New Folder, the trash browser)
+    /// that must all agree on one global order. `fetch_add` is a single
+    /// indivisible "read, add one, write back", so two callers can never get
+    /// the same number; `Relaxed` is enough because only the number matters,
+    /// not ordering against other memory.
+    pub fn mint() -> Incident {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Incident(NEXT.fetch_add(1, Ordering::Relaxed))
     }
 }
 
@@ -529,8 +533,7 @@ mod tests {
 
     #[test]
     fn incidents_are_strictly_increasing() {
-        let mut source = IncidentSource::default();
-        let (a, b) = (source.mint(), source.mint());
+        let (a, b) = (Incident::mint(), Incident::mint());
         assert!(a < b);
     }
 

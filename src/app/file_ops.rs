@@ -83,7 +83,9 @@ impl App {
                     .active_op
                     .as_ref()
                     .map(|request| failures::op_failures(request.kind, &request.dest_dir, &errors));
-                let incident = self.incidents.end_op();
+                let incident = self
+                    .incidents
+                    .end_op(self.active_op.as_ref().map(|request| request.id));
                 if let Some((operation, failures)) = reported {
                     self.report_failures(incident, operation, failures);
                 }
@@ -121,6 +123,8 @@ impl App {
                 }
             }
             ops::OpEvent::Cancelled => {
+                self.incidents
+                    .end_op(self.active_op.as_ref().map(|request| request.id));
                 self.active_op = None;
                 self.active_op_progress = None;
                 self.pending_conflict = None;
@@ -204,7 +208,7 @@ impl App {
             return Task::none();
         }
         let id = self.op_ids.alloc();
-        self.incidents.begin_op();
+        self.incidents.begin_op(id);
         self.active_op_had_conflict = false;
         self.active_op = Some(ops::OpRequest::new(id, kind, sources, dest_dir));
         Task::none()

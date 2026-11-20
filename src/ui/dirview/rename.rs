@@ -25,7 +25,7 @@ use std::ffi::{OsStr, OsString};
 use futures::SinkExt;
 use iced::Task;
 
-use crate::core::failure::{Failure, Operation};
+use crate::core::failure::{Failure, Incident, Operation};
 use crate::core::fs::entry::FileEntry;
 use crate::core::vfs::{Location, VfsError};
 use crate::tr;
@@ -167,6 +167,7 @@ impl DirectoryView {
     /// `update`'s `Message::CreateResult` arm, moved here verbatim.
     pub(super) fn on_create_result(
         &mut self,
+        incident: Incident,
         dir_location: Location,
         name: OsString,
         result: Result<(), VfsError>,
@@ -186,7 +187,7 @@ impl DirectoryView {
                 let failure = Failure::new(name, err).into_folder(&dir_location);
                 (
                     Task::none(),
-                    Some(Event::Failed(Operation::Create, vec![failure])),
+                    Some(Event::Failed(incident, Operation::Create, vec![failure])),
                 )
             }
         }
@@ -286,6 +287,10 @@ impl DirectoryView {
         let location = self.location.join(&name);
         let dir_location = self.location.clone();
         let name_for_message = name.clone();
+        // Minted now, when the person asked, not when the result arrives: a
+        // slow create (a remote folder) that fails after a later action's
+        // failure is older and must not replace that newer notice.
+        let incident = Incident::mint();
 
         Task::perform(
             async move {
@@ -311,7 +316,12 @@ impl DirectoryView {
                 }
             },
             move |result| {
-                Message::CreateResult(dir_location.clone(), name_for_message.clone(), result)
+                Message::CreateResult(
+                    incident,
+                    dir_location.clone(),
+                    name_for_message.clone(),
+                    result,
+                )
             },
         )
     }
@@ -535,6 +545,7 @@ mod tests {
     fn create_result_success_reloads_selects_and_starts_renaming_the_new_entry() {
         let mut view = listed_view(vec![file("existing")]);
         let (_, event) = view.update(Message::CreateResult(
+            Incident::mint(),
             Location::local("/home"),
             OsString::from("New Folder"),
             Ok(()),
@@ -565,6 +576,7 @@ mod tests {
     fn create_result_failure_bubbles_a_worded_failure() {
         let mut view = listed_view(vec![]);
         let (_, event) = view.update(Message::CreateResult(
+            Incident::mint(),
             Location::local("/home"),
             OsString::from("New Folder"),
             Err(VfsError::PermissionDenied {
@@ -572,7 +584,7 @@ mod tests {
             }),
         ));
         match event {
-            Some(Event::Failed(Operation::Create, failures)) => {
+            Some(Event::Failed(_, Operation::Create, failures)) => {
                 assert_eq!(failures.len(), 1);
                 assert_eq!(
                     crate::core::failure::describe(Operation::Create, &failures[0]),
@@ -586,10 +598,30 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_create_carries_the_incident_it_started_with() {
+        let mut view = listed_view(vec![]);
+        let started = Incident::mint();
+        let _later_action = Incident::mint();
+        let (_, event) = view.update(Message::CreateResult(
+            started,
+            Location::local("/home"),
+            OsString::from("New Folder"),
+            Err(VfsError::PermissionDenied {
+                location: "/home".to_owned(),
+            }),
+        ));
+        match event {
+            Some(Event::Failed(incident, Operation::Create, _)) => assert_eq!(incident, started),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn create_result_for_a_stale_directory_is_dropped() {
         let mut view = listed_view(vec![]);
         let _ = view.navigate(Location::local("/elsewhere"));
         let (_, event) = view.update(Message::CreateResult(
+            Incident::mint(),
             Location::local("/home"),
             OsString::from("New Folder"),
             Ok(()),
