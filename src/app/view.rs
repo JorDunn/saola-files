@@ -10,7 +10,7 @@
 
 use iced::{Element, Fill};
 
-use saola_files::{core, ui};
+use saola_files::{core, tr_static, ui};
 
 use super::{App, Message};
 
@@ -201,6 +201,12 @@ impl App {
             None => with_connect,
         };
 
-        ui::window::view(t, self.surface, "Files", with_conflict, Message::Window)
+        ui::window::view(
+            t,
+            self.surface,
+            tr_static!("window-title"),
+            with_conflict,
+            Message::Window,
+        )
     }
 }

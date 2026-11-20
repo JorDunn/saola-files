@@ -156,6 +156,16 @@ documented exception).
   D-Bus and compositor behind traits with fakes; **never `std::env::set_var`
   in a test** — resolve env at a thin wrapper and test the argument-taking
   half. Anything mapping surfaces or grabbing input is tested in nested niri.
+- **User-visible strings (binding):** every string a person reads in
+  `src/ui/` or `src/app/` is a message in `i18n/en-US/files.ftl`, looked up
+  with `tr!("id")` / `tr!("id", name = value)` (owned `String`) or
+  `tr_static!("id")` (`&'static str`, for `saola-theme` widgets that borrow
+  their label). Plurals are Fluent selectors in the catalogue, never
+  `if n == 1` in code. Filenames and paths are arguments
+  (`name.to_string_lossy()` at the call site), never part of a message.
+  `eprintln!` log text stays literal. A test fails on a stray user-visible
+  literal and on an id missing from the catalogue. Rationale and survey:
+  `docs/decisions/i18n.md`.
 - **Teaching notes:** Jordan is newer to Rust — comment non-obvious async
   ownership, macro behaviour, and stream bridging; prefer explicit code over
   clever abstraction.

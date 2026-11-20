@@ -31,6 +31,7 @@ use saola_theme::{ColorExt, Surface, Theme, convert, style};
 use crate::core::fs::entry::FileEntry;
 use crate::core::mime::MimeDb;
 use crate::core::thumbs::ThumbCache;
+use crate::tr_static;
 
 use super::rename::RENAME_INPUT_ID;
 use super::{DirectoryView, Message, row_icon, thumbnail_for};
@@ -143,9 +144,9 @@ pub(super) fn view<'a>(
     }
     if state.entries.is_empty() {
         let message = if state.loading {
-            "Loading…"
+            tr_static!("status-loading")
         } else {
-            "This folder is empty"
+            tr_static!("dirview-empty")
         };
         return empty_state(t, s, message);
     }
@@ -368,7 +369,7 @@ fn renaming_tile<'a>(
         t.on(s).primary.into_iced(),
     );
 
-    let field = text_input("Name", &rename.buffer)
+    let field = text_input(tr_static!("dirview-rename-placeholder"), &rename.buffer)
         .id(RENAME_INPUT_ID)
         .on_input(Message::RenameChanged)
         .on_submit(Message::RenameSubmitted)

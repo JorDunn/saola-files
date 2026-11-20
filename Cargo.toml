@@ -49,6 +49,16 @@ async-trait = "0.1"
 # there's no version-fragmentation cost.
 bitflags = "2"
 
+# `i18n` (issue #12) — the message catalogue runtime. Surveyed 2026-11-19;
+# full comparison in docs/decisions/i18n.md. `fluent-templates` and
+# `i18n-embed` both wrap this crate and add loader, directory-walking and
+# locale-detection layers that an English-only embedded catalogue does not
+# need; `rust-i18n` has no plural grammar; `gettext-rs` binds C `libintl`
+# (not pure Rust). The low-level crate gives us Fluent plurals and selectors
+# in a pure-Rust package, and lets us turn off the bidi isolation marks so
+# English output is unchanged.
+fluent-bundle = "0.16"
+
 # `core::vfs::{ReadStream, WriteSink}` and the local backend's chunked
 # read/write (Stage 3) need `Stream`/`Sink`/`BoxStream` and a channel that
 # isn't `tokio::sync` (CLAUDE.md: iced messages use `iced::futures::channel::
@@ -283,6 +293,12 @@ tokio = { version = "1", features = ["sync"] }
 # resilience rules (one bad knob must degrade alone, with its own warning).
 # serde comes along transitively as toml's data model; we don't derive on it.
 toml = "0.9"
+
+# `i18n` (issue #12) — `LanguageIdentifier`, which `FluentBundle::new` takes.
+# Surveyed 2026-11-19: no alternative (fluent-bundle's own locale type); it
+# is already in the graph through fluent-bundle, this names it directly.
+# No `macros` feature: the proc-macro `langid!` is not needed for one parse.
+unic-langid = "0.9"
 
 # `core::clipboard_interop` (Stage 10) — writing `text/uri-list` +
 # `x-special/gnome-copied-files` on copy/cut, and a best-effort read on

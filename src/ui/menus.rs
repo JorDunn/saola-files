@@ -66,6 +66,7 @@ use crate::core::apps::{AppsDb, DesktopEntry};
 use crate::core::fs::entry::{EntryKind, FileEntry};
 use crate::core::mime::MimeDb;
 use crate::core::vfs::Caps;
+use crate::{msg, tr_static};
 
 use super::dirview::{DirectoryView, Message, menu};
 
@@ -131,7 +132,9 @@ pub(super) struct MenuContext {
 /// One fixed row of the context menu.
 pub(super) struct MenuEntry {
     pub(super) glyph: Icon,
-    pub(super) label: &'static str,
+    /// Catalogue id of the label (wrapped in `msg!`); resolved with
+    /// `i18n::lookup_static` when the row is drawn.
+    pub(super) label_id: &'static str,
     /// Whether this row shows for a given context. A plain function
     /// pointer (`fn`), not a closure, so the whole table can be a `const`.
     pub(super) shown: fn(&MenuContext) -> bool,
@@ -167,18 +170,18 @@ fn has_selection_without_trash(ctx: &MenuContext) -> bool {
 /// are mutually exclusive, so exactly one of them shows with a selection.
 #[rustfmt::skip]
 pub(super) const CONTEXT_MENU: &[MenuEntry] = &[
-    MenuEntry { glyph: Icon::ExternalLink,   label: "Open",             shown: has_selection,               message: menu::Message::OpenSelected },
-    MenuEntry { glyph: Icon::Ellipsis,       label: "Open with…",       shown: has_selection,               message: menu::Message::OpenWithRequested },
-    MenuEntry { glyph: Icon::Terminal,       label: "Open in terminal", shown: always,                      message: menu::Message::OpenTerminalRequested },
-    MenuEntry { glyph: Icon::Copy,           label: "Copy",             shown: has_selection,               message: menu::Message::CopyRequested },
-    MenuEntry { glyph: Icon::Scissors,       label: "Cut",              shown: has_selection,               message: menu::Message::CutRequested },
-    MenuEntry { glyph: Icon::ClipboardPaste, label: "Paste",            shown: has_clipboard,               message: menu::Message::PasteRequested },
-    MenuEntry { glyph: Icon::Pencil,         label: "Rename…",          shown: single_selection,            message: menu::Message::RenameRequested },
-    MenuEntry { glyph: Icon::Trash2,         label: "Move to Trash",    shown: has_selection_and_trash,     message: menu::Message::DeleteRequested },
-    MenuEntry { glyph: Icon::Trash2,         label: "Delete",           shown: has_selection_without_trash, message: menu::Message::DeleteRequested },
-    MenuEntry { glyph: Icon::FolderPlus,     label: "New Folder",       shown: always,                      message: menu::Message::NewFolderRequested },
-    MenuEntry { glyph: Icon::FilePlus,       label: "New File",         shown: always,                      message: menu::Message::NewFileRequested },
-    MenuEntry { glyph: Icon::Info,           label: "Properties",       shown: has_selection,               message: menu::Message::PropertiesRequested },
+    MenuEntry { glyph: Icon::ExternalLink,   label_id: msg!("menu-open"),             shown: has_selection,               message: menu::Message::OpenSelected },
+    MenuEntry { glyph: Icon::Ellipsis,       label_id: msg!("menu-open-with"),        shown: has_selection,               message: menu::Message::OpenWithRequested },
+    MenuEntry { glyph: Icon::Terminal,       label_id: msg!("menu-open-in-terminal"), shown: always,                      message: menu::Message::OpenTerminalRequested },
+    MenuEntry { glyph: Icon::Copy,           label_id: msg!("menu-copy"),             shown: has_selection,               message: menu::Message::CopyRequested },
+    MenuEntry { glyph: Icon::Scissors,       label_id: msg!("menu-cut"),              shown: has_selection,               message: menu::Message::CutRequested },
+    MenuEntry { glyph: Icon::ClipboardPaste, label_id: msg!("menu-paste"),            shown: has_clipboard,               message: menu::Message::PasteRequested },
+    MenuEntry { glyph: Icon::Pencil,         label_id: msg!("menu-rename"),           shown: single_selection,            message: menu::Message::RenameRequested },
+    MenuEntry { glyph: Icon::Trash2,         label_id: msg!("menu-move-to-trash"),    shown: has_selection_and_trash,     message: menu::Message::DeleteRequested },
+    MenuEntry { glyph: Icon::Trash2,         label_id: msg!("menu-delete"),           shown: has_selection_without_trash, message: menu::Message::DeleteRequested },
+    MenuEntry { glyph: Icon::FolderPlus,     label_id: msg!("menu-new-folder"),       shown: always,                      message: menu::Message::NewFolderRequested },
+    MenuEntry { glyph: Icon::FilePlus,       label_id: msg!("menu-new-file"),         shown: always,                      message: menu::Message::NewFileRequested },
+    MenuEntry { glyph: Icon::Info,           label_id: msg!("menu-properties"),       shown: has_selection,               message: menu::Message::PropertiesRequested },
     // --- features: insert one row at the position it should display ---
 ];
 
@@ -206,7 +209,7 @@ fn context_menu<'a>(
             menu_row(
                 t,
                 entry.glyph,
-                entry.label,
+                crate::i18n::lookup_static(entry.label_id),
                 Message::Menu(entry.message.clone()),
             )
         })
@@ -244,14 +247,14 @@ fn open_with_popover<'a>(
 ) -> Element<'a, Message> {
     let selected = state.selected_entries();
     let Some(first) = selected.first() else {
-        return popover_container(t, empty_note(t, "Nothing selected"));
+        return popover_container(t, empty_note(t, tr_static!("menu-nothing-selected")));
     };
     let mimetype = entry_mimetype(first, mime_db);
     let candidates = apps_db.candidates_for(&mimetype);
     let default_id = apps_db.default_for(&mimetype).map(|entry| entry.id.clone());
 
     if candidates.is_empty() {
-        return popover_container(t, empty_note(t, "No known app for this file type"));
+        return popover_container(t, empty_note(t, tr_static!("menu-no-known-app")));
     }
 
     let items: Vec<Element<'a, Message>> = candidates
@@ -371,7 +374,9 @@ mod tests {
             clipboard_has_contents,
             can_trash,
         };
-        visible_entries(&ctx).map(|entry| entry.label).collect()
+        visible_entries(&ctx)
+            .map(|entry| crate::i18n::lookup_static(entry.label_id))
+            .collect()
     }
 
     // The expected lists below are the rows the pre-table, imperative

@@ -11,6 +11,7 @@ use iced::Task;
 use crate::config::Config;
 use crate::core::fs::entry::{EntryKind, FileEntry};
 use crate::core::vfs::{Location, VfsError};
+use crate::tr;
 
 use super::{DirectoryView, Event, Message};
 
@@ -236,7 +237,10 @@ impl DirectoryView {
                 match backend {
                     Some(backend) => backend.list(&location_for_task).await,
                     None => Err(VfsError::Other {
-                        message: format!("no backend for scheme \"{}\"", location_for_task.scheme),
+                        message: tr!(
+                            "error-no-backend",
+                            scheme = location_for_task.scheme.as_str()
+                        ),
                     }),
                 }
             },
@@ -281,7 +285,7 @@ async fn list_with_fallback(fallback: &Location) -> Result<Vec<FileEntry>, VfsEr
     match crate::modules::resolve(fallback) {
         Some(backend) => backend.list(fallback).await,
         None => Err(VfsError::Other {
-            message: format!("no backend for scheme \"{}\"", fallback.scheme),
+            message: tr!("error-no-backend", scheme = fallback.scheme.as_str()),
         }),
     }
 }

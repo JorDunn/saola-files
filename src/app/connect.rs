@@ -6,7 +6,7 @@ use iced::Task;
 
 use core::remote;
 use core::vfs::Location;
-use saola_files::{config, core, ui};
+use saola_files::{config, core, tr, ui};
 
 use super::{App, Message};
 
@@ -100,9 +100,7 @@ impl App {
             return Task::none();
         };
         if location.is_local() {
-            pending.connect.phase = ui::dialogs::connect::Phase::Failed(
-                "Enter a server URI, e.g. sftp://user@host/path".to_owned(),
-            );
+            pending.connect.phase = ui::dialogs::connect::Phase::Failed(tr!("connect-enter-uri"));
             return Task::none();
         }
 

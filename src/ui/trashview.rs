@@ -40,6 +40,7 @@ use saola_theme::{Chrome, ColorExt, Surface, Theme, convert, style};
 use crate::core::fs::entry::EntryKind;
 use crate::core::fs::trash::{self, TrashedItem};
 use crate::core::vfs::VfsError;
+use crate::{tr, tr_static};
 
 /// The two fixed cells at the tail of a trash row. Layout-specific to this
 /// surface's row shape, not saola-theme design-system sizes — the same
@@ -244,9 +245,9 @@ impl TrashView {
             saola_theme::widget::empty_state(t, s, err)
         } else if self.items.is_empty() {
             let message = if self.loading {
-                "Loading…"
+                tr_static!("status-loading")
             } else {
-                "Trash is empty"
+                tr_static!("trash-empty-state")
             };
             saola_theme::widget::empty_state(t, s, message)
         } else {
@@ -323,7 +324,7 @@ where
     match tokio::task::spawn_blocking(f).await {
         Ok(result) => result,
         Err(join_err) => Err(VfsError::Other {
-            message: format!("internal error talking to the trash: {join_err}"),
+            message: tr!("error-trash-internal", detail = join_err.to_string()),
         }),
     }
 }
@@ -338,14 +339,14 @@ fn toolbar<'a>(
         return confirm_strip(t, s);
     }
 
-    let title = text("Trash")
+    let title = text(tr!("trash-title"))
         .size(t.typography.size.dialog_title)
         .font(convert::display_font(t))
         .color(t.on(s).primary.into_iced());
 
     let empty_content = row![
         icon::icon(Icon::Trash2, t.sizes.icon_row, t.on(s).primary.into_iced()),
-        text("Empty Trash")
+        text(tr!("trash-empty-button"))
             .size(t.typography.size.body)
             .font(convert::ui_font(t)),
     ]
@@ -382,13 +383,13 @@ fn toolbar<'a>(
 /// local to `TrashView`, the same "self-contained per-surface state"
 /// posture `DirectoryView`'s own inline-rename state takes.
 fn confirm_strip<'a>(t: &'a Theme, s: Surface) -> Element<'a, Message> {
-    let label = text("Permanently delete everything in the trash?")
+    let label = text(tr!("trash-confirm-empty"))
         .size(t.typography.size.body)
         .font(convert::ui_font(t))
         .color(t.on(s).primary.into_iced());
 
     let cancel = button(
-        text("Cancel")
+        text(tr!("action-cancel"))
             .size(t.typography.size.body)
             .font(convert::ui_font(t)),
     )
@@ -397,7 +398,7 @@ fn confirm_strip<'a>(t: &'a Theme, s: Surface) -> Element<'a, Message> {
     .on_press(Message::EmptyCancelClicked);
 
     let confirm = button(
-        text("Empty Trash")
+        text(tr!("trash-empty-button"))
             .size(t.typography.size.body)
             .font(convert::ui_font(t)),
     )
@@ -499,7 +500,7 @@ fn item_row<'a>(
             t.sizes.icon_row,
             t.on(s).primary.into_iced()
         ),
-        text("Restore")
+        text(tr!("trash-restore"))
             .size(t.typography.size.label)
             .font(convert::ui_font(t)),
     ]

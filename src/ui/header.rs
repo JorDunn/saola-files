@@ -24,6 +24,7 @@ use saola_theme::{Chrome, ColorExt, Surface, Theme, convert, style, widget};
 use crate::config::View;
 use crate::core::vfs::Caps;
 use crate::keymap::Action;
+use crate::tr;
 use crate::ui::breadcrumbs;
 use crate::ui::dirview::{self, DirectoryView};
 
@@ -162,7 +163,7 @@ fn hidden_toggle<'a>(t: &'a Theme, s: Surface, active: bool) -> Element<'a, dirv
     };
     let content = row![
         icon::icon(glyph, t.sizes.icon_row, color.into_iced()),
-        text("Hidden")
+        text(tr!("header-hidden"))
             .size(t.typography.size.label)
             .font(convert::ui_font(t)),
     ]

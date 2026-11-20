@@ -16,6 +16,7 @@ use saola_theme::icon::{self, Icon};
 use saola_theme::{ColorExt, Surface, Theme, convert, style, widget};
 
 use crate::core::fs::ops::{OpEvent, OpKind, OpRequest};
+use crate::tr;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Message {
@@ -81,25 +82,33 @@ pub fn subscription(request: &OpRequest) -> Subscription<OpEvent> {
 /// rendering here to keep honest, the caller decides whether to show it at
 /// all.
 pub fn view<'a>(t: &'a Theme, progress: &'a Progress) -> Element<'a, Message> {
-    let verb = match progress.kind {
-        OpKind::Copy => "Copying",
-        OpKind::Move => "Moving",
-    };
     let name = progress
         .current_name
         .as_deref()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let label = if name.is_empty() {
-        format!(
-            "{verb}… {} of {}",
-            progress.files_done, progress.files_total
-        )
-    } else {
-        format!(
-            "{verb} {name}… {} of {}",
-            progress.files_done, progress.files_total
-        )
+    let (done, total) = (progress.files_done, progress.files_total);
+    // One whole message per verb and per with/without-name case, not a verb
+    // spliced into a sentence: other languages inflect the verb.
+    let label = match (progress.kind, name.is_empty()) {
+        (OpKind::Copy, true) => tr!("progress-copying", done = done, total = total),
+        (OpKind::Copy, false) => {
+            tr!(
+                "progress-copying-named",
+                name = name.as_str(),
+                done = done,
+                total = total
+            )
+        }
+        (OpKind::Move, true) => tr!("progress-moving", done = done, total = total),
+        (OpKind::Move, false) => {
+            tr!(
+                "progress-moving-named",
+                name = name.as_str(),
+                done = done,
+                total = total
+            )
+        }
     };
 
     let icon = icon::icon(

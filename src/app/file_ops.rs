@@ -8,7 +8,7 @@ use iced::Task;
 use core::clipboard_interop;
 use core::fs::{ops, undo};
 use core::vfs::Location;
-use saola_files::{core, modules, ui};
+use saola_files::{core, modules, tr, ui};
 
 use super::{App, Message};
 
@@ -327,7 +327,7 @@ async fn delete_one(
     let Some(backend) = modules::resolve(&location) else {
         return Err((
             location.clone(),
-            format!("no backend for scheme \"{}\"", location.scheme),
+            tr!("error-no-backend", scheme = location.scheme.as_str()),
         ));
     };
     let caps = backend.caps();
