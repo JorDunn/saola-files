@@ -172,10 +172,13 @@ impl DirectoryView {
         name: OsString,
         result: Result<(), VfsError>,
     ) -> (Task<Message>, Option<Event>) {
-        if dir_location != self.location {
-            return (Task::none(), None);
-        }
+        // A late result is judged by where the create was attempted, not
+        // where the view is now: a failure is reported either way, but a
+        // success must not select or rename anything in the wrong folder.
+        let in_place = dir_location == self.location;
         match result {
+            // Succeeded after the user moved on: nothing visible to do.
+            Ok(()) if !in_place => (Task::none(), None),
             Ok(()) => {
                 let created = dir_location.join(&name);
                 self.pending_select = Some(name);
@@ -614,6 +617,36 @@ mod tests {
             Some(Event::Failed(incident, Operation::Create, _)) => assert_eq!(incident, started),
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_failed_create_still_reports_after_navigating_away() {
+        let mut view = listed_view(vec![]);
+        let _ = view.navigate(Location::local("/elsewhere"));
+        let started = Incident::mint();
+        let (_, event) = view.update(Message::CreateResult(
+            started,
+            Location::local("/home"),
+            OsString::from("New Folder"),
+            Err(VfsError::PermissionDenied {
+                location: "/home".to_owned(),
+            }),
+        ));
+        match event {
+            Some(Event::Failed(incident, Operation::Create, failures)) => {
+                assert_eq!(incident, started);
+                // The sentence names where the create was attempted
+                // ("home"), not the folder the view is in now.
+                assert_eq!(
+                    crate::core::failure::describe(Operation::Create, &failures[0]),
+                    "Couldn't create “New Folder” in “home”: permission denied."
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(view.location(), &Location::local("/elsewhere"));
+        assert!(view.rename_state().is_none());
+        assert!(!view.selection.is_selected(OsStr::new("New Folder")));
     }
 
     #[test]
