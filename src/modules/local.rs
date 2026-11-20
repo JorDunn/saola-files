@@ -67,7 +67,7 @@ use tokio::time::Instant as TokioInstant;
 
 use crate::core::fs::entry::{EntryKind, FileEntry};
 use crate::core::vfs::{
-    Backend, Caps, DirEvent, FsStats, Location, ReadStream, VfsError, WriteSink,
+    Backend, Caps, DirEvent, FsStats, Location, ReadStream, VfsError, WriteOptions, WriteSink,
 };
 
 /// Bytes read/written per chunk on `read`/`write` — big enough that a
@@ -295,19 +295,84 @@ fn statfs_blocking(location: &Location) -> Result<FsStats, VfsError> {
     })
 }
 
+/// A writer that can also be flushed to stable storage. `fs::File` is the
+/// real one; tests implement it for in-memory writers so a failing flush
+/// can be injected without a broken disk.
+trait SyncWrite: io::Write {
+    fn sync(&mut self) -> io::Result<()>;
+}
+
+impl SyncWrite for fs::File {
+    /// `sync_all` (fsync), not `sync_data` (fdatasync): for a file that was
+    /// just created and written, fdatasync must commit the new size and
+    /// block allocations anyway, so it saves nothing measurable here, and
+    /// fsync is the call every filesystem implements without surprises.
+    fn sync(&mut self) -> io::Result<()> {
+        self.sync_all()
+    }
+}
+
+/// Opens `location` for [`LocalBackend::write_with`]. `create_new` maps to
+/// `O_CREAT | O_EXCL`, which also refuses a symlink at the name rather than
+/// following it; otherwise create-or-truncate, like `File::create`.
+/// `owner_only` creates the file as `0o600` (`OpenOptionsExt::mode`, which
+/// only applies when the file is created; the umask can narrow it further,
+/// never widen it).
+fn open_for_write(location: &Location, options: WriteOptions) -> Result<fs::File, VfsError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut open = fs::OpenOptions::new();
+    open.write(true);
+    if options.owner_only {
+        open.mode(0o600);
+    }
+    if options.create_new {
+        open.create_new(true);
+    } else {
+        open.create(true).truncate(true);
+    }
+    open.open(&location.path)
+        .map_err(|err| io_error(location, err))
+}
+
 /// The writer thread's body: writes each chunk to `file` in order, stops at
-/// the first error and returns it, and flushes at the end. Generic over
-/// `io::Write` (not tied to `fs::File`) so a test can inject a writer that
-/// fails on chunk N. When this returns early the receiver is dropped, so
-/// later `send`s on the sink fail too; `poll_close` carries the real error.
-fn write_chunks<W: std::io::Write>(
+/// the first error and returns it, flushes at the end and, when `sync` is
+/// set, flushes to stable storage too (a failed sync is a failed write).
+/// Generic over [`SyncWrite`] (not tied to `fs::File`) so a test can inject
+/// a writer that fails on chunk N or on the sync. When this returns early
+/// the receiver is dropped, so later `send`s on the sink fail too;
+/// `poll_close` carries the real error.
+fn write_chunks<W: SyncWrite>(
     mut file: W,
     rx: &mut mpsc::Receiver<Vec<u8>>,
+    sync: bool,
 ) -> io::Result<()> {
     while let Some(chunk) = futures::executor::block_on(rx.next()) {
         file.write_all(&chunk)?;
     }
-    file.flush()
+    file.flush()?;
+    if sync {
+        file.sync()?;
+    }
+    Ok(())
+}
+
+/// [`LocalBackend::same_file`]'s check: same device and inode, following
+/// symlinks (`fs::metadata`, not `symlink_metadata`), so a hard link, a
+/// symlink to the file and a path through a symlinked folder all count.
+/// A side that doesn't exist (a dangling symlink included) is `Ok(false)`;
+/// any other failure to look (permission denied, a symlink loop) is the
+/// error, because it can't rule out the same file.
+fn same_inode(a: &Location, b: &Location) -> Result<bool, VfsError> {
+    use std::os::unix::fs::MetadataExt;
+    let stat = |location: &Location| match fs::metadata(&location.path) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(io_error(location, err)),
+    };
+    match (stat(a)?, stat(b)?) {
+        (Some(a), Some(b)) => Ok(a.dev() == b.dev() && a.ino() == b.ino()),
+        _ => Ok(false),
+    }
 }
 
 /// The [`WriteSink`] `LocalBackend::write` returns.
@@ -485,16 +550,21 @@ impl Backend for LocalBackend {
     }
 
     async fn write(&self, location: &Location) -> Result<WriteSink, VfsError> {
+        self.write_with(location, WriteOptions::default()).await
+    }
+
+    async fn write_with(
+        &self,
+        location: &Location,
+        options: WriteOptions,
+    ) -> Result<WriteSink, VfsError> {
         let loc = location.clone();
-        let file = run_blocking(location, move || {
-            fs::File::create(&loc.path).map_err(|err| io_error(&loc, err))
-        })
-        .await?;
+        let file = run_blocking(location, move || open_for_write(&loc, options)).await?;
 
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
         let loc = location.clone();
         let join = tokio::task::spawn_blocking(move || {
-            let result = write_chunks(file, &mut rx);
+            let result = write_chunks(file, &mut rx, options.sync);
             if let Err(err) = &result {
                 eprintln!("saola-files: write to {loc} failed: {err}");
             }
@@ -506,6 +576,14 @@ impl Backend for LocalBackend {
             join: Some(join),
             location: location.clone(),
         }))
+    }
+
+    async fn same_file(&self, a: &Location, b: &Location) -> Result<bool, VfsError> {
+        if a == b {
+            return Ok(true);
+        }
+        let (a_owned, b_owned) = (a.clone(), b.clone());
+        run_blocking(a, move || same_inode(&a_owned, &b_owned)).await
     }
 
     async fn mkdir(&self, location: &Location) -> Result<(), VfsError> {
@@ -1145,10 +1223,15 @@ mod tests {
 
     // ── tiny temp-dir helpers (no `tempfile` dependency for this alone) ──
 
+    /// A fresh, empty directory for one test. The per-process counter keeps
+    /// two parallel tests that read the same nanosecond from sharing a
+    /// directory (the cause of issue #106; see `core::fs::ops`'s helper).
     fn tempdir() -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut dir = std::env::temp_dir();
         let unique = format!(
-            "saola-files-test-{}-{}",
+            "saola-files-test-{}-{}-{n}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1156,7 +1239,7 @@ mod tests {
                 .as_nanos()
         );
         dir.push(unique);
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir(&dir).unwrap();
         dir
     }
 
@@ -1200,10 +1283,174 @@ mod tests {
         }
     }
 
+    impl SyncWrite for FailsAfter {
+        fn sync(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SyncWrite for &mut Vec<u8> {
+        fn sync(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Accepts every write; the flush to stable storage fails (EIO), like a
+    /// disk that drops the data on its way down.
+    struct SyncFails {
+        written: Vec<u8>,
+        synced: bool,
+    }
+
+    impl std::io::Write for SyncFails {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SyncWrite for SyncFails {
+        fn sync(&mut self) -> io::Result<()> {
+            self.synced = true;
+            Err(io::Error::from_raw_os_error(5)) // EIO
+        }
+    }
+
+    #[test]
+    fn a_failed_sync_is_a_failed_write_when_sync_is_asked_for() {
+        let (mut tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+        tx.try_send(vec![1, 2]).expect("send");
+        drop(tx);
+        let mut writer = SyncFails {
+            written: Vec::new(),
+            synced: false,
+        };
+        let err = write_chunks(&mut writer, &mut rx, true).expect_err("sync failure must surface");
+        assert_eq!(err.raw_os_error(), Some(5));
+        assert_eq!(writer.written, vec![1, 2]);
+    }
+
+    #[test]
+    fn sync_is_skipped_when_not_asked_for() {
+        let (mut tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+        tx.try_send(vec![9]).expect("send");
+        drop(tx);
+        let mut writer = SyncFails {
+            written: Vec::new(),
+            synced: false,
+        };
+        write_chunks(&mut writer, &mut rx, false).expect("no sync, no failure");
+        assert!(!writer.synced);
+    }
+
+    impl SyncWrite for &mut SyncFails {
+        fn sync(&mut self) -> io::Result<()> {
+            (**self).sync()
+        }
+    }
+
+    #[tokio::test]
+    async fn create_new_refuses_an_existing_file_and_leaves_it_alone() {
+        let dir = tempdir();
+        let path = dir.join("taken");
+        std::fs::write(&path, b"precious").unwrap();
+        let options = WriteOptions {
+            create_new: true,
+            sync: false,
+            owner_only: false,
+        };
+        let result = backend().write_with(&Location::local(&path), options).await;
+        assert!(matches!(result, Err(VfsError::AlreadyExists { .. })));
+        assert_eq!(std::fs::read(&path).unwrap(), b"precious");
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn create_new_never_writes_through_a_symlink() {
+        let dir = tempdir();
+        let target = dir.join("target");
+        let link = dir.join("link");
+        std::fs::write(&target, b"precious").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let options = WriteOptions {
+            create_new: true,
+            sync: true,
+            owner_only: false,
+        };
+        let result = backend().write_with(&Location::local(&link), options).await;
+        assert!(matches!(result, Err(VfsError::AlreadyExists { .. })));
+        assert_eq!(std::fs::read(&target).unwrap(), b"precious");
+        // A dangling link is refused too, and its target is not created.
+        let dangling = dir.join("dangling");
+        std::os::unix::fs::symlink(dir.join("nowhere"), &dangling).unwrap();
+        assert!(
+            backend()
+                .write_with(&Location::local(&dangling), options)
+                .await
+                .is_err()
+        );
+        assert!(!dir.join("nowhere").exists());
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn create_new_with_sync_writes_the_whole_file_by_close() {
+        let dir = tempdir();
+        let path = dir.join("fresh");
+        let options = WriteOptions {
+            create_new: true,
+            sync: true,
+            owner_only: false,
+        };
+        let mut sink = backend()
+            .write_with(&Location::local(&path), options)
+            .await
+            .unwrap();
+        sink.send(vec![1, 2, 3]).await.unwrap();
+        sink.send(vec![4]).await.unwrap();
+        sink.close().await.unwrap();
+        // No polling: `close` resolved, so the bytes are there.
+        assert_eq!(std::fs::read(&path).unwrap(), vec![1, 2, 3, 4]);
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn same_file_sees_hard_links_symlinks_and_symlinked_folders() {
+        let dir = tempdir();
+        let file = dir.join("file");
+        let other = dir.join("other");
+        std::fs::write(&file, b"a").unwrap();
+        std::fs::write(&other, b"a").unwrap();
+        std::fs::hard_link(&file, dir.join("hard")).unwrap();
+        std::os::unix::fs::symlink(&file, dir.join("soft")).unwrap();
+        std::os::unix::fs::symlink(&dir, dir.join("via")).unwrap();
+        let at = |name: &str| Location::local(dir.join(name));
+        let b = backend();
+        assert_eq!(b.same_file(&at("file"), &at("file")).await, Ok(true));
+        assert_eq!(b.same_file(&at("file"), &at("hard")).await, Ok(true));
+        assert_eq!(b.same_file(&at("file"), &at("soft")).await, Ok(true));
+        assert_eq!(b.same_file(&at("file"), &at("via/file")).await, Ok(true));
+        assert_eq!(b.same_file(&at("file"), &at("other")).await, Ok(false));
+        // Missing on one side: not the same, and no error.
+        assert_eq!(b.same_file(&at("file"), &at("missing")).await, Ok(false));
+        // A dangling symlink can't be the file either.
+        std::os::unix::fs::symlink(dir.join("gone"), dir.join("dangling")).unwrap();
+        assert_eq!(b.same_file(&at("file"), &at("dangling")).await, Ok(false));
+        // A symlink loop can't be examined: an error, not a guess.
+        std::os::unix::fs::symlink(dir.join("loop"), dir.join("loop")).unwrap();
+        assert!(b.same_file(&at("file"), &at("loop")).await.is_err());
+        cleanup(dir);
+    }
+
     #[tokio::test]
     async fn a_write_that_fails_part_way_is_reported_by_close() {
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
-        let join = tokio::task::spawn_blocking(move || write_chunks(FailsAfter { ok: 1 }, &mut rx));
+        let join =
+            tokio::task::spawn_blocking(move || write_chunks(FailsAfter { ok: 1 }, &mut rx, false));
         let mut sink = WriterSink {
             tx,
             join: Some(join),
@@ -1239,7 +1486,7 @@ mod tests {
         tx.try_send(vec![3]).expect("send");
         drop(tx);
         let mut out = Vec::new();
-        write_chunks(&mut out, &mut rx).expect("ok");
+        write_chunks(&mut out, &mut rx, true).expect("ok");
         assert_eq!(out, vec![1, 2, 3]);
     }
 }

@@ -111,6 +111,15 @@ progress-moving-named = Moving { $name }… { $done } of { $total }
 progress-downloading = Downloading… { $done } of { $total }
 progress-downloading-named = Downloading { $name }… { $done } of { $total }
 
+# Reasons for an Overwrite on a server that can't replace a file in one
+# step (src/core/fs/ops.rs, `place_over`). `$new` and `$old` are temporary
+# file names in the destination folder.
+copy-replace-stranded = the new copy couldn't be put in place; it is saved as “{ $new }”, and the file it was replacing as “{ $old }”
+# A Move that can't tell whether the source is the destination file itself
+# (src/core/fs/ops.rs); `$reason` is why the check failed.
+copy-identity-unknown = it couldn't be checked whether this is the same file as the one already there, so it was left where it is ({ $reason })
+copy-replaced-file-kept =the copy is in place, but the file it replaced couldn't be removed and is still there as “{ $old }”
+
 ## Opening a file that has no local path (a downloaded read-only copy)
 
 notice-opened-copy = Opened a read-only copy of “{ $name }” — changes won't be saved to the server.
