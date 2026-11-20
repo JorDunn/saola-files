@@ -55,13 +55,17 @@
 //! # Partial failure
 //!
 //! The executor stops at the first failed step and **rolls back** every step
-//! it had completed (in reverse), so a failure normally leaves the folder
-//! exactly as it was and there is nothing to undo. If a rollback step itself
-//! fails, that item stays under whatever name it has at that moment;
-//! [`ApplyReport::moved`] lists exactly the items that are not under their
-//! original name (current name, original name), so the undo entry the caller
-//! pushes restores precisely what changed, and [`ApplyReport::stuck`] says
-//! which rollback steps failed.
+//! it had completed (in reverse), through the same checked rename the forward
+//! steps use, so a failure normally leaves the folder exactly as it was and
+//! there is nothing to undo. The rollback **stops at the first step it cannot
+//! undo** (never carrying on past a stuck step, which could replace the item
+//! still sitting there). The report then says exactly where everything is:
+//! [`ApplyReport::moved`] lists the items not under their original name
+//! (current name, original name; the undo entry covers exactly these),
+//! [`ApplyReport::parked`] those stranded under a temporary name, and
+//! [`ApplyReport::stuck`] the step that could not be undone. A batch that is
+//! interrupted by the app exiting can likewise leave a `.saola-tmp-N` behind
+//! with no undo entry; the next batch skips over leftover temp names.
 //!
 //! # Case-only renames
 //!
@@ -619,6 +623,8 @@ impl Plan {
 /// One `rename` call: names within the folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
+    /// Which of the input moves (by position) this step belongs to.
+    pub item: usize,
     pub from: OsString,
     pub to: OsString,
 }
@@ -657,45 +663,51 @@ impl TempNames {
 /// Orders `moves` (`(from, to)` name pairs) into steps that never rename
 /// onto a name that is still occupied, parking one item under a temporary
 /// name for each cycle. `taken` is every name currently in the folder (used
-/// only to pick temp names that don't collide).
+/// only to pick temp names that don't collide, so leftover `.saola-tmp-N`
+/// files from an interrupted batch are simply skipped over).
 ///
 /// Requires unique `from`s and unique `to`s, which [`Plan`] validation
-/// guarantees. Identity moves (`from == to`) are dropped.
+/// guarantees. Identity moves (`from == to`) are dropped. Linear in the
+/// number of moves (a chain of 50 000 is fine).
 pub fn schedule(moves: &[(OsString, OsString)], taken: &HashSet<OsString>) -> Vec<Step> {
-    let moves: Vec<(OsString, OsString)> = moves
-        .iter()
-        .filter(|(from, to)| from != to)
-        .cloned()
-        .collect();
-    let by_from: HashMap<&OsStr, usize> = moves
+    // (input position, from, to) for every real move.
+    let kept: Vec<(usize, &OsString, &OsString)> = moves
         .iter()
         .enumerate()
-        .map(|(i, (from, _))| (from.as_os_str(), i))
+        .filter(|(_, (from, to))| from != to)
+        .map(|(i, (from, to))| (i, from, to))
         .collect();
-    // The move that must happen *before* move `i`: the one whose source is
-    // the name `i` wants to take over.
-    let blocker = |i: usize| -> Option<usize> {
-        moves
-            .get(i)
-            .and_then(|(_, to)| by_from.get(to.as_os_str()).copied())
+    let by_from: HashMap<&OsStr, usize> = kept
+        .iter()
+        .enumerate()
+        .map(|(k, (_, from, _))| (from.as_os_str(), k))
+        .collect();
+    // The move that must happen *before* move `k`: the one whose source is
+    // the name `k` wants to take over.
+    let blocker = |k: usize| -> Option<usize> {
+        kept.get(k)
+            .and_then(|(_, _, to)| by_from.get(to.as_os_str()).copied())
     };
-    let step = |i: usize| -> Option<Step> {
-        moves.get(i).map(|(from, to)| Step {
-            from: from.clone(),
-            to: to.clone(),
+    let step = |k: usize| -> Option<Step> {
+        kept.get(k).map(|(item, from, to)| Step {
+            item: *item,
+            from: (*from).clone(),
+            to: (*to).clone(),
         })
     };
 
-    let mut temps = TempNames::new(taken, &moves);
+    let mut temps = TempNames::new(taken, moves);
     let mut done: HashSet<usize> = HashSet::new();
     let mut steps = Vec::new();
 
-    for start in 0..moves.len() {
+    for start in 0..kept.len() {
         if done.contains(&start) {
             continue;
         }
         // Follow "must go first" links until something is free to move.
+        // `on_path` mirrors `path` as a set so the repeat check is O(1).
         let mut path = vec![start];
+        let mut on_path: HashSet<usize> = HashSet::from([start]);
         let mut is_cycle = false;
         while let Some(&last) = path.last() {
             match blocker(last) {
@@ -710,8 +722,11 @@ pub fn schedule(moves: &[(OsString, OsString)], taken: &HashSet<OsString>) -> Ve
                 // targets, which validation rules out. Stop rather than
                 // loop forever; `apply`'s per-step check still refuses to
                 // overwrite anything.
-                Some(next) if path.contains(&next) => break,
-                Some(next) => path.push(next),
+                Some(next) if on_path.contains(&next) => break,
+                Some(next) => {
+                    path.push(next);
+                    on_path.insert(next);
+                }
             }
         }
 
@@ -723,23 +738,25 @@ pub fn schedule(moves: &[(OsString, OsString)], taken: &HashSet<OsString>) -> Ve
             let Some(first) = step(*head) else { continue };
             let temp = temps.next();
             steps.push(Step {
+                item: first.item,
                 from: first.from,
                 to: temp.clone(),
             });
-            for &i in rest.iter().rev() {
-                steps.extend(step(i));
-                done.insert(i);
+            for &k in rest.iter().rev() {
+                steps.extend(step(k));
+                done.insert(k);
             }
             steps.push(Step {
+                item: first.item,
                 from: temp,
                 to: first.to,
             });
             done.insert(*head);
         } else {
             // The far end of the chain is free: move it first, then back up.
-            for &i in path.iter().rev() {
-                steps.extend(step(i));
-                done.insert(i);
+            for &k in path.iter().rev() {
+                steps.extend(step(k));
+                done.insert(k);
             }
         }
     }
@@ -762,18 +779,31 @@ pub struct StepFailure {
 pub struct ApplyReport {
     /// Items now under a name other than their original, as
     /// `(current name, original name)`. After a success: every item. After a
-    /// failure that rolled back cleanly: empty. This is exactly what an undo
-    /// entry must restore.
+    /// failure that rolled back cleanly: empty. Current names are always
+    /// distinct. This is exactly what an undo entry must restore.
     pub moved: Vec<(OsString, OsString)>,
+    /// The subset of `moved` that is stranded under a temporary
+    /// `.saola-tmp-N` name (a stopped rollback), as `(temporary name,
+    /// original name)`. The person can't find these on their own: the
+    /// failure text must name them.
+    pub parked: Vec<(OsString, OsString)>,
     /// The step that stopped the batch, if any.
     pub failure: Option<StepFailure>,
-    /// Rollback steps that failed (those items stay where they ended up and
-    /// are listed in `moved`).
+    /// The rollback step that could not be undone, if any. The rollback
+    /// stops there (see [`apply`]), so there is at most one.
     pub stuck: Vec<StepFailure>,
 }
 
 /// Renames `step.from` to `step.to` in `dir`, refusing to land on a name
 /// that exists (`rename(2)` would silently replace it).
+///
+/// **Residual risk: check-then-rename is not atomic.** A file created at
+/// `step.to` in the window between the `metadata` check and the `rename`
+/// is replaced on the local backend (`rename(2)` overwrites). Plain SFTP v3
+/// `rename` refuses an existing regular file, but servers vary. An atomic
+/// no-replace rename (`renameat2` with `RENAME_NOREPLACE`) is not available
+/// through the `Backend` trait today, and the trait is not changed here.
+/// The check narrows the window to a few microseconds; it does not close it.
 async fn rename_step(backend: &dyn Backend, dir: &Location, step: &Step) -> Result<(), VfsError> {
     let to = dir.join(&step.to);
     // Only a successful stat means "occupied". NotFound is the expected
@@ -816,9 +846,28 @@ fn preflight(
     None
 }
 
+/// A failure for the item behind `step`, named by its original and final
+/// names (never a temporary one).
+fn failure_for(moves: &[(OsString, OsString)], step: &Step, error: VfsError) -> StepFailure {
+    let (name, target) = moves.get(step.item).cloned().unwrap_or_default();
+    StepFailure {
+        name,
+        target,
+        error,
+    }
+}
+
 /// Carries out `moves` (`(old, new)` names in `dir`) as one batch: check,
 /// order ([`schedule`]), run, and on the first failure roll back. See the
 /// module docs, "Partial failure".
+///
+/// The rollback goes through the same checked [`rename_step`] as the forward
+/// steps and **stops at the first step it cannot undo**. Carrying on past a
+/// stuck step would be unsafe: a later reverse step could land on the name
+/// the stuck item is still sitting under and replace it. After a stopped
+/// rollback the report says exactly where everything is: items not in
+/// `moved` are back at their original names, items in `moved` are under a
+/// new name, and the ones in `parked` are under a temporary name.
 pub async fn apply(
     backend: &dyn Backend,
     dir: &Location,
@@ -849,34 +898,24 @@ pub async fn apply(
     }
 
     let steps = schedule(moves, &present);
-    // Where every item is right now: (current name, original name).
-    let mut state: Vec<(OsString, OsString)> = moves
-        .iter()
-        .map(|(from, _)| (from.clone(), from.clone()))
-        .collect();
-    let final_name = |original: &OsStr| -> OsString {
-        moves
-            .iter()
-            .find(|(from, _)| from == original)
-            .map(|(_, to)| to.clone())
-            .unwrap_or_default()
+    // The name each item is under right now, by input position.
+    let mut current: Vec<OsString> = moves.iter().map(|(from, _)| from.clone()).collect();
+    let set_current = |current: &mut Vec<OsString>, item: usize, name: &OsString| {
+        if let Some(slot) = current.get_mut(item) {
+            *slot = name.clone();
+        }
     };
 
-    let mut executed: Vec<&Step> = Vec::new();
+    let mut done = 0;
     let mut failure = None;
     for step in &steps {
         match rename_step(backend, dir, step).await {
             Ok(()) => {
-                executed.push(step);
-                retarget(&mut state, &step.from, &step.to);
+                set_current(&mut current, step.item, &step.to);
+                done += 1;
             }
             Err(error) => {
-                let original = original_of(&state, &step.from);
-                failure = Some(StepFailure {
-                    target: final_name(&original),
-                    name: original,
-                    error,
-                });
+                failure = Some(failure_for(moves, step, error));
                 break;
             }
         }
@@ -884,53 +923,45 @@ pub async fn apply(
 
     let mut stuck = Vec::new();
     if failure.is_some() {
-        // Undo what this batch did, newest first. A raw rename is enough:
-        // each reverse step puts a name back on a spot its forward step just
-        // vacated, so it cannot collide.
-        for step in executed.iter().rev() {
-            let back = backend
-                .rename(&dir.join(&step.to), &dir.join(&step.from))
-                .await;
-            match back {
-                Ok(()) => retarget(&mut state, &step.to, &step.from),
+        // Undo what this batch did, newest first, checking each target.
+        for step in steps.iter().take(done).rev() {
+            let back = Step {
+                item: step.item,
+                from: step.to.clone(),
+                to: step.from.clone(),
+            };
+            match rename_step(backend, dir, &back).await {
+                Ok(()) => set_current(&mut current, back.item, &back.to),
                 Err(error) => {
-                    let original = original_of(&state, &step.to);
-                    stuck.push(StepFailure {
-                        target: final_name(&original),
-                        name: original,
-                        error,
-                    });
+                    stuck.push(failure_for(moves, step, error));
+                    break;
                 }
             }
         }
     }
 
+    // Names a plan item legitimately has; anything else is a temp name.
+    let planned: HashSet<&OsStr> = moves
+        .iter()
+        .flat_map(|(from, to)| [from.as_os_str(), to.as_os_str()])
+        .collect();
+    let mut moved = Vec::new();
+    let mut parked = Vec::new();
+    for (now, (original, _)) in current.iter().zip(moves) {
+        if now != original {
+            moved.push((now.clone(), original.clone()));
+            if !planned.contains(now.as_os_str()) {
+                parked.push((now.clone(), original.clone()));
+            }
+        }
+    }
+
     ApplyReport {
-        moved: state
-            .into_iter()
-            .filter(|(current, original)| current != original)
-            .collect(),
+        moved,
+        parked,
         failure,
         stuck,
     }
-}
-
-/// The item currently called `current` is now called `new`.
-fn retarget(state: &mut [(OsString, OsString)], current: &OsStr, new: &OsStr) {
-    for (name, _) in state.iter_mut() {
-        if name == current {
-            *name = new.to_owned();
-        }
-    }
-}
-
-/// The original name of the item currently called `current`.
-fn original_of(state: &[(OsString, OsString)], current: &OsStr) -> OsString {
-    state
-        .iter()
-        .find(|(name, _)| name == current)
-        .map(|(_, original)| original.clone())
-        .unwrap_or_else(|| current.to_owned())
 }
 
 // ── Undo ───────────────────────────────────────────────────────────────────
@@ -1534,30 +1565,59 @@ mod tests {
 
     // ── executing, against an in-memory backend ─────────────────────────
 
-    /// A folder of names whose `rename` really moves them, failing on chosen
-    /// calls. A rename onto an existing name replaces it (as rename(2)
-    /// does), which shows up as a missing name in the assertions.
+    /// A folder whose `rename` really moves files (with their contents),
+    /// failing on chosen calls. A rename onto an existing name replaces it
+    /// (as rename(2) does) and the replaced contents are gone, which the
+    /// content assertions notice.
     struct MemBackend {
-        names: Mutex<Vec<OsString>>,
+        files: Mutex<HashMap<OsString, String>>,
         calls: Mutex<usize>,
         /// 1-based indexes of `rename` calls that fail.
         fail_calls: Vec<usize>,
+        /// On this `rename` call, first create a file (name, contents): a
+        /// name re-occupied behind the batch's back.
+        plant: Option<(usize, String, String)>,
     }
 
     impl MemBackend {
+        /// Every file's contents are `content of <name>`.
         fn new(names: &[&str], fail_calls: &[usize]) -> Self {
             MemBackend {
-                names: Mutex::new(names.iter().map(|n| os(n)).collect()),
+                files: Mutex::new(
+                    names
+                        .iter()
+                        .map(|n| (os(n), format!("content of {n}")))
+                        .collect(),
+                ),
                 calls: Mutex::new(0),
                 fail_calls: fail_calls.to_vec(),
+                plant: None,
             }
         }
 
         fn names(&self) -> HashSet<OsString> {
-            self.names
+            self.files
                 .lock()
-                .map(|n| n.iter().cloned().collect())
+                .map(|f| f.keys().cloned().collect())
                 .unwrap_or_default()
+        }
+
+        /// Every file's contents, sorted: lets a test assert nothing was lost.
+        fn contents(&self) -> Vec<String> {
+            let mut all: Vec<String> = self
+                .files
+                .lock()
+                .map(|f| f.values().cloned().collect())
+                .unwrap_or_default();
+            all.sort();
+            all
+        }
+
+        fn content_of(&self, name: &str) -> Option<String> {
+            self.files
+                .lock()
+                .ok()
+                .and_then(|f| f.get(&os(name)).cloned())
         }
     }
 
@@ -1591,8 +1651,14 @@ mod tests {
         }
         async fn metadata(&self, location: &Location) -> Result<FileEntry, VfsError> {
             let name = location.path.file_name().map(OsStr::to_os_string);
+            let exists = |name: &OsString| {
+                self.files
+                    .lock()
+                    .map(|f| f.contains_key(name))
+                    .unwrap_or(false)
+            };
             match name {
-                Some(name) if self.names().contains(&name) => Ok(entry(name)),
+                Some(name) if exists(&name) => Ok(entry(name)),
                 _ => Err(VfsError::NotFound {
                     location: location.to_string(),
                 }),
@@ -1613,6 +1679,12 @@ mod tests {
                 *calls += 1;
                 *calls
             };
+            if let Some((at, name, text)) = &self.plant
+                && *at == call
+                && let Ok(mut files) = self.files.lock()
+            {
+                files.insert(os(name), text.clone());
+            }
             if self.fail_calls.contains(&call) {
                 return Err(VfsError::PermissionDenied {
                     location: from.to_string(),
@@ -1621,16 +1693,13 @@ mod tests {
             let (Some(f), Some(t)) = (from.path.file_name(), to.path.file_name()) else {
                 return Err(other("bad path"));
             };
-            let mut names = self.names.lock().unwrap_or_else(|e| e.into_inner());
-            if !names.iter().any(|n| n == f) {
+            let mut files = self.files.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(text) = files.remove(f) else {
                 return Err(VfsError::NotFound {
                     location: from.to_string(),
                 });
-            }
-            names.retain(|n| n != t);
-            if let Some(slot) = names.iter_mut().find(|n| *n == f) {
-                *slot = t.to_os_string();
-            }
+            };
+            files.insert(t.to_os_string(), text);
             Ok(())
         }
         async fn remove(&self, _l: &Location) -> Result<(), VfsError> {
@@ -1723,11 +1792,19 @@ mod tests {
         assert!(report.stuck.is_empty());
     }
 
+    /// Every original content must still exist somewhere in the folder.
+    fn assert_nothing_lost(backend: &MemBackend, start: &[&str]) {
+        let mut expected: Vec<String> = start.iter().map(|n| format!("content of {n}")).collect();
+        expected.sort();
+        assert_eq!(backend.contents(), expected, "a file's contents were lost");
+    }
+
     #[tokio::test]
-    async fn if_rollback_also_fails_the_report_names_exactly_what_changed() {
+    async fn a_stuck_rollback_stops_and_reports_exactly_what_changed() {
         // Forward: a->A (1), b->B (2), c->C (3, fails). Rollback: B->b (4,
-        // fails), A->a (5, ok).
-        let backend = MemBackend::new(&["a", "b", "c"], &[3, 4]);
+        // fails) and the rollback STOPS, so A->a is not attempted.
+        let start = ["a", "b", "c"];
+        let backend = MemBackend::new(&start, &[3, 4]);
         let report = apply(
             &backend,
             &dir(),
@@ -1740,9 +1817,130 @@ mod tests {
         );
         assert_eq!(report.stuck.len(), 1);
         assert_eq!(report.stuck[0].name, os("b"));
-        // Only b is still renamed, and the report says so (current, original).
-        assert_eq!(report.moved, pairs(&[("B", "b")]));
-        assert_eq!(backend.names(), set(&["a", "B", "c"]));
+        // a and b are still under their new names; c never moved.
+        let mut moved = report.moved.clone();
+        moved.sort();
+        assert_eq!(moved, pairs(&[("A", "a"), ("B", "b")]));
+        assert_eq!(backend.names(), set(&["A", "B", "c"]));
+        assert!(report.parked.is_empty());
+        assert_nothing_lost(&backend, &start);
+    }
+
+    #[tokio::test]
+    async fn a_cascade_after_a_stuck_step_never_overwrites_the_stuck_item() {
+        // Chain a->b, b->c plus x->y. Forward: b->c (1), a->b (2), x->y (3,
+        // fails). Rollback: b->a (4, fails). The old code then ran c->b
+        // unchecked, replacing the original `a` still sitting at `b`.
+        let start = ["a", "b", "x"];
+        let backend = MemBackend::new(&start, &[3, 4]);
+        let report = apply(
+            &backend,
+            &dir(),
+            &pairs(&[("a", "b"), ("b", "c"), ("x", "y")]),
+        )
+        .await;
+        assert!(report.failure.is_some());
+        assert_eq!(report.stuck.len(), 1);
+        assert_nothing_lost(&backend, &start);
+        // The original `a` is at `b`, the original `b` at `c`; x untouched.
+        assert_eq!(backend.content_of("b"), Some("content of a".into()));
+        assert_eq!(backend.content_of("c"), Some("content of b".into()));
+        assert_eq!(backend.content_of("x"), Some("content of x".into()));
+        let mut moved = report.moved.clone();
+        moved.sort();
+        assert_eq!(moved, pairs(&[("b", "a"), ("c", "b")]));
+    }
+
+    #[tokio::test]
+    async fn a_cycle_with_a_stuck_rollback_leaves_the_parked_item_named_and_safe() {
+        // Swap a<->b plus x->y. Forward: a->tmp (1), b->a (2), tmp->b (3,
+        // fails). Rollback: a->b (4, fails) and stops; the old code then ran
+        // tmp->a over the item now at `a`.
+        let start = ["a", "b", "x"];
+        let backend = MemBackend::new(&start, &[3, 4]);
+        let report = apply(
+            &backend,
+            &dir(),
+            &pairs(&[("a", "b"), ("b", "a"), ("x", "y")]),
+        )
+        .await;
+        assert!(report.failure.is_some());
+        assert_nothing_lost(&backend, &start);
+        // The original `a` is parked under the temp name, and says so.
+        assert_eq!(report.parked, pairs(&[(".saola-tmp-1", "a")]));
+        assert_eq!(
+            backend.content_of(".saola-tmp-1"),
+            Some("content of a".into())
+        );
+        // The original `b` is at `a`.
+        assert_eq!(backend.content_of("a"), Some("content of b".into()));
+        let mut moved = report.moved.clone();
+        moved.sort();
+        assert_eq!(moved, pairs(&[(".saola-tmp-1", "a"), ("a", "b")]));
+        // No two items are recorded under the same current name.
+        let currents: HashSet<_> = report.moved.iter().map(|(c, _)| c.clone()).collect();
+        assert_eq!(currents.len(), report.moved.len());
+    }
+
+    #[tokio::test]
+    async fn a_name_re_occupied_before_rollback_is_not_replaced() {
+        // a->A (1), b->B (2), c->C (3, fails). During call 3 something
+        // creates a new `a`. Rolling back A->a must refuse, not replace it.
+        let start = ["a", "b", "c"];
+        let mut backend = MemBackend::new(&start, &[3]);
+        backend.plant = Some((3, "a".into(), "intruder".into()));
+        let report = apply(
+            &backend,
+            &dir(),
+            &pairs(&[("a", "A"), ("b", "B"), ("c", "C")]),
+        )
+        .await;
+        assert!(report.failure.is_some());
+        assert_eq!(report.stuck.len(), 1);
+        assert!(matches!(
+            report.stuck[0].error,
+            VfsError::AlreadyExists { .. }
+        ));
+        assert_eq!(backend.content_of("a"), Some("intruder".into()));
+        assert_eq!(backend.content_of("A"), Some("content of a".into()));
+        // b's rollback came first (newest first) and succeeded.
+        assert_eq!(backend.content_of("b"), Some("content of b".into()));
+        assert_eq!(report.moved, pairs(&[("A", "a")]));
+    }
+
+    #[tokio::test]
+    async fn leftover_temp_names_from_an_interrupted_batch_are_tolerated() {
+        let backend = MemBackend::new(&["a", "b", ".saola-tmp-1", ".saola-tmp-2"], &[]);
+        let report = apply(&backend, &dir(), &pairs(&[("a", "b"), ("b", "a")])).await;
+        assert_eq!(report.failure, None);
+        assert_eq!(backend.content_of("a"), Some("content of b".into()));
+        assert_eq!(backend.content_of("b"), Some("content of a".into()));
+        // The leftovers are untouched.
+        assert!(backend.names().contains(&os(".saola-tmp-1")));
+        assert!(backend.names().contains(&os(".saola-tmp-2")));
+    }
+
+    #[tokio::test]
+    async fn a_fifty_thousand_item_chain_schedules_and_applies() {
+        // "Shift numbering by one": n0->n1, n1->n2, ... one long chain.
+        const N: usize = 50_000;
+        let names: Vec<String> = (0..=N).map(|i| format!("n{i}")).collect();
+        let moves: Vec<(OsString, OsString)> =
+            (0..N).map(|i| (os(&names[i]), os(&names[i + 1]))).collect();
+        let taken: HashSet<OsString> = names.iter().take(N).map(|n| os(n)).collect();
+
+        let steps = schedule(&moves, &taken);
+        assert_eq!(steps.len(), N, "a chain needs no temp name");
+        // The far end moves first.
+        assert_eq!(steps[0].from, os(&names[N - 1]));
+
+        let refs: Vec<&str> = names.iter().take(N).map(String::as_str).collect();
+        let backend = MemBackend::new(&refs, &[]);
+        let report = apply(&backend, &dir(), &moves).await;
+        assert_eq!(report.failure, None);
+        assert_eq!(report.moved.len(), N);
+        assert_eq!(backend.names().len(), N);
+        assert_eq!(backend.content_of("n1"), Some("content of n0".into()));
     }
 
     #[tokio::test]

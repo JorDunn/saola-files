@@ -5,6 +5,7 @@
 //! collision with them). The dialog and the renaming live in
 //! `ui::dialogs::bulk_rename` and `app::bulk_rename`.
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 
 use crate::core::vfs::Location;
@@ -39,10 +40,13 @@ impl DirectoryView {
         if selected.len() < 2 {
             return None;
         }
+        // A set, not `selected.contains`: that is a linear scan per entry,
+        // which freezes the UI thread with a 100 000-item selection.
+        let chosen: HashSet<&OsString> = selected.iter().collect();
         let others = self
             .entries
             .iter()
-            .filter(|entry| !selected.contains(&entry.name))
+            .filter(|entry| !chosen.contains(&entry.name))
             .map(|entry| entry.name.clone())
             .collect();
         Some(Event::BulkRenameRequested(BulkRenameRequest {

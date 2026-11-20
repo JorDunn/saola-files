@@ -387,6 +387,9 @@ pub(crate) struct App {
     /// gets to do anything else with it.
     activation: cli::Cli,
     // --- features (alphabetical) ---
+    /// A bulk-rename batch is running (set on Apply, cleared when it
+    /// finishes). Counts as busy for a second batch and for paste.
+    bulk_rename_running: bool,
     /// The bulk-rename dialog currently showing, if any. A modal: listed
     /// in [`App::keyboard_target`].
     pending_bulk_rename: Option<PendingBulkRename>,
@@ -516,6 +519,7 @@ impl App {
             pending_connect: None,
             activation,
             // --- features (alphabetical) ---
+            bulk_rename_running: false,
             pending_bulk_rename: None,
             error_notice: ui::dialogs::error_notice::Slot::default(),
             free_space: statusbar::FreeSpace::default(),
@@ -1016,6 +1020,29 @@ mod tests {
         // Cancel closes it and the view gets its keys back.
         let _ = app.handle_bulk_rename_message(ui::dialogs::bulk_rename::Message::CancelRequested);
         assert_eq!(app.keyboard_target(), KeyboardTarget::FocusedView);
+    }
+
+    #[test]
+    fn a_second_bulk_rename_is_refused_while_one_is_running() {
+        let mut app = app();
+        app.bulk_rename_running = true;
+        let _ = app.open_bulk_rename(bulk_request());
+        assert!(app.pending_bulk_rename.is_none());
+        assert!(app.error_notice.is_showing());
+        // And a paste is refused while the batch runs.
+        let _ = app.submit_paste_op(
+            ops::OpKind::Copy,
+            vec![Location::local("/tmp/a")],
+            Location::local("/tmp"),
+        );
+        assert!(app.active_op.is_none());
+        // Finishing the batch clears the flag.
+        let _ = app.handle_bulk_rename_done(
+            core::failure::Incident::mint(),
+            Location::local("/tmp"),
+            core::fs::bulk_rename::ApplyReport::default(),
+        );
+        assert!(!app.bulk_rename_running);
     }
 
     #[test]

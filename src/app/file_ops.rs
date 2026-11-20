@@ -209,7 +209,8 @@ impl App {
         sources: Vec<Location>,
         dest_dir: Location,
     ) -> Task<Message> {
-        if self.active_op.is_some() || sources.is_empty() {
+        // A running bulk rename is busy too (same folder, same names).
+        if self.active_op.is_some() || self.bulk_rename_running || sources.is_empty() {
             return Task::none();
         }
         let id = self.op_ids.alloc();

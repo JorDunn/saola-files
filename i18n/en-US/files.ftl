@@ -219,6 +219,14 @@ bulk-rename-error-stray = A “{"}"}” has no opening “{"{"}”. Write “{"}
 bulk-rename-error-width = “{ $width }” isn't a valid width. Use a number from 1 to 32.
 bulk-rename-error-start = The starting number must be a whole number.
 bulk-rename-cancel = Cancel
+bulk-rename-preview-more =
+    { $count ->
+        [one] and { $count } more item not shown here (it is still checked and renamed)
+       *[other] and { $count } more items not shown here (they are still checked and renamed)
+    }
+bulk-rename-regex-hint = In the replacement, ${"{"}name{"}"} or $1 inserts a matched group. Write ${"{"}1{"}"}abc when letters follow the number.
+bulk-rename-parked = it is now stored as “{ $temp }”, a hidden file in the same folder
+bulk-rename-busy = another operation is still running; try again when it has finished
 bulk-rename-operation = renaming items
 bulk-rename-no-backend = nothing is connected for “{ $scheme }” locations
 

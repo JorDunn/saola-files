@@ -42,6 +42,10 @@ impl App {
     /// `Event::BulkRenameRequested`: open the dialog, unless the folder's
     /// backend can't rename in place, in which case say so in words.
     pub(super) fn open_bulk_rename(&mut self, request: BulkRenameRequest) -> Task<Message> {
+        if self.bulk_rename_busy() {
+            self.report_busy(&request);
+            return Task::none();
+        }
         let can_rename = modules::resolve(&request.dir)
             .map(|backend| backend.caps().contains(Caps::RENAME_IN_PLACE))
             .unwrap_or(false);
@@ -64,6 +68,18 @@ impl App {
         focus
     }
 
+    /// Whether a rename batch or an engine copy/move is in flight. The one
+    /// existing "busy" decision is `active_op.is_some()` (see
+    /// `submit_paste_op`); a running batch joins it from the other side.
+    fn bulk_rename_busy(&self) -> bool {
+        self.bulk_rename_running || self.active_op.is_some()
+    }
+
+    fn report_busy(&mut self, request: &BulkRenameRequest) {
+        let name = request.selected.first().cloned().unwrap_or_default();
+        self.report_new(Operation::Rename, vec![busy_failure(name)]);
+    }
+
     /// `Message::BulkRename`: one control changed, or Apply/Cancel.
     pub(super) fn handle_bulk_rename_message(&mut self, message: dialog::Message) -> Task<Message> {
         let Some(pending) = self.pending_bulk_rename.as_mut() else {
@@ -80,6 +96,17 @@ impl App {
             Some(dialog::Outcome::Apply(moves)) => {
                 let dir = pending.dialog.dir().clone();
                 self.pending_bulk_rename = None;
+                // Checked again here: an engine operation can start while
+                // the dialog is open (a D-Bus request, say).
+                if self.bulk_rename_busy() {
+                    let name = moves
+                        .first()
+                        .map(|(old, _)| old.clone())
+                        .unwrap_or_default();
+                    self.report_new(Operation::Rename, vec![busy_failure(name)]);
+                    return Task::none();
+                }
+                self.bulk_rename_running = true;
                 // One incident for the whole batch, minted as it starts.
                 let incident = self.new_incident();
                 Task::perform(run(dir.clone(), moves), move |report| {
@@ -96,6 +123,7 @@ impl App {
         dir: Location,
         report: ApplyReport,
     ) -> Task<Message> {
+        self.bulk_rename_running = false;
         // What changed, if anything, is ONE undo step. After a clean
         // rollback `moved` is empty, so a failed batch leaves no entry.
         if !report.moved.is_empty() {
@@ -161,6 +189,16 @@ impl App {
     }
 }
 
+/// "Couldn't rename “x”: another operation is still running…".
+fn busy_failure(name: OsString) -> Failure {
+    Failure::new(
+        name,
+        VfsError::Other {
+            message: tr!("bulk-rename-busy"),
+        },
+    )
+}
+
 /// Focus the dialog's first field for its current mode (none for Case).
 fn focus_task(dialog: &dialog::BulkRename) -> Task<Message> {
     match dialog.focus_target() {
@@ -173,12 +211,26 @@ fn focus_task(dialog: &dialog::BulkRename) -> Task<Message> {
 /// any rollback step that also failed. Each names the item and the name it
 /// was going to get, never a temporary name.
 fn failures_of(report: &ApplyReport) -> Vec<Failure> {
-    report
+    let steps = report
         .failure
         .iter()
         .chain(report.stuck.iter())
-        .map(|step| Failure::new(step.name.clone(), step.error.clone()).to(step.target.clone()))
-        .collect()
+        .map(|step| Failure::new(step.name.clone(), step.error.clone()).to(step.target.clone()));
+    // An item stranded under a hidden temporary name can't be found by the
+    // person: say where it is. (The name is an argument, never part of the
+    // message text.)
+    let parked = report.parked.iter().map(|(temp, original)| {
+        Failure::new(
+            original.clone(),
+            VfsError::Other {
+                message: tr!(
+                    "bulk-rename-parked",
+                    temp = temp.to_string_lossy().into_owned()
+                ),
+            },
+        )
+    });
+    steps.chain(parked).collect()
 }
 
 /// The batch itself, off the UI thread: resolves the backend and hands the
@@ -218,12 +270,27 @@ mod tests {
             moved: vec![(OsString::from("B"), OsString::from("b"))],
             failure: Some(denied("c", "C")),
             stuck: vec![denied("b", "B")],
+            ..ApplyReport::default()
         };
         let failures = failures_of(&report);
         assert_eq!(failures.len(), 2);
         assert_eq!(failures[0].target, OsString::from("c"));
         assert_eq!(failures[0].destination, Some(OsString::from("C")));
         assert_eq!(failures[1].target, OsString::from("b"));
+    }
+
+    #[test]
+    fn an_item_parked_under_a_temp_name_is_named_in_the_failure_text() {
+        let report = ApplyReport {
+            moved: vec![(OsString::from(".saola-tmp-1"), OsString::from("a"))],
+            parked: vec![(OsString::from(".saola-tmp-1"), OsString::from("a"))],
+            ..ApplyReport::default()
+        };
+        let failures = failures_of(&report);
+        assert_eq!(failures.len(), 1);
+        let sentence = saola_files::core::failure::describe(Operation::Rename, &failures[0]);
+        assert!(sentence.contains("“a”"), "{sentence}");
+        assert!(sentence.contains(".saola-tmp-1"), "{sentence}");
     }
 
     #[test]

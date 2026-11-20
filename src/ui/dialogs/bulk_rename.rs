@@ -408,7 +408,7 @@ fn controls<'a>(t: &'a Theme, dialog: &'a BulkRename) -> Element<'a, Message> {
                     .font(convert::ui_font_regular(t)),
             ]
             .spacing(gap * 2.0);
-            column![
+            let mut fields = column![
                 field(
                     t,
                     tr_static!("bulk-rename-find-placeholder"),
@@ -424,10 +424,13 @@ fn controls<'a>(t: &'a Theme, dialog: &'a BulkRename) -> Element<'a, Message> {
                     Message::ReplaceChanged,
                     false
                 ),
-                toggles,
-            ]
-            .spacing(gap)
-            .into()
+            ];
+            // Regex replacements expand groups; literal ones never do.
+            if dialog.regex {
+                fields = fields.push(hint(t, tr!("bulk-rename-regex-hint")));
+            }
+            fields = fields.push(toggles);
+            fields.spacing(gap).into()
         }
         Mode::Affix => column![
             field(
@@ -537,6 +540,11 @@ fn preview<'a>(t: &'a Theme, dialog: &'a BulkRename) -> Element<'a, Message> {
     )];
     for row_data in dialog.plan.rows.iter().take(PREVIEW_ROWS) {
         rows.push(preview_row(t, row_data));
+    }
+    // Validation covers every item; say so when the list is cut short.
+    let hidden = dialog.plan.rows.len().saturating_sub(PREVIEW_ROWS);
+    if hidden > 0 {
+        rows.push(hint(t, tr!("bulk-rename-preview-more", count = hidden)));
     }
     container(
         scrollable(column(rows).spacing(t.sizes.gap_tight).width(Fill))
