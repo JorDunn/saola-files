@@ -18,13 +18,12 @@
 //! `ui::dialogs::progress` streams in `core::fs::ops`'s copy/move events:
 //! same bounded-bridge-plus-`AtomicBool` shape, different engine.
 //!
-//! **Permissions are read-only.** `core::vfs::Caps::SET_PERMISSIONS` is
-//! still "a future trait method — no backend sets this bit yet" (see that
-//! flag's own doc comment) — there is no `Backend::set_permissions` to call
-//! even if this rendered an editable control. [`Properties::caps`] is
-//! still threaded through (not just discarded) so a future stage that adds
-//! that trait method and flips the bit on a real backend only has to touch
-//! this row's rendering, not invent the plumbing to reach it.
+//! **Permissions are read-only here.** `Backend::set_permissions` exists
+//! and the local and SFTP backends set `core::vfs::Caps::SET_PERMISSIONS`,
+//! but this dialog does not render an editable control yet.
+//! [`Properties::caps`] is still threaded through (not just discarded) so
+//! a later stage only has to touch this row's rendering, not invent the
+//! plumbing to reach it.
 
 use iced::widget::{Space, button, column, container, row, text};
 use iced::{Center, Element, Fill, Length, Subscription};

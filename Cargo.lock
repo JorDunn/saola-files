@@ -4375,6 +4375,7 @@ dependencies = [
  "png 0.18.1",
  "russh",
  "russh-sftp",
+ "rustix 1.1.4",
  "saola-theme",
  "tokio",
  "toml",

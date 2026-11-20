@@ -86,13 +86,16 @@ use russh::keys::{HashAlg, PrivateKeyWithHashAlg};
 use russh_sftp::client::SftpSession;
 use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::client::fs::Metadata;
+use russh_sftp::extensions::Statvfs;
 use russh_sftp::protocol::{FileAttributes, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
 
 use crate::core::fs::entry::{EntryKind, FileEntry};
 use crate::core::remote::{AuthStage, ConnectEvent, ConnectRequest, HostKeyPrompt, PROMPT_TIMEOUT};
-use crate::core::vfs::{Backend, Caps, DirEvent, Location, ReadStream, VfsError, WriteSink};
+use crate::core::vfs::{
+    Backend, Caps, DirEvent, FsStats, Location, ReadStream, VfsError, WriteSink,
+};
 
 /// Default SSH port when the URI/authority didn't specify one — the same
 /// default OpenSSH itself uses.
@@ -139,6 +142,10 @@ pub struct SftpBackend {
     /// struct.
     _session: Arc<client::Handle<ClientHandler>>,
     sftp: Arc<SftpSession>,
+    /// Whether the server offers `statvfs@openssh.com`, probed once in
+    /// [`connect`]. Decides [`Caps::STATFS`]; `caps()` is synchronous, so
+    /// the answer has to be stored, not asked for on each call.
+    statfs: bool,
 }
 
 #[async_trait]
@@ -164,7 +171,14 @@ impl Backend for SftpBackend {
         // `RENAME_IN_PLACE` *is* honest: `SSH_FXP_RENAME` really is one
         // server-side operation, so `core::fs::ops`'s same-backend fast
         // path and `core::fs::undo::can_undo_rename` both apply for free.
-        Caps::RENAME_IN_PLACE
+        // `SET_PERMISSIONS`: `SSH_FXP_SETSTAT` with a permissions
+        // attribute is part of the base protocol, every server has it.
+        // `SYMLINK`: `SSH_FXP_SYMLINK` is base protocol too; a server that
+        // refuses answers `SSH_FX_OP_UNSUPPORTED`, which `sftp_error`
+        // words as `Unsupported`. There is no way to ask in advance.
+        // `STATFS` is the one that is optional: only set when the connect
+        // probe saw `statvfs@openssh.com`.
+        caps_for(self.statfs)
     }
 
     async fn list(&self, location: &Location) -> Result<Vec<FileEntry>, VfsError> {
@@ -327,6 +341,34 @@ impl Backend for SftpBackend {
             .map_err(|err| sftp_error(location, err))
     }
 
+    /// `target` is stored as written. The argument mapping, and why it
+    /// looks reversed, is documented on [`sftp_symlink_args`].
+    async fn symlink(&self, target: &Path, link: &Location) -> Result<(), VfsError> {
+        let (first, second) = sftp_symlink_args(target, link);
+        self.sftp
+            .symlink(first, second)
+            .await
+            .map_err(|err| sftp_error(link, err))
+    }
+
+    async fn set_permissions(&self, location: &Location, mode: u32) -> Result<(), VfsError> {
+        self.sftp
+            .set_metadata(wire_path(location), permissions_attrs(mode))
+            .await
+            .map_err(|err| sftp_error(location, err))
+    }
+
+    async fn statfs(&self, location: &Location) -> Result<FsStats, VfsError> {
+        if !self.statfs {
+            return Err(unsupported("reporting free space"));
+        }
+        match self.sftp.fs_info(wire_path(location)).await {
+            Ok(Some(raw)) => Ok(fs_stats_from(&raw)),
+            Ok(None) => Err(unsupported("reporting free space")),
+            Err(err) => Err(sftp_error(location, err)),
+        }
+    }
+
     /// Always `None` — no `Caps::WATCH` (see [`Self::caps`]).
     fn watch(&self, _location: &Location) -> Option<BoxStream<'static, DirEvent>> {
         None
@@ -367,6 +409,73 @@ fn entry_from_metadata(name: OsString, meta: &Metadata) -> FileEntry {
     }
 }
 
+/// The capability set for a connected server; `statfs` is whether the
+/// connect probe found `statvfs@openssh.com`. Split out of `caps()` so the
+/// rule is testable without a live session.
+fn caps_for(statfs: bool) -> Caps {
+    let mut caps = Caps::RENAME_IN_PLACE | Caps::SET_PERMISSIONS | Caps::SYMLINK;
+    caps.set(Caps::STATFS, statfs);
+    caps
+}
+
+/// The two strings to hand to `SftpSession::symlink(path, target)`, in
+/// that order, so that the target string is the FIRST string on the wire.
+///
+/// Wire fact, read from russh-sftp 2.4.0 source: `symlink(path, target)`
+/// builds `protocol::Symlink { linkpath: path, targetpath: target }`, and
+/// the serializer writes struct fields in declaration order, `linkpath`
+/// then `targetpath`. So the library's parameter named `path` is sent
+/// first, and it is the parameter named `path` that must carry our
+/// *target*. OpenSSH's `sftp-server` (and its own `sftp` client) treat the
+/// first string as the target and the second as the new link, which is the
+/// opposite of the order the protocol draft names them in. Getting this
+/// wrong silently creates a link at the target's path.
+///
+/// Re-verify against the serializer on any russh-sftp upgrade; the test
+/// `symlink_target_string_precedes_the_link_string_on_the_wire` pins it.
+fn sftp_symlink_args(target: &Path, link: &Location) -> (String, String) {
+    (target.to_string_lossy().into_owned(), wire_path(link))
+}
+
+fn unsupported(operation: &str) -> VfsError {
+    VfsError::Unsupported {
+        operation: operation.to_owned(),
+    }
+}
+
+/// A setstat that changes only the permission bits (`0o7777`).
+fn permissions_attrs(mode: u32) -> FileAttributes {
+    FileAttributes {
+        permissions: Some(mode & 0o7777),
+        ..FileAttributes::default()
+    }
+}
+
+/// `statvfs@openssh.com` counts blocks of `fragment_size` bytes (the same
+/// meaning as POSIX `f_frsize`); saturating so a bogus reply cannot panic.
+fn fs_stats_from(raw: &Statvfs) -> FsStats {
+    let unit = raw.fragment_size;
+    FsStats {
+        total: raw.blocks.saturating_mul(unit),
+        free: raw.blocks_free.saturating_mul(unit),
+        available: raw.blocks_avail.saturating_mul(unit),
+    }
+}
+
+/// Whether the connect-time `fs_info` probe means the server speaks
+/// `statvfs@openssh.com`. `Ok(None)` is the library's "extension not
+/// offered"; a status error (say, permission denied on the probe path)
+/// still proves the server understood the request, except
+/// `OP_UNSUPPORTED`, which says it did not; a transport error proves
+/// nothing, so it counts as unsupported.
+fn statfs_probe_supported(probe: &Result<Option<Statvfs>, SftpError>) -> bool {
+    match probe {
+        Ok(reply) => reply.is_some(),
+        Err(SftpError::Status(status)) => status.status_code != StatusCode::OpUnsupported,
+        Err(_) => false,
+    }
+}
+
 fn system_time_to_u32(time: SystemTime) -> Option<u32> {
     time.duration_since(UNIX_EPOCH)
         .ok()
@@ -387,6 +496,9 @@ fn sftp_error(location: &Location, err: SftpError) -> VfsError {
             },
             StatusCode::PermissionDenied => VfsError::PermissionDenied {
                 location: location.to_string(),
+            },
+            StatusCode::OpUnsupported => VfsError::Unsupported {
+                operation: "that operation".to_owned(),
             },
             StatusCode::NoConnection | StatusCode::ConnectionLost => VfsError::Unavailable {
                 message: format!("{location}: the connection to the server was lost"),
@@ -830,9 +942,14 @@ pub(crate) async fn connect(
             message: format!("sftp subsystem on {host} failed to start: {err}"),
         })?;
 
+    // One cheap round trip to learn whether `statvfs@openssh.com` works;
+    // the home directory (`.`) is a path every account can stat.
+    let statfs = statfs_probe_supported(&sftp.fs_info(".").await);
+
     Ok(SftpBackend {
         _session: Arc::new(session),
         sftp: Arc::new(sftp),
+        statfs,
     })
 }
 
@@ -953,5 +1070,114 @@ mod tests {
     fn system_time_to_u32_is_none_before_the_epoch() {
         let time = UNIX_EPOCH - Duration::from_secs(1);
         assert_eq!(system_time_to_u32(time), None);
+    }
+
+    // ── symlink / set_permissions / statfs helpers ──────────────────────
+
+    #[test]
+    fn caps_include_statfs_only_when_the_server_offered_it() {
+        let with = caps_for(true);
+        let without = caps_for(false);
+        assert!(with.contains(Caps::STATFS));
+        assert!(!without.contains(Caps::STATFS));
+        for caps in [with, without] {
+            assert!(caps.contains(Caps::SYMLINK));
+            assert!(caps.contains(Caps::SET_PERMISSIONS));
+            assert!(caps.contains(Caps::RENAME_IN_PLACE));
+        }
+    }
+
+    #[test]
+    fn permissions_attrs_sets_only_the_permission_bits() {
+        let attrs = permissions_attrs(0o100_755);
+        assert_eq!(attrs.permissions, Some(0o755));
+        assert_eq!(attrs.atime, None);
+        assert_eq!(attrs.mtime, None);
+        assert_eq!(attrs.size, None);
+    }
+
+    #[test]
+    fn fs_stats_multiply_blocks_by_the_fragment_size() {
+        let raw = Statvfs {
+            block_size: 4096,
+            fragment_size: 1024,
+            blocks: 1000,
+            blocks_free: 400,
+            blocks_avail: 300,
+            inodes: 0,
+            inodes_free: 0,
+            inodes_avail: 0,
+            fs_id: 0,
+            flags: 0,
+            name_max: 255,
+        };
+        assert_eq!(
+            fs_stats_from(&raw),
+            FsStats {
+                total: 1_024_000,
+                free: 409_600,
+                available: 307_200,
+            }
+        );
+    }
+
+    #[test]
+    fn probe_means_supported_for_a_reply_or_a_status_error_only() {
+        use russh_sftp::protocol::Status;
+        assert!(!statfs_probe_supported(&Ok(None)));
+        let status = SftpError::Status(Status {
+            id: 1,
+            status_code: StatusCode::PermissionDenied,
+            error_message: String::new(),
+            language_tag: String::new(),
+        });
+        assert!(statfs_probe_supported(&Err(status)));
+        assert!(!statfs_probe_supported(&Err(SftpError::IO(
+            "reset".to_owned()
+        ))));
+        let unsupported = SftpError::Status(Status {
+            id: 1,
+            status_code: StatusCode::OpUnsupported,
+            error_message: String::new(),
+            language_tag: String::new(),
+        });
+        assert!(!statfs_probe_supported(&Err(unsupported)));
+    }
+
+    #[test]
+    fn symlink_target_string_precedes_the_link_string_on_the_wire() {
+        use russh_sftp::protocol::Symlink;
+        let (first, second) = sftp_symlink_args(
+            Path::new("the-target"),
+            &Location::parse("sftp://jordan@host/dir/the-link"),
+        );
+        // Built exactly as russh-sftp 2.4.0's `RawSftpSession::symlink`
+        // does: first parameter -> `linkpath`, second -> `targetpath`.
+        let packet = Symlink {
+            id: 7,
+            linkpath: first,
+            targetpath: second,
+        };
+        let bytes = russh_sftp::ser::to_bytes(&packet).unwrap();
+        let find = |needle: &[u8]| bytes.windows(needle.len()).position(|w| w == needle);
+        let target_at = find(b"the-target").unwrap();
+        let link_at = find(b"/dir/the-link").unwrap();
+        assert!(target_at < link_at, "target must be sent first");
+    }
+
+    #[test]
+    fn sftp_error_words_op_unsupported_as_unsupported() {
+        use russh_sftp::protocol::Status;
+        let location = Location::parse("sftp://jordan@host/x");
+        let err = SftpError::Status(Status {
+            id: 1,
+            status_code: StatusCode::OpUnsupported,
+            error_message: String::new(),
+            language_tag: String::new(),
+        });
+        assert!(matches!(
+            sftp_error(&location, err),
+            VfsError::Unsupported { .. }
+        ));
     }
 }
