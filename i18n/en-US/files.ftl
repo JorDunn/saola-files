@@ -52,6 +52,7 @@ error-no-backend = no backend for scheme "{ $scheme }"
 error-create-failed = creating { $location } failed
 error-trash-internal = internal error talking to the trash: { $detail }
 error-op-busy = another file operation is still running
+error-too-deep = this folder is nested too deeply to delete safely, so it was left alone
 error-unsafe-entry-name = a folder entry has a name that cannot be used safely, so it was skipped
 error-unsupported-trash = moving items to the trash
 

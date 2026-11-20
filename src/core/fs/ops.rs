@@ -471,6 +471,16 @@ async fn execute(request: OpRequest, mut tx: mpsc::Sender<OpEvent>) {
 /// bound.
 const MAX_KEPT_FAILURES: usize = 32;
 
+/// How deep the walk and the pre-scan will go. Both recurse through boxed
+/// futures, and polling a chain of nested futures uses real stack: roughly
+/// a few hundred bytes to a kilobyte per level in a debug build, on a tokio
+/// worker thread whose stack is 2 MiB. 512 levels stays well inside that,
+/// and is far deeper than real trees (a path is limited to 4096 bytes, and
+/// even `node_modules` rarely passes 50 levels). A hostile server serving
+/// an endless `a/a/a/...` chain must hit a worded failure, not a stack
+/// overflow that aborts the process.
+const MAX_WALK_DEPTH: usize = 512;
+
 /// True for a directory-entry name that must never be joined onto a path:
 /// empty (re-enters the same directory forever), `.` / `..` (escape or
 /// loop), or containing a `/` (an absolute name makes `Path::join` replace
@@ -611,7 +621,7 @@ where
         for source in &request.sources {
             if let Some(backend) = resolve(source) {
                 total +=
-                    count_removal_items(backend.as_ref(), source.clone(), None, &request.cancel)
+                    count_removal_items(backend.as_ref(), source.clone(), None, &request.cancel, 0)
                         .await;
             }
         }
@@ -648,7 +658,7 @@ where
                 )
                 .await
             }
-            _ => remove_tree(&mut state, backend.as_ref(), source, None).await,
+            _ => remove_tree(&mut state, backend.as_ref(), source, None, 0).await,
         }
     }
 
@@ -729,15 +739,21 @@ fn is_real_directory(entry: &crate::core::fs::entry::FileEntry) -> bool {
 /// item (unlinked, if it is a link). That check is the whole defence against
 /// following a link out of the tree.
 ///
-/// Residual risk: between that check and the `list` call another process
-/// could still swap the directory for a link. The window is the length of
-/// one round trip, as it was for the pre-engine recursive delete; closing it
-/// needs `openat`-style descent, which the `Backend` trait does not offer.
+/// Residual risk, stated plainly: every location is a full path, so the
+/// check above protects only the instant it runs. If another process swaps
+/// *any* directory inside the tree (not just the one being examined) for a
+/// symlink while the walk is still working below it, every later lstat and
+/// unlink under that path resolves through the link, and files outside the
+/// tree can be removed. `main` had the same exposure before this engine
+/// (`trash::delete_permanently` walked paths the same way). Closing it needs
+/// fd-relative descent (`openat` / `unlinkat`), which the `Backend` trait
+/// does not offer.
 fn remove_tree<'a>(
     state: &'a mut RemovalState,
     backend: &'a dyn Backend,
     location: Location,
     listed_as_dir: Option<bool>,
+    depth: usize,
 ) -> BoxFuture<'a, ()> {
     // Async fns cannot call themselves directly; boxing the future is the
     // standard workaround (same as `copy_item`).
@@ -761,6 +777,17 @@ fn remove_tree<'a>(
         };
 
         if descend {
+            if depth >= MAX_WALK_DEPTH {
+                // Leave this directory (and so every ancestor, which now
+                // has a surviving child) alone, and say why.
+                state.fail(
+                    location,
+                    VfsError::Other {
+                        message: crate::tr!("error-too-deep"),
+                    },
+                );
+                return;
+            }
             let failures_before = state.failure_count();
             let children = match backend.list(&location).await {
                 Ok(children) => children,
@@ -779,7 +806,7 @@ fn remove_tree<'a>(
                 }
                 let child_location = location.join(&child.name);
                 let as_dir = child.kind == EntryKind::Directory;
-                remove_tree(state, backend, child_location, Some(as_dir)).await;
+                remove_tree(state, backend, child_location, Some(as_dir), depth + 1).await;
             }
             // If something inside could not go, removing the directory
             // would only fail again with a misleading "not empty".
@@ -805,6 +832,7 @@ fn count_removal_items<'a>(
     location: Location,
     listed_as_dir: Option<bool>,
     cancel: &'a AtomicBool,
+    depth: usize,
 ) -> BoxFuture<'a, usize> {
     Box::pin(async move {
         if cancel.load(Ordering::Relaxed) {
@@ -819,7 +847,9 @@ fn count_removal_items<'a>(
             }
         };
         let mut total = 1;
-        if descend {
+        // Past the limit the walk reports the directory as a failure, so
+        // there is nothing more to count.
+        if descend && depth < MAX_WALK_DEPTH {
             let Ok(children) = backend.list(&location).await else {
                 return total;
             };
@@ -832,6 +862,7 @@ fn count_removal_items<'a>(
                     location.join(&child.name),
                     Some(child.kind == EntryKind::Directory),
                     cancel,
+                    depth + 1,
                 )
                 .await;
             }
@@ -1818,7 +1849,9 @@ mod tests {
         phantoms: BTreeMap<PathBuf, Vec<OsString>>,
         /// `(parent, child)`: after `list(parent)` answers, `child` becomes
         /// a symlink (a swap racing the walk).
-        swap_after_list: Vec<(PathBuf, PathBuf)>,
+        swap_after_list: Vec<(PathBuf, PathBuf, usize)>,
+        /// Every directory has one child directory `a`, forever.
+        endless: bool,
         /// After this many successful removals, flip the flag.
         cancel_after: Option<(usize, Arc<AtomicBool>)>,
     }
@@ -1872,12 +1905,14 @@ mod tests {
                 .push(OsString::from(std::ffi::OsStr::from_bytes(name)));
             self
         }
-        fn swapping(self, parent: &str, child: &str) -> Self {
-            self.state
-                .lock()
-                .unwrap()
-                .swap_after_list
-                .push((PathBuf::from(parent), PathBuf::from(child)));
+        /// After the `nth` (1-based) `list` of `parent` answers, `child`
+        /// becomes a symlink.
+        fn swapping(self, parent: &str, child: &str, nth: usize) -> Self {
+            self.state.lock().unwrap().swap_after_list.push((
+                PathBuf::from(parent),
+                PathBuf::from(child),
+                nth,
+            ));
             self
         }
         fn listed(&self) -> Vec<PathBuf> {
@@ -1917,6 +1952,16 @@ mod tests {
         async fn list(&self, location: &Location) -> Result<Vec<FileEntry>, VfsError> {
             let mut state = self.state.lock().unwrap();
             state.listed.push(location.path.clone());
+            if state.endless {
+                return Ok(vec![FileEntry {
+                    name: OsString::from("a"),
+                    kind: EntryKind::Directory,
+                    size: 0,
+                    modified: None,
+                    is_symlink: false,
+                    mode: None,
+                }]);
+            }
             let mut entries: Vec<FileEntry> = state
                 .nodes
                 .iter()
@@ -1952,11 +1997,16 @@ mod tests {
                     mode: None,
                 });
             }
+            let times_listed = state
+                .listed
+                .iter()
+                .filter(|path| **path == location.path)
+                .count();
             let swaps: Vec<PathBuf> = state
                 .swap_after_list
                 .iter()
-                .filter(|(parent, _)| *parent == location.path)
-                .map(|(_, child)| child.clone())
+                .filter(|(parent, _, nth)| *parent == location.path && *nth == times_listed)
+                .map(|(_, child, _)| child.clone())
                 .collect();
             for child in swaps {
                 if let Some(node) = state.nodes.get_mut(&child) {
@@ -1967,6 +2017,16 @@ mod tests {
         }
         async fn metadata(&self, location: &Location) -> Result<FileEntry, VfsError> {
             let state = self.state.lock().unwrap();
+            if state.endless {
+                return Ok(FileEntry {
+                    name: OsString::from("a"),
+                    kind: EntryKind::Directory,
+                    size: 0,
+                    modified: None,
+                    is_symlink: false,
+                    mode: None,
+                });
+            }
             state
                 .nodes
                 .get(&location.path)
@@ -2009,6 +2069,9 @@ mod tests {
         async fn remove(&self, location: &Location) -> Result<(), VfsError> {
             let mut state = self.state.lock().unwrap();
             state.attempted.push(location.path.clone());
+            if state.endless {
+                return Ok(());
+            }
             if state.refuse.contains(&location.path) {
                 return Err(VfsError::PermissionDenied {
                     location: location.to_string(),
@@ -2322,10 +2385,54 @@ mod tests {
             .dir("/t")
             .dir("/t/d")
             .file("/t/d/secret")
-            .swapping("/t", "/t/d");
+            // The 2nd list of `/t` is the walk's (the 1st is the pre-scan's),
+            // so only the walk's own lstat-before-descent can save `secret`.
+            .swapping("/t", "/t/d", 2);
         let _ = collect(run_on_tree(&delete_request(vec![fake("/t")]), &tree)).await;
-        assert!(!tree.listed().contains(&PathBuf::from("/t/d")));
+        // `/t/d` was listed once, by the scan (before the swap); the walk
+        // must not have listed it again, nor touched what is inside.
+        let d_lists = tree
+            .listed()
+            .iter()
+            .filter(|path| **path == Path::new("/t/d"))
+            .count();
+        assert_eq!(d_lists, 1, "the walk must not enter the swapped entry");
         assert!(tree.exists("/t/d/secret"));
+        assert!(!tree.attempted().contains(&PathBuf::from("/t/d/secret")));
+    }
+
+    #[tokio::test]
+    async fn an_entry_that_becomes_a_symlink_during_the_pre_scan_is_not_counted_into() {
+        // The 1st list of `/t` is the pre-scan's.
+        let tree = TreeBackend::default()
+            .dir("/t")
+            .dir("/t/d")
+            .file("/t/d/secret")
+            .swapping("/t", "/t/d", 1);
+        let events = collect(run_on_tree(&delete_request(vec![fake("/t")]), &tree)).await;
+        // /t and d only: `secret` was never counted (nor listed).
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, OpEvent::Started { files_total: 2, .. }))
+        );
+        assert!(!tree.listed().contains(&PathBuf::from("/t/d")));
+    }
+
+    #[tokio::test]
+    async fn an_endless_chain_of_directories_stops_at_the_depth_limit() {
+        let tree = TreeBackend::default();
+        tree.state.lock().unwrap().endless = true;
+        let events = collect(run_on_tree(&delete_request(vec![fake("/t")]), &tree)).await;
+
+        // One failure for the directory at the limit; nothing was removed
+        // because every directory above it still has a child.
+        assert_eq!(errors_of(&events).len(), 1);
+        assert!(tree.attempted().is_empty());
+        assert!(
+            tree.listed().len() <= MAX_WALK_DEPTH * 2 + 2,
+            "bounded work"
+        );
     }
 
     #[tokio::test]
