@@ -38,7 +38,11 @@ impl App {
         // also covers the copy-conflict dialog, which this used to miss).
         let keyboard = match self.keyboard_target() {
             // `App::update` routes `Message::Keyboard` to the focused view.
-            KeyboardTarget::FocusedView => iced::keyboard::listen().map(Message::Keyboard),
+            // `NoticeOnly` listens too, but `App::key_route` drops every key
+            // except a bare Esc.
+            KeyboardTarget::FocusedView | KeyboardTarget::NoticeOnly => {
+                iced::keyboard::listen().map(Message::Keyboard)
+            }
             KeyboardTarget::Nobody => Subscription::none(),
         };
 

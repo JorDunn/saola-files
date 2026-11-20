@@ -4,7 +4,8 @@
 //! New Folder that can't be created: each used to print a line to stderr
 //! and nothing else. This notice puts the sentence
 //! (`core::failure::describe`) in the window, and keeps it there until the
-//! person dismisses it (the close button, or Esc via `App`).
+//! person dismisses it (the close button, or Esc via `App`) or a newer
+//! incident replaces it. Navigating does not clear it.
 //!
 //! # Where it sits (the ordering rule)
 //!
@@ -15,14 +16,27 @@
 //! which always stays the bottom-most thing in the window. The
 //! Details list, when open, is a card directly above the notice's own strip.
 //!
-//! # Several failures
+//! # One notice = one incident
 //!
-//! Failures reported for the same [`Operation`] while a notice is already
-//! showing join it ("3 items couldn't be trashed" grows from two to three),
-//! so one multi-item delete is one notice however many tasks reported in.
-//! A failure of a different operation replaces the notice; the replaced
-//! one is already on stderr and was, by definition, not dismissed because
-//! the person was busy with something else.
+//! Every failure carries an [`Incident`]: one user action (or one engine
+//! operation), minted when it started. [`Slot::report`] decides:
+//!
+//! - same incident as the notice showing: the failure joins it ("3 items
+//!   couldn't be trashed" grows from two to three);
+//! - a newer incident: replaces the notice, collapsed;
+//! - an older (or already-dismissed) incident: dropped. It is still on
+//!   stderr; a straggler from an earlier action must not overwrite what the
+//!   person is looking at, nor resurrect a notice they dismissed.
+//!
+//! Two unrelated copies ten minutes apart are two incidents, so they never
+//! read as "2 items couldn't be copied".
+//!
+//! # Bounded
+//!
+//! A failed 100k-item delete must not hold or format 100k failures. The
+//! notice stores a total count and only the first [`MAX_DETAIL_LINES`]
+//! failures (the rest are dropped on arrival), and its text is built once
+//! per report, not per frame.
 //!
 //! # Severity is wording
 //!
@@ -30,23 +44,28 @@
 //! `footer_strip` the progress strip and undo toast use, with an
 //! `Icon::Info` glyph; the sentence says what is wrong.
 //!
-//! State lives here and is mutated by [`update`]; `App` owns the
-//! `Option<Notice>` and the Esc binding. Like the other dialogs this module
-//! holds no clock and ticks nothing.
+//! State lives here and is mutated by [`update`]; `App` owns the [`Slot`]
+//! and the Esc routing. Like the other dialogs this module holds no clock
+//! and ticks nothing.
 
 use iced::widget::text::Wrapping;
-use iced::widget::{button, column, container, row, text};
-use iced::{Center, Element, Fill};
+use iced::widget::{button, column, container, responsive, row, text};
+use iced::{Center, Element, Fill, Shrink};
 use saola_theme::icon::{self, Icon};
-use saola_theme::{ColorExt, Surface, Theme, convert, style, widget};
+use saola_theme::{ColorExt, Surface, Theme, convert, overflow, style, widget};
 
-use crate::core::failure::{self, Failure, Operation, Summary};
+use crate::core::failure::{self, Failure, Incident, Operation, Summary};
 use crate::tr;
 
-/// Detail lines drawn before "…and N more". The strip has no scrolling
-/// (and nothing in this app builds a list it can't bound), so a notice for
-/// a thousand failed items shows the first few and counts the rest.
-const MAX_DETAIL_LINES: usize = 8;
+/// Failures kept (and detail lines drawn) per notice; the rest are counted
+/// ("…and N more") and dropped.
+pub const MAX_DETAIL_LINES: usize = 8;
+
+/// Width reserved for the Details button when working out how much of the
+/// headline fits: its label is the longer of two translated words, so its
+/// width is not known up front. Same posture as `trashview`'s
+/// `RESTORE_COLUMN`: a generous column rather than a measurement.
+const DETAILS_COLUMN: f32 = 120.0;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -56,41 +75,62 @@ pub enum Message {
     ToggleDetails,
     /// Something failed: show it. This is the message other code sends;
     /// `App` has a helper that builds it.
-    Report(Operation, Vec<Failure>),
+    Report(Incident, Operation, Vec<Failure>),
 }
 
 /// What the notice is currently telling the person.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
+    incident: Incident,
     operation: Operation,
+    /// The first [`MAX_DETAIL_LINES`] failures; never more.
     failures: Vec<Failure>,
+    /// How many failed in all, including those not stored.
+    total: usize,
     expanded: bool,
+    /// Text for `failures`/`total`, rebuilt only when they change.
+    summary: Summary,
 }
 
 impl Notice {
-    /// Adds `failures` of `operation` to `slot`: joins the notice already
-    /// showing for the same operation, otherwise replaces it. An empty list
-    /// changes nothing.
-    pub fn report(slot: &mut Option<Notice>, operation: Operation, failures: Vec<Failure>) {
-        if failures.is_empty() {
-            return;
+    fn new(incident: Incident, operation: Operation) -> Self {
+        Notice {
+            incident,
+            operation,
+            failures: Vec::new(),
+            total: 0,
+            expanded: false,
+            summary: Summary {
+                headline: String::new(),
+                details: Vec::new(),
+            },
         }
-        match slot {
-            Some(notice) if notice.operation == operation => notice.failures.extend(failures),
-            _ => {
-                *slot = Some(Notice {
-                    operation,
-                    failures,
-                    expanded: false,
-                });
-            }
+    }
+
+    /// Counts `failures`, keeps what fits, and rebuilds the text.
+    fn add(&mut self, failures: Vec<Failure>) {
+        self.total = self.total.saturating_add(failures.len());
+        let room = MAX_DETAIL_LINES.saturating_sub(self.failures.len());
+        self.failures.extend(failures.into_iter().take(room));
+        if let Some(summary) = failure::summarize(self.operation, &self.failures, self.total) {
+            self.summary = summary;
         }
+    }
+
+    pub fn incident(&self) -> Incident {
+        self.incident
     }
 
     pub fn operation(&self) -> Operation {
         self.operation
     }
 
+    /// How many failed in all (more than are stored).
+    pub fn total(&self) -> usize {
+        self.total
+    }
+
+    /// The stored failures: at most [`MAX_DETAIL_LINES`].
     pub fn failures(&self) -> &[Failure] {
         &self.failures
     }
@@ -99,116 +139,187 @@ impl Notice {
         self.expanded
     }
 
-    /// The sentence(s) to draw. `None` only for a notice with no failures,
-    /// which [`Notice::report`] never creates.
-    pub fn summary(&self) -> Option<Summary> {
-        failure::summarize(self.operation, &self.failures)
+    /// The sentence(s) to draw.
+    pub fn summary(&self) -> &Summary {
+        &self.summary
     }
 }
 
-/// Applies `message` to the notice slot.
-pub fn update(slot: &mut Option<Notice>, message: Message) {
-    match message {
-        Message::Dismiss => *slot = None,
-        Message::ToggleDetails => {
-            if let Some(notice) = slot {
-                notice.expanded = !notice.expanded;
-            }
+/// The notice (if any) plus the newest incident ever reported, which
+/// outlives a dismissal so a late straggler can't bring the notice back.
+#[derive(Debug, Default)]
+pub struct Slot {
+    notice: Option<Notice>,
+    newest: Option<Incident>,
+}
+
+impl Slot {
+    pub fn notice(&self) -> Option<&Notice> {
+        self.notice.as_ref()
+    }
+
+    pub fn is_showing(&self) -> bool {
+        self.notice.is_some()
+    }
+
+    /// Applies the one-notice-per-incident rule (module docs). An empty
+    /// list changes nothing. Returns whether the failures were shown.
+    pub fn report(
+        &mut self,
+        incident: Incident,
+        operation: Operation,
+        failures: Vec<Failure>,
+    ) -> bool {
+        if failures.is_empty() {
+            return false;
         }
-        Message::Report(operation, failures) => Notice::report(slot, operation, failures),
+        if let Some(notice) = self.notice.as_mut()
+            && notice.incident == incident
+        {
+            notice.add(failures);
+            return true;
+        }
+        if self.newest.is_some_and(|newest| incident <= newest) {
+            return false;
+        }
+        self.newest = Some(incident);
+        let mut notice = Notice::new(incident, operation);
+        notice.add(failures);
+        self.notice = Some(notice);
+        true
+    }
+
+    pub fn dismiss(&mut self) {
+        self.notice = None;
+    }
+
+    pub fn toggle_details(&mut self) {
+        if let Some(notice) = self.notice.as_mut() {
+            notice.expanded = !notice.expanded;
+        }
+    }
+}
+
+/// Applies `message` to the slot.
+pub fn update(slot: &mut Slot, message: Message) {
+    match message {
+        Message::Dismiss => slot.dismiss(),
+        Message::ToggleDetails => slot.toggle_details(),
+        Message::Report(incident, operation, failures) => {
+            slot.report(incident, operation, failures);
+        }
     }
 }
 
 /// Renders the notice: an optional Details card above a `footer_strip`
 /// holding the glyph, the headline, a Details toggle (only when more than
 /// one thing failed) and the close button.
-pub fn view<'a>(t: &'a Theme, notice: &Notice) -> Element<'a, Message> {
-    let Some(summary) = notice.summary() else {
-        return iced::widget::Space::new().into();
-    };
-    let has_details = !summary.details.is_empty();
+///
+/// Long names are cut with `overflow::truncate` (one `…`), budgeted from the
+/// width the notice really has: `responsive` hands the closure the notice's
+/// measured width, the same technique as `ui::trashview`'s rows.
+pub fn view<'a>(t: &'a Theme, notice: &'a Notice) -> Element<'a, Message> {
+    let has_details = !notice.summary.details.is_empty();
+    responsive(move |size| {
+        let font = convert::ui_font(t);
+        let font_size = t.typography.size.secondary;
+        let glyph = icon::icon(Icon::Info, t.sizes.icon_row, t.on_paper.primary.into_iced());
 
-    let glyph = icon::icon(Icon::Info, t.sizes.icon_row, t.on_paper.primary.into_iced());
+        // What the strip spends its width on besides the headline: its own
+        // padding, the glyph, the close button (glyph + the button's
+        // padding), the gaps between children, and the Details button.
+        let strip_padding = t.sizes.popover_padding;
+        let close_width = t.sizes.icon_row + 2.0 * t.paddings.strip[1];
+        let children = if has_details { 4.0 } else { 3.0 };
+        let reserved = strip_padding
+            + t.sizes.icon_row
+            + close_width
+            + (children - 1.0) * t.sizes.pill_gap
+            + if has_details { DETAILS_COLUMN } else { 0.0 };
+        let headline_units = overflow::unit_budget(size.width - reserved, font_size);
 
-    // `Wrapping::None` keeps a long filename on the one line the strip has
-    // room for; the container clips it rather than growing the strip.
-    let headline = text(summary.headline)
-        .size(t.typography.size.secondary)
-        .font(convert::ui_font(t))
-        .wrapping(Wrapping::None)
-        .width(Fill);
+        let headline = text(overflow::truncate(&notice.summary.headline, headline_units))
+            .size(font_size)
+            .font(font)
+            .wrapping(Wrapping::None)
+            .width(Fill);
 
-    let mut strip = row![glyph, headline]
-        .spacing(t.sizes.pill_gap)
-        .align_y(Center)
-        .width(Fill);
+        let mut strip = row![glyph, headline]
+            .spacing(t.sizes.pill_gap)
+            .align_y(Center)
+            .width(Fill);
 
-    if has_details {
-        let label = if notice.expanded {
-            tr!("error-notice-hide-details")
-        } else {
-            tr!("error-notice-details")
-        };
-        strip = strip.push(
-            button(
-                text(label)
-                    .size(t.typography.size.secondary)
-                    .font(convert::ui_font(t)),
-            )
-            .style(style::button::bare(t, Surface::Paper))
-            .padding(t.paddings.strip)
-            .on_press(Message::ToggleDetails),
-        );
-    }
-
-    strip = strip.push(
-        button(icon::icon(
-            Icon::X,
-            t.sizes.icon_row,
-            t.on_paper.primary.into_iced(),
-        ))
-        .style(style::button::bare(t, Surface::Paper))
-        .padding(t.paddings.strip)
-        .on_press(Message::Dismiss),
-    );
-
-    let strip = widget::footer_strip(t, Surface::Paper, strip);
-
-    if has_details && notice.expanded {
-        let total = summary.details.len();
-        let mut lines: Vec<Element<'a, Message>> = summary
-            .details
-            .into_iter()
-            .take(MAX_DETAIL_LINES)
-            .map(|line| {
-                text(line)
-                    .size(t.typography.size.secondary)
-                    .font(convert::ui_font(t))
-                    .wrapping(Wrapping::None)
-                    .into()
-            })
-            .collect();
-        if total > MAX_DETAIL_LINES {
-            lines.push(
-                text(tr!("error-notice-more", count = total - MAX_DETAIL_LINES))
-                    .size(t.typography.size.secondary)
-                    .font(convert::ui_font(t))
-                    .into(),
+        if has_details {
+            let label = if notice.expanded {
+                tr!("error-notice-hide-details")
+            } else {
+                tr!("error-notice-details")
+            };
+            strip = strip.push(
+                button(text(label).size(font_size).font(font))
+                    .style(style::button::bare(t, Surface::Paper))
+                    .padding(t.paddings.strip)
+                    .on_press(Message::ToggleDetails),
             );
         }
-        let card = container(column(lines).spacing(t.sizes.gap_tight).width(Fill))
-            .style(style::container::card(t, Surface::Paper))
-            .width(Fill)
-            .padding([t.sizes.pill_gap / 2.0, t.sizes.popover_padding / 2.0]);
-        column![card, strip].width(Fill).into()
-    } else {
-        strip
-    }
+
+        strip = strip.push(
+            button(icon::icon(
+                Icon::X,
+                t.sizes.icon_row,
+                t.on_paper.primary.into_iced(),
+            ))
+            .style(style::button::bare(t, Surface::Paper))
+            .padding(t.paddings.strip)
+            .on_press(Message::Dismiss),
+        );
+
+        let strip = widget::footer_strip(t, Surface::Paper, strip);
+
+        if has_details && notice.expanded {
+            let card_padding = t.sizes.popover_padding;
+            let line_units = overflow::unit_budget(size.width - card_padding, font_size);
+            let mut lines: Vec<Element<'_, Message>> = notice
+                .summary
+                .details
+                .iter()
+                .map(|line| {
+                    text(overflow::truncate(line, line_units))
+                        .size(font_size)
+                        .font(font)
+                        .wrapping(Wrapping::None)
+                        .into()
+                })
+                .collect();
+            if notice.total > notice.failures.len() {
+                lines.push(
+                    text(tr!(
+                        "error-notice-more",
+                        count = notice.total - notice.failures.len()
+                    ))
+                    .size(font_size)
+                    .font(font)
+                    .into(),
+                );
+            }
+            let card = container(column(lines).spacing(t.sizes.gap_tight).width(Fill))
+                .style(style::container::card(t, Surface::Paper))
+                .width(Fill)
+                .padding([t.sizes.pill_gap / 2.0, t.sizes.popover_padding / 2.0]);
+            column![card, strip].width(Fill).into()
+        } else {
+            strip
+        }
+    })
+    .width(Fill)
+    .height(Shrink)
+    .into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::failure::IncidentSource;
     use crate::core::vfs::VfsError;
 
     fn failure(name: &str) -> Failure {
@@ -220,92 +331,132 @@ mod tests {
         )
     }
 
+    fn two_incidents() -> (Incident, Incident) {
+        let mut source = IncidentSource::default();
+        (source.mint(), source.mint())
+    }
+
     #[test]
     fn a_report_into_an_empty_slot_shows_it() {
-        let mut slot = None;
-        Notice::report(&mut slot, Operation::Copy, vec![failure("a")]);
-        let notice = slot.expect("a notice");
+        let (first, _) = two_incidents();
+        let mut slot = Slot::default();
+        assert!(slot.report(first, Operation::Copy, vec![failure("a")]));
+        let notice = slot.notice().expect("a notice");
         assert_eq!(notice.operation(), Operation::Copy);
-        assert_eq!(notice.failures().len(), 1);
+        assert_eq!(notice.total(), 1);
         assert!(!notice.is_expanded());
     }
 
     #[test]
     fn an_empty_report_changes_nothing() {
-        let mut slot = None;
-        Notice::report(&mut slot, Operation::Copy, Vec::new());
-        assert!(slot.is_none());
-        Notice::report(&mut slot, Operation::Copy, vec![failure("a")]);
-        let before = slot.clone();
-        Notice::report(&mut slot, Operation::Move, Vec::new());
-        assert_eq!(slot, before);
+        let (first, second) = two_incidents();
+        let mut slot = Slot::default();
+        assert!(!slot.report(first, Operation::Copy, Vec::new()));
+        assert!(!slot.is_showing());
+        slot.report(first, Operation::Copy, vec![failure("a")]);
+        assert!(!slot.report(second, Operation::Move, Vec::new()));
+        assert_eq!(slot.notice().map(Notice::incident), Some(first));
     }
 
     #[test]
-    fn failures_of_the_same_operation_join_one_notice() {
-        let mut slot = None;
+    fn failures_of_the_same_incident_aggregate() {
+        let (first, _) = two_incidents();
+        let mut slot = Slot::default();
         for name in ["a", "b", "c"] {
-            Notice::report(&mut slot, Operation::Trash, vec![failure(name)]);
+            slot.report(first, Operation::Trash, vec![failure(name)]);
         }
-        let notice = slot.expect("a notice");
-        assert_eq!(notice.failures().len(), 3);
-        let summary = notice.summary().expect("a summary");
-        assert_eq!(summary.headline, "3 items couldn't be moved to the trash");
-        assert_eq!(summary.details.len(), 3);
+        let notice = slot.notice().expect("a notice");
+        assert_eq!(notice.total(), 3);
+        assert_eq!(
+            notice.summary().headline,
+            "3 items couldn't be moved to the trash"
+        );
+        assert_eq!(notice.summary().details.len(), 3);
     }
 
     #[test]
-    fn a_different_operation_replaces_the_notice() {
-        let mut slot = None;
-        Notice::report(&mut slot, Operation::Copy, vec![failure("a"), failure("b")]);
-        Notice::report(&mut slot, Operation::Open, vec![failure("c")]);
-        let notice = slot.expect("a notice");
+    fn a_new_incident_of_the_same_kind_replaces_rather_than_joins() {
+        let (first, second) = two_incidents();
+        let mut slot = Slot::default();
+        slot.report(first, Operation::Copy, vec![failure("a")]);
+        slot.report(second, Operation::Copy, vec![failure("b")]);
+        let notice = slot.notice().expect("a notice");
+        assert_eq!(notice.incident(), second);
+        assert_eq!(notice.total(), 1);
+        assert!(notice.summary().headline.contains("“b”"));
+    }
+
+    #[test]
+    fn a_late_failure_from_an_older_incident_does_not_overwrite() {
+        let (first, second) = two_incidents();
+        let mut slot = Slot::default();
+        slot.report(second, Operation::Open, vec![failure("new")]);
+        assert!(!slot.report(first, Operation::Copy, vec![failure("old")]));
+        let notice = slot.notice().expect("a notice");
+        assert_eq!(notice.incident(), second);
         assert_eq!(notice.operation(), Operation::Open);
-        assert_eq!(notice.failures().len(), 1);
     }
 
     #[test]
-    fn a_replacement_starts_collapsed() {
-        let mut slot = None;
-        update(
-            &mut slot,
-            Message::Report(Operation::Copy, vec![failure("a"), failure("b")]),
-        );
-        update(&mut slot, Message::ToggleDetails);
-        assert!(slot.as_ref().is_some_and(Notice::is_expanded));
-        update(
-            &mut slot,
-            Message::Report(Operation::Move, vec![failure("c")]),
-        );
-        assert!(slot.as_ref().is_some_and(|n| !n.is_expanded()));
+    fn a_straggler_cannot_bring_back_a_dismissed_notice() {
+        let (first, second) = two_incidents();
+        let mut slot = Slot::default();
+        slot.report(second, Operation::Open, vec![failure("a")]);
+        slot.dismiss();
+        assert!(!slot.report(first, Operation::Copy, vec![failure("old")]));
+        assert!(!slot.report(second, Operation::Open, vec![failure("late")]));
+        assert!(!slot.is_showing());
     }
 
     #[test]
-    fn joining_keeps_the_details_open() {
-        let mut slot = None;
-        update(
-            &mut slot,
-            Message::Report(Operation::Copy, vec![failure("a"), failure("b")]),
-        );
+    fn the_notice_persists_until_dismissed_or_replaced() {
+        // Nothing in the slot reacts to navigation: there is no message for
+        // it. Only Dismiss and a newer incident remove or replace it.
+        let (first, _) = two_incidents();
+        let mut slot = Slot::default();
+        slot.report(first, Operation::Copy, vec![failure("a")]);
         update(&mut slot, Message::ToggleDetails);
-        update(
-            &mut slot,
-            Message::Report(Operation::Copy, vec![failure("c")]),
-        );
-        assert!(slot.as_ref().is_some_and(Notice::is_expanded));
-    }
-
-    #[test]
-    fn dismiss_clears_and_toggle_on_nothing_is_harmless() {
-        let mut slot = None;
         update(&mut slot, Message::ToggleDetails);
-        assert!(slot.is_none());
-        update(
-            &mut slot,
-            Message::Report(Operation::Copy, vec![failure("a")]),
-        );
+        assert!(slot.is_showing());
         update(&mut slot, Message::Dismiss);
-        assert!(slot.is_none());
+        assert!(!slot.is_showing());
+    }
+
+    #[test]
+    fn a_replacement_starts_collapsed_and_joining_keeps_details_open() {
+        let (first, second) = two_incidents();
+        let mut slot = Slot::default();
+        slot.report(first, Operation::Copy, vec![failure("a"), failure("b")]);
+        update(&mut slot, Message::ToggleDetails);
+        slot.report(first, Operation::Copy, vec![failure("c")]);
+        assert!(slot.notice().is_some_and(Notice::is_expanded));
+        slot.report(second, Operation::Move, vec![failure("d")]);
+        assert!(slot.notice().is_some_and(|n| !n.is_expanded()));
+    }
+
+    #[test]
+    fn toggle_on_nothing_is_harmless() {
+        let mut slot = Slot::default();
+        update(&mut slot, Message::ToggleDetails);
+        assert!(!slot.is_showing());
+    }
+
+    #[test]
+    fn a_huge_report_is_counted_but_only_the_first_few_are_kept() {
+        let (first, _) = two_incidents();
+        let mut slot = Slot::default();
+        let many: Vec<Failure> = (0..100_000).map(|i| failure(&i.to_string())).collect();
+        slot.report(first, Operation::Delete, many);
+        // More arrive in a second batch for the same incident.
+        slot.report(first, Operation::Delete, vec![failure("x"), failure("y")]);
+        let notice = slot.notice().expect("a notice");
+        assert_eq!(notice.total(), 100_002);
+        assert_eq!(notice.failures().len(), MAX_DETAIL_LINES);
+        assert_eq!(notice.summary().details.len(), MAX_DETAIL_LINES);
+        assert_eq!(
+            notice.summary().headline,
+            "100002 items couldn't be deleted"
+        );
     }
 
     #[test]
@@ -313,17 +464,16 @@ mod tests {
         // Smoke test: building the widget tree must not panic in any state
         // (single, collapsed group, expanded group, more than the cap).
         let theme = Theme::saola();
-        let many: Vec<Failure> = (0..MAX_DETAIL_LINES + 3)
-            .map(|i| failure(&format!("f{i}")))
-            .collect();
-        for failures in [vec![failure("a")], many.clone()] {
+        let (first, _) = two_incidents();
+        for count in [1, 3, MAX_DETAIL_LINES + 3] {
             for expanded in [false, true] {
-                let mut slot = None;
-                Notice::report(&mut slot, Operation::Copy, failures.clone());
+                let mut slot = Slot::default();
+                let failures = (0..count).map(|i| failure(&format!("f{i}"))).collect();
+                slot.report(first, Operation::Copy, failures);
                 if expanded {
-                    update(&mut slot, Message::ToggleDetails);
+                    slot.toggle_details();
                 }
-                if let Some(notice) = &slot {
+                if let Some(notice) = slot.notice() {
                     let _element = view(&theme, notice);
                 }
             }

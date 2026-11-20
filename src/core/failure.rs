@@ -45,6 +45,31 @@ use std::io;
 use crate::core::vfs::{Location, VfsError};
 use crate::tr;
 
+/// One user-visible incident: a single user action (or one engine
+/// operation) and everything that failed inside it. Failures aggregate into
+/// one notice only when they share an `Incident`, and a failure from an
+/// older incident never displaces a newer notice.
+///
+/// Ordered: a later-minted incident compares greater. Minted by
+/// [`IncidentSource`] when the action *starts* and carried through its
+/// tasks, so ordering reflects when the person asked, not when a result
+/// happened to arrive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Incident(u64);
+
+/// Mints [`Incident`]s, strictly increasing. One lives on `App`.
+#[derive(Debug, Default)]
+pub struct IncidentSource {
+    last: u64,
+}
+
+impl IncidentSource {
+    pub fn mint(&mut self) -> Incident {
+        self.last = self.last.saturating_add(1);
+        Incident(self.last)
+    }
+}
+
 /// What the person asked for. Picks the sentence in [`describe`] and the
 /// headline in [`summarize`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +211,11 @@ pub enum Reason {
     ProgramMissing,
     /// Anything else: the backend's own words.
     Other(String),
+    /// The location can't do this at all (a backend without the matching
+    /// capability); carries the refused operation as a noun phrase.
+    Unsupported(String),
+    /// An error that came with no words at all.
+    Unknown,
 }
 
 /// Classifies `cause`. Pure; see the module docs for why `Other` text is
@@ -197,7 +227,7 @@ pub fn reason(cause: &Cause) -> Reason {
         Cause::Launch { kind, message } => match kind {
             io::ErrorKind::NotFound => Reason::ProgramMissing,
             io::ErrorKind::PermissionDenied => Reason::PermissionDenied,
-            _ => Reason::Other(message.clone()),
+            _ => other_reason(message),
         },
         Cause::Vfs(err) => match err {
             VfsError::NotFound { .. } => Reason::NotFound,
@@ -206,23 +236,36 @@ pub fn reason(cause: &Cause) -> Reason {
             VfsError::NotADirectory { .. } => Reason::NotAFolder,
             VfsError::IsADirectory { .. } => Reason::IsAFolder,
             VfsError::Unavailable { .. } => Reason::Disconnected,
+            VfsError::Unsupported { operation } => Reason::Unsupported(operation.clone()),
             VfsError::Other { message } => classify_other(message),
         },
     }
 }
 
-/// `io::Error`'s `Display` for an OS error ends in `(os error N)`. These are
-/// the Linux errno values with their own wording: ENOSPC (28) and EDQUOT
-/// (122) are "no space"; EXDEV (18) is "cross-device"; EROFS (30) is
-/// "read-only".
+/// `io::Error`'s `Display` for an OS error *ends* in `(os error N)`, and
+/// local backend messages are `"{path}: {err}"`. Only the end is trusted: a
+/// file named `x (os error 28)` that fails for another reason must not be
+/// reported as out of space. Linux errno values with their own wording:
+/// ENOSPC (28) and EDQUOT (122) no space; EXDEV (18) cross-device; EROFS
+/// (30) read-only.
 fn classify_other(message: &str) -> Reason {
-    let has = |errno: u32| message.contains(&format!("(os error {errno})"));
-    if has(28) || has(122) {
+    let tail = message.trim_end();
+    let ends = |errno: u32| tail.ends_with(&format!("(os error {errno})"));
+    if ends(28) || ends(122) {
         Reason::NoSpace
-    } else if has(18) {
+    } else if ends(18) {
         Reason::CrossDevice
-    } else if has(30) {
+    } else if ends(30) {
         Reason::ReadOnly
+    } else {
+        other_reason(message)
+    }
+}
+
+/// The backend's own words, or [`Reason::Unknown`] when there are none.
+fn other_reason(message: &str) -> Reason {
+    if message.trim().is_empty() {
+        Reason::Unknown
     } else {
         Reason::Other(message.to_owned())
     }
@@ -245,10 +288,18 @@ fn reason_text(reason: &Reason) -> String {
         Reason::AppUninstalled => tr!("failure-reason-app-uninstalled"),
         Reason::ProgramMissing => tr!("failure-reason-program-missing"),
         // The sentence supplies its own full stop.
-        Reason::Other(message) => tr!(
-            "failure-reason-other",
-            message = message.trim().trim_end_matches('.')
-        ),
+        Reason::Other(message) => {
+            let words = message.trim().trim_end_matches('.').trim_end();
+            if words.is_empty() {
+                tr!("failure-reason-unknown")
+            } else {
+                tr!("failure-reason-other", message = words)
+            }
+        }
+        Reason::Unsupported(operation) => {
+            tr!("failure-reason-unsupported", operation = operation.as_str())
+        }
+        Reason::Unknown => tr!("failure-reason-unknown"),
     }
 }
 
@@ -315,6 +366,9 @@ pub fn describe(operation: Operation, failure: &Failure) -> String {
         (Operation::OpenTerminal, _) => tr!("failure-open-terminal", name = name, reason = reason),
         (Operation::RunAction, _) => tr!("failure-run-action", name = name, reason = reason),
         (Operation::Undo, _) => tr!("failure-undo", reason = reason),
+        (Operation::Restore, _) if name.is_empty() => {
+            tr!("failure-restore-unnamed", reason = reason)
+        }
         (Operation::Restore, _) => tr!("failure-restore", name = name, reason = reason),
         (Operation::EmptyTrash, _) => tr!("failure-empty-trash", reason = reason),
         (Operation::Clipboard, _) => tr!("failure-clipboard", reason = reason),
@@ -332,23 +386,25 @@ pub struct Summary {
     pub details: Vec<String>,
 }
 
-/// Groups `failures` (all from `operation`) for display. `None` when there
-/// is nothing to show.
+/// Groups failures of `operation` for display. `shown` is the stored
+/// prefix (the notice keeps only the first few) and `total` how many
+/// failed in all; `None` when there is nothing to show.
 ///
 /// One failure: the full sentence, no details. Several: a count headline
-/// ("3 items couldn't be copied") and every sentence as a detail line.
-pub fn summarize(operation: Operation, failures: &[Failure]) -> Option<Summary> {
-    match failures {
-        [] => None,
-        [only] => Some(Summary {
-            headline: describe(operation, only),
+/// ("3 items couldn't be copied") from `total`, and a sentence per *shown*
+/// failure as detail lines. Only what is shown is formatted.
+pub fn summarize(operation: Operation, shown: &[Failure], total: usize) -> Option<Summary> {
+    let (first, _) = shown.split_first()?;
+    if total <= 1 {
+        return Some(Summary {
+            headline: describe(operation, first),
             details: Vec::new(),
-        }),
-        many => Some(Summary {
-            headline: group_headline(operation, many.len()),
-            details: many.iter().map(|f| describe(operation, f)).collect(),
-        }),
+        });
     }
+    Some(Summary {
+        headline: group_headline(operation, total),
+        details: shown.iter().map(|f| describe(operation, f)).collect(),
+    })
 }
 
 /// The count headline for `count` (two or more) failures of `operation`.
@@ -414,6 +470,12 @@ mod tests {
                 },
                 Reason::Disconnected,
             ),
+            (
+                VfsError::Unsupported {
+                    operation: "creating links".to_owned(),
+                },
+                Reason::Unsupported("creating links".to_owned()),
+            ),
             (other("odd"), Reason::Other("odd".to_owned())),
         ];
         for (err, expected) in cases {
@@ -429,6 +491,47 @@ mod tests {
         ] {
             assert_eq!(reason(&Cause::Vfs(other(message))), Reason::NoSpace);
         }
+    }
+
+    #[test]
+    fn a_file_named_like_an_errno_is_not_mistaken_for_one() {
+        // The errno text is only trusted at the very end of the message.
+        let text = "/x (os error 28): Text file busy (os error 26)";
+        assert_eq!(
+            reason(&Cause::Vfs(other(text))),
+            Reason::Other(text.to_owned())
+        );
+        let real = Cause::Vfs(other(
+            "/x (os error 18): No space left on device (os error 28)",
+        ));
+        assert_eq!(reason(&real), Reason::NoSpace);
+    }
+
+    #[test]
+    fn an_empty_message_gets_a_real_sentence() {
+        for message in ["", "   ", " . "] {
+            let sentence = describe(Operation::Copy, &Failure::new("a", other(message)));
+            assert_eq!(sentence, "Couldn't copy “a”: something went wrong.");
+        }
+    }
+
+    #[test]
+    fn a_restore_without_a_name_does_not_render_empty_quotes() {
+        let sentence = describe(
+            Operation::Restore,
+            &Failure::new(OsString::new(), permission_denied()),
+        );
+        assert_eq!(
+            sentence,
+            "Couldn't restore an item from the trash: permission denied."
+        );
+    }
+
+    #[test]
+    fn incidents_are_strictly_increasing() {
+        let mut source = IncidentSource::default();
+        let (a, b) = (source.mint(), source.mint());
+        assert!(a < b);
     }
 
     #[test]
@@ -603,13 +706,13 @@ mod tests {
 
     #[test]
     fn nothing_failed_is_no_summary() {
-        assert_eq!(summarize(Operation::Copy, &[]), None);
+        assert_eq!(summarize(Operation::Copy, &[], 0), None);
     }
 
     #[test]
     fn one_failure_is_its_own_sentence_with_no_details() {
         let failure = Failure::new("a.txt", permission_denied()).to("Docs");
-        let summary = summarize(Operation::Copy, std::slice::from_ref(&failure));
+        let summary = summarize(Operation::Copy, std::slice::from_ref(&failure), 1);
         let summary = summary.expect("one failure summarises");
         assert_eq!(summary.headline, describe(Operation::Copy, &failure));
         assert!(summary.details.is_empty());
@@ -621,7 +724,7 @@ mod tests {
             .into_iter()
             .map(|n| Failure::new(n, permission_denied()).to("Docs"))
             .collect();
-        let summary = summarize(Operation::Copy, &failures).expect("summarises");
+        let summary = summarize(Operation::Copy, &failures, 3).expect("summarises");
         assert_eq!(summary.headline, "3 items couldn't be copied");
         assert_eq!(summary.details.len(), 3);
         assert_eq!(

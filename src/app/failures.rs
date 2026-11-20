@@ -3,25 +3,42 @@
 //!
 //! # Reporting a failure (the API other features call)
 //!
-//! Build one [`Failure`] per thing that failed and pick the
-//! [`Operation`] (both in `core::failure`), then either:
+//! Build one [`Failure`] per thing that failed, pick the [`Operation`]
+//! (both in `core::failure`), and attach the **incident**: one user action,
+//! or one engine operation, with everything that failed inside it.
 //!
-//! - from `&mut self` code (an `update` arm, an `Event` handler):
-//!   `self.report_failures(Operation::Open, failures);`
-//! - from a `Task::perform` completion closure, which has no `self`: return
-//!   `failed(Operation::Trash, vec![failure])` as the `Message`.
+//! - Mint the incident when the action *starts*: `self.new_incident()`
+//!   (needs `&mut self`), and carry the `Incident` (it is `Copy`) into the
+//!   tasks the action spawns.
+//! - From a `Task::perform` completion closure, which has no `self`: return
+//!   `failed(incident, operation, failures)` as the `Message`.
+//! - From `&mut self` code that is its own whole action (an `Event`
+//!   handler that fails synchronously): `self.report_new(operation,
+//!   failures)` mints and reports in one step.
+//! - From `&mut self` code that already holds an incident:
+//!   `self.report_failures(incident, operation, failures)`.
 //!
-//! Failures of the same operation that arrive while a notice is showing
-//! join it, so reporting one failure per task is fine. The sentence, the
-//! grouping and the Details list are all derived; nothing here words
-//! anything. stderr logging stays at the call site, next to the code that
-//! knows the raw error.
+//! Failures sharing an incident aggregate into one notice; a newer incident
+//! replaces it; an older one is dropped (see `ui::dialogs::error_notice`).
+//! The sentence, the grouping and the Details list are all derived; nothing
+//! here words anything. stderr logging stays at the call site, next to the
+//! code that knows the raw error.
+//!
+//! # How each path identifies its incident
+//!
+//! - copy/move: one per engine op, minted in `submit_paste_op`;
+//! - trash/delete: one per `start_delete` call, shared by all its tasks;
+//! - undo, clipboard write, open, open with, open terminal, custom action:
+//!   one per user action, minted where the action is handled;
+//! - trash-browser restore/empty: minted when the request is seen, before
+//!   the browser handles it;
+//! - New Folder/File: minted when the result arrives (the view, not `App`,
+//!   starts it, and there is only ever one create in flight per view).
 //!
 //! # Escape
 //!
-//! Esc dismisses the notice, but only when the focused view has nothing of
-//! its own for Esc to close (menu, rename, path editor): one press closes
-//! the thing the person is looking at, the next closes the notice.
+//! The routing lives in `App::key_route` (`mod.rs`), the one place that
+//! decides where a key goes; this file only supplies [`is_bare_escape`].
 
 use std::ffi::OsString;
 
@@ -29,18 +46,61 @@ use iced::keyboard;
 use iced::widget::column;
 use iced::{Element, Fill, Task};
 
-use saola_files::core::failure::{Failure, Operation};
+use saola_files::core::failure::{Failure, Incident, IncidentSource, Operation};
 use saola_files::core::fs::ops::OpKind;
 use saola_files::core::vfs::{Location, VfsError};
 use saola_files::ui;
-use saola_files::ui::dialogs::error_notice::{self, Notice};
+use saola_files::ui::dialogs::error_notice;
 
 use super::{App, Message};
 
 /// The `Message` that reports `failures` of `operation`. For `Task::perform`
 /// completion closures; see the module docs.
-pub(super) fn failed(operation: Operation, failures: Vec<Failure>) -> Message {
-    Message::ErrorNotice(error_notice::Message::Report(operation, failures))
+pub(super) fn failed(incident: Incident, operation: Operation, failures: Vec<Failure>) -> Message {
+    Message::ErrorNotice(error_notice::Message::Report(incident, operation, failures))
+}
+
+/// `App`'s incident bookkeeping: the mint, plus the incidents of the two
+/// actions whose result arrives apart from their start.
+#[derive(Debug, Default)]
+pub(super) struct Incidents {
+    source: IncidentSource,
+    /// The running copy/move op's incident (set when it is submitted).
+    op: Option<Incident>,
+    /// The latest trash-browser restore/empty request's incident.
+    trash: Option<Incident>,
+}
+
+impl Incidents {
+    pub(super) fn mint(&mut self) -> Incident {
+        self.source.mint()
+    }
+
+    /// Starts the incident for a copy/move op.
+    pub(super) fn begin_op(&mut self) {
+        self.op = Some(self.source.mint());
+    }
+
+    /// The finished op's incident (minting one if somehow absent).
+    pub(super) fn end_op(&mut self) -> Incident {
+        match self.op.take() {
+            Some(incident) => incident,
+            None => self.source.mint(),
+        }
+    }
+}
+
+/// True for an unmodified Escape key press: the only key that does anything
+/// while only the notice can take input.
+pub(super) fn is_bare_escape(event: &keyboard::Event) -> bool {
+    matches!(
+        event,
+        keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            modifiers,
+            ..
+        } if modifiers.is_empty()
+    )
 }
 
 /// The failures of a copy/move op, as the notice wants them: each error
@@ -71,24 +131,51 @@ pub(super) fn op_failures(
 }
 
 impl App {
-    /// Shows `failures` in the window; see the module docs.
-    pub(super) fn report_failures(&mut self, operation: Operation, failures: Vec<Failure>) {
-        Notice::report(&mut self.error_notice, operation, failures);
+    /// A fresh incident for an action that is starting.
+    pub(super) fn new_incident(&mut self) -> Incident {
+        self.incidents.mint()
+    }
+
+    /// Shows `failures` of `incident` in the window; see the module docs.
+    pub(super) fn report_failures(
+        &mut self,
+        incident: Incident,
+        operation: Operation,
+        failures: Vec<Failure>,
+    ) {
+        self.error_notice.report(incident, operation, failures);
+    }
+
+    /// [`Self::report_failures`] for an action that is complete in itself:
+    /// mints its incident first.
+    pub(super) fn report_new(&mut self, operation: Operation, failures: Vec<Failure>) {
+        let incident = self.incidents.mint();
+        self.report_failures(incident, operation, failures);
     }
 
     /// Called with a trash-browser message *before* the browser handles it
-    /// (so an item index still names the row the person clicked): a failed
-    /// restore or empty becomes a notice. The browser's own stderr line
-    /// stays.
+    /// (so an item index still names the row the person clicked). A
+    /// request opens an incident; a failed result reports into it. The
+    /// browser's own stderr line stays.
     pub(super) fn report_trash_failure(&mut self, message: &ui::trashview::Message) {
         use ui::trashview::Message as Trash;
         match message {
+            Trash::RestoreRequested(_) | Trash::EmptyRequested | Trash::EmptyConfirmClicked => {
+                self.incidents.trash = Some(self.incidents.mint());
+            }
             Trash::RestoreResult(index, Err(err)) => {
                 let name = self.trash_view.original_name(*index).unwrap_or_default();
-                self.report_failures(Operation::Restore, vec![Failure::new(name, err.clone())]);
+                let incident = self.trash_incident();
+                self.report_failures(
+                    incident,
+                    Operation::Restore,
+                    vec![Failure::new(name, err.clone())],
+                );
             }
             Trash::EmptyResult(Err(err)) => {
+                let incident = self.trash_incident();
                 self.report_failures(
+                    incident,
                     Operation::EmptyTrash,
                     vec![Failure::new(OsString::new(), err.clone())],
                 );
@@ -97,30 +184,17 @@ impl App {
         }
     }
 
+    fn trash_incident(&mut self) -> Incident {
+        match self.incidents.trash {
+            Some(incident) => incident,
+            None => self.incidents.mint(),
+        }
+    }
+
     /// `Message::ErrorNotice`'s handling.
     pub(super) fn handle_error_notice(&mut self, message: error_notice::Message) -> Task<Message> {
         error_notice::update(&mut self.error_notice, message);
         Task::none()
-    }
-
-    /// Consumes `event` and returns `true` when it is a bare Escape that
-    /// should dismiss the notice (one is showing, and the focused view has
-    /// nothing of its own to cancel). Otherwise returns `false` and the key
-    /// goes to the view as usual.
-    pub(super) fn dismiss_error_notice_on_escape(&mut self, event: &keyboard::Event) -> bool {
-        let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
-            return false;
-        };
-        let is_escape = matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
-            && modifiers.is_empty();
-        if !is_escape || self.error_notice.is_none() {
-            return false;
-        }
-        if self.focused_view().is_some_and(|view| view.owns_escape()) {
-            return false;
-        }
-        self.error_notice = None;
-        true
     }
 
     /// Stacks the notice (when there is one) directly under `body`. The
@@ -131,7 +205,7 @@ impl App {
         &'a self,
         body: Element<'a, Message>,
     ) -> Element<'a, Message> {
-        match &self.error_notice {
+        match self.error_notice.notice() {
             Some(notice) => column![
                 body,
                 error_notice::view(&self.theme, notice).map(Message::ErrorNotice),

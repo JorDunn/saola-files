@@ -162,10 +162,15 @@ impl TrashView {
 
     /// The name `index`'s item had before it was trashed, for wording a
     /// failed restore ("Couldn't restore “a.txt” ..."). `None` when `index`
-    /// is out of range.
+    /// is out of range (or the entry has no name at all).
     pub fn original_name(&self, index: usize) -> Option<std::ffi::OsString> {
         let item = self.items.get(index)?;
-        item.original_path.file_name().map(|n| n.to_owned())
+        // Falls back to the entry's own name inside the trash when the
+        // recorded original path has none; `None` only if neither does.
+        item.original_path
+            .file_name()
+            .or_else(|| item.id.files_path().file_name())
+            .map(|n| n.to_owned())
     }
 
     /// Fetches the trash's current contents — the owner calls this once

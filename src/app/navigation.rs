@@ -98,7 +98,7 @@ impl App {
                         .iter()
                         .map(|l| Failure::at(l, Cause::AppUninstalled).to(desktop_id.as_str()))
                         .collect();
-                    self.report_failures(Operation::OpenWith, failures);
+                    self.report_new(Operation::OpenWith, failures);
                     return Task::none();
                 };
                 let terminal = core::apps::resolve_terminal_from_env(self.terminal.as_deref());
@@ -109,7 +109,7 @@ impl App {
                         .iter()
                         .map(|l| Failure::at(l, Cause::launch(&err)).to(entry.name.as_str()))
                         .collect();
-                    self.report_failures(Operation::OpenWith, failures);
+                    self.report_new(Operation::OpenWith, failures);
                 }
                 Task::none()
             }
@@ -126,7 +126,7 @@ impl App {
                         location.parent().unwrap_or_else(|| location.clone())
                     };
                     let failure = Failure::at(&folder, Cause::launch(&err));
-                    self.report_failures(Operation::OpenTerminal, vec![failure]);
+                    self.report_new(Operation::OpenTerminal, vec![failure]);
                 }
                 Task::none()
             }
@@ -142,16 +142,18 @@ impl App {
                         failures.push(Failure::new(program.clone(), Cause::launch(&err)));
                     }
                 }
-                self.report_failures(Operation::RunAction, failures);
+                self.report_new(Operation::RunAction, failures);
                 Task::none()
             }
             ui::dirview::Event::CopyRequested(locations) => {
                 self.clipboard.set_copy(locations.clone());
-                write_foreign_clipboard(ops::ClipboardOp::Copy, locations)
+                let incident = self.new_incident();
+                write_foreign_clipboard(incident, ops::ClipboardOp::Copy, locations)
             }
             ui::dirview::Event::CutRequested(locations) => {
                 self.clipboard.set_cut(locations.clone());
-                write_foreign_clipboard(ops::ClipboardOp::Cut, locations)
+                let incident = self.new_incident();
+                write_foreign_clipboard(incident, ops::ClipboardOp::Cut, locations)
             }
             ui::dirview::Event::PasteRequested(dest_dir) => self.start_paste(dest_dir),
             ui::dirview::Event::DeleteRequested(locations, mode) => {
@@ -178,7 +180,7 @@ impl App {
             ui::dirview::Event::App(action) => self.handle_app_action(action),
             // --- features (alphabetical) ---
             ui::dirview::Event::Failed(operation, failures) => {
-                self.report_failures(operation, failures);
+                self.report_new(operation, failures);
                 Task::none()
             }
         }
@@ -218,6 +220,6 @@ impl App {
                 failures.push(Failure::at(location, Cause::launch(&err)));
             }
         }
-        self.report_failures(Operation::Open, failures);
+        self.report_new(Operation::Open, failures);
     }
 }

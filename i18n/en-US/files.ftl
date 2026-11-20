@@ -159,6 +159,7 @@ failure-open-terminal = Couldn't open a terminal in “{ $name }”: { $reason }
 failure-run-action = Couldn't run “{ $name }”: { $reason }.
 failure-undo = Couldn't undo that: { $reason }.
 failure-restore = Couldn't restore “{ $name }” from the trash: { $reason }.
+failure-restore-unnamed = Couldn't restore an item from the trash: { $reason }.
 failure-empty-trash = Couldn't empty the trash: { $reason }.
 failure-clipboard = Couldn't share the copied items with other apps: { $reason }.
 
@@ -175,6 +176,8 @@ failure-reason-no-default-app = no app is set up to open this kind of file
 failure-reason-app-uninstalled = that app is no longer installed
 failure-reason-program-missing = the app couldn't be found
 failure-reason-other = { $message }
+failure-reason-unknown = something went wrong
+failure-reason-unsupported = this location doesn't support { $operation }
 
 failure-summary-copy =
     { $count ->

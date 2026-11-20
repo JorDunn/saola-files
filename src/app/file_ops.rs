@@ -8,7 +8,7 @@ use std::ffi::OsString;
 use iced::Task;
 
 use core::clipboard_interop;
-use core::failure::{Failure, Operation};
+use core::failure::{Failure, Incident, Operation};
 use core::fs::{ops, undo};
 use core::vfs::{Location, VfsError};
 use saola_files::{core, modules, tr, ui};
@@ -83,8 +83,9 @@ impl App {
                     .active_op
                     .as_ref()
                     .map(|request| failures::op_failures(request.kind, &request.dest_dir, &errors));
+                let incident = self.incidents.end_op();
                 if let Some((operation, failures)) = reported {
-                    self.report_failures(operation, failures);
+                    self.report_failures(incident, operation, failures);
                 }
 
                 // Stage 10: a clean (zero-conflict) Move is undo-able —
@@ -203,6 +204,7 @@ impl App {
             return Task::none();
         }
         let id = self.op_ids.alloc();
+        self.incidents.begin_op();
         self.active_op_had_conflict = false;
         self.active_op = Some(ops::OpRequest::new(id, kind, sources, dest_dir));
         Task::none()
@@ -236,11 +238,16 @@ impl App {
             return Task::none();
         };
         self.undo_toast = None;
-        Task::perform(undo::apply(entry), |result| match result {
+        let incident = self.new_incident();
+        Task::perform(undo::apply(entry), move |result| match result {
             Ok(()) => Message::Noop,
             Err(err) => {
                 eprintln!("saola-files: couldn't undo: {err}");
-                failed(Operation::Undo, vec![Failure::new(OsString::new(), err)])
+                failed(
+                    incident,
+                    Operation::Undo,
+                    vec![Failure::new(OsString::new(), err)],
+                )
             }
         })
     }
@@ -274,6 +281,10 @@ impl App {
         mode: ui::dirview::DeleteMode,
     ) -> Task<Message> {
         let force_permanent = mode == ui::dirview::DeleteMode::Permanent;
+        // One incident for the whole action: every item's task reports into
+        // it, so a 5-item delete that fails 5 times is one notice, "5 items
+        // couldn't be ...", not five competing ones.
+        let incident = self.new_incident();
         let tasks: Vec<Task<Message>> = locations
             .into_iter()
             .map(|location| {
@@ -286,7 +297,7 @@ impl App {
                         Ok(None) => Message::Noop,
                         Err((location, operation, err)) => {
                             eprintln!("saola-files: couldn't delete {location}: {err}");
-                            failed(operation, vec![Failure::at(&location, err)])
+                            failed(incident, operation, vec![Failure::at(&location, err)])
                         }
                     }
                 })
@@ -306,16 +317,18 @@ impl App {
 /// own internal clipboard/paste already worked before this stage existed
 /// and keeps working regardless of whether this succeeds.
 pub(super) fn write_foreign_clipboard(
+    incident: Incident,
     op: ops::ClipboardOp,
     locations: Vec<Location>,
 ) -> Task<Message> {
     Task::perform(
         clipboard_interop::write(op, locations),
-        |result| match result {
+        move |result| match result {
             Ok(()) => Message::Noop,
             Err(err) => {
                 eprintln!("saola-files: couldn't update the system clipboard: {err}");
                 failed(
+                    incident,
                     Operation::Clipboard,
                     vec![Failure::new(OsString::new(), err)],
                 )
@@ -374,4 +387,49 @@ async fn delete_one(
         .await
         .map(|()| None)
         .map_err(|err| (location.clone(), Operation::Delete, err))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A delete of several items where one cannot be deleted still deletes
+    /// the others: each item is its own `delete_one`, so one failure cannot
+    /// stop its neighbours, and the failure comes back worded for the
+    /// notice (`Operation::Delete`, the failed item's location).
+    ///
+    /// Not covered here, for lack of a seam: the trash branch writes to the
+    /// real `$XDG_DATA_HOME/Trash` (resolved from the environment inside
+    /// `core::fs::trash`, and tests never set env), so the `Trashed`
+    /// undo-entry pushes for the successful items can't be driven from a
+    /// unit test; and `start_delete` returns an opaque `iced::Task`, so its
+    /// shared incident can't be read back. The incident rule itself is
+    /// tested on `error_notice::Slot`.
+    #[test]
+    fn one_failed_delete_does_not_stop_the_others() {
+        let dir = std::env::temp_dir().join(format!("saola-files-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        let (a, b, missing) = (dir.join("a"), dir.join("b"), dir.join("missing"));
+        std::fs::write(&a, b"x").expect("write a");
+        std::fs::write(&b, b"x").expect("write b");
+
+        let results: Vec<_> = [&a, &missing, &b]
+            .into_iter()
+            .map(|path| {
+                futures::executor::block_on(delete_one(Location::local(path.clone()), true))
+            })
+            .collect();
+
+        assert!(!a.exists() && !b.exists(), "the others were still deleted");
+        assert!(matches!(results[0], Ok(None)));
+        assert!(matches!(results[2], Ok(None)));
+        match &results[1] {
+            Err((location, Operation::Delete, _)) => {
+                assert_eq!(location, &Location::local(missing.clone()));
+            }
+            other => panic!("expected a Delete failure, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
