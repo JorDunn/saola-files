@@ -167,6 +167,21 @@ impl TrashView {
         }
     }
 
+    /// How many items the trash holds (the status bar's count).
+    pub fn item_count(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Whether a listing of the trash is in flight.
+    pub fn is_loading(&self) -> bool {
+        self.loading
+    }
+
+    /// Whether the last listing of the trash failed.
+    pub fn has_error(&self) -> bool {
+        self.error.is_some()
+    }
+
     /// The name `index`'s item had before it was trashed, for wording a
     /// failed restore ("Couldn't restore “a.txt” ..."). `None` when `index`
     /// is out of range (or the entry has no name at all).

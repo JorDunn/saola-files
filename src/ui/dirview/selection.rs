@@ -21,11 +21,24 @@ pub struct Selection {
     /// Stays put across a range selection; a plain click/move or Ctrl+click
     /// resets it to the new position.
     anchor: Option<usize>,
+    /// Bumped by every change to `selected`, so a cache built from the set
+    /// (the status bar's size total, `summary.rs`) can tell it is stale
+    /// without comparing the set itself.
+    revision: u64,
 }
 
 impl Selection {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Changes whenever the selected set changes; see the field.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn touch(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
     }
 
     pub fn cursor(&self) -> Option<usize> {
@@ -57,6 +70,7 @@ impl Selection {
     /// unrelated cursor move, never for a fresh navigation (see
     /// `DirectoryView::navigate`, which resets the whole `Selection`).
     pub fn clear(&mut self) {
+        self.touch();
         self.selected.clear();
         self.anchor = None;
     }
@@ -64,6 +78,7 @@ impl Selection {
     /// A plain click (or plain cursor move) landing on `visible[index]`:
     /// select only that row, move the cursor and anchor there.
     pub fn click(&mut self, index: usize, name: OsString) {
+        self.touch();
         self.selected.clear();
         self.selected.insert(name);
         self.cursor = Some(index);
@@ -75,6 +90,7 @@ impl Selection {
     /// (matching most file managers: the next Shift+click ranges from the
     /// most recent Ctrl+click, not some earlier plain click).
     pub fn toggle_click(&mut self, index: usize, name: OsString) {
+        self.touch();
         if !self.selected.remove(&name) {
             self.selected.insert(name);
         }
@@ -88,6 +104,7 @@ impl Selection {
     /// was — a second Shift+click re-ranges from the same anchor rather
     /// than the last endpoint.
     pub fn range_select(&mut self, index: usize, names: impl IntoIterator<Item = OsString>) {
+        self.touch();
         self.selected.clear();
         self.selected.extend(names);
         self.cursor = Some(index);
@@ -97,6 +114,7 @@ impl Selection {
     }
 
     pub fn select_all(&mut self, names: impl IntoIterator<Item = OsString>) {
+        self.touch();
         self.selected.clear();
         self.selected.extend(names);
     }
@@ -115,7 +133,9 @@ impl Selection {
     /// [`Self::clear`]: one entry disappearing shouldn't touch anything
     /// else that's still selected, or the anchor a Shift-range is tracking.
     pub fn forget(&mut self, name: &OsStr) {
-        self.selected.remove(name);
+        if self.selected.remove(name) {
+            self.touch();
+        }
     }
 
     /// A watched rename: if `from` was selected, `to` becomes selected in
@@ -125,6 +145,7 @@ impl Selection {
     /// selection to survive it.
     pub fn rename(&mut self, from: &OsStr, to: OsString) {
         if self.selected.remove(from) {
+            self.touch();
             self.selected.insert(to);
         }
     }

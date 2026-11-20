@@ -22,6 +22,7 @@ mod navigation;
 mod properties;
 mod session;
 mod sniff;
+mod statusbar;
 mod subscription;
 mod thumbs;
 mod view;
@@ -144,6 +145,12 @@ pub(crate) enum Message {
     /// The error notice's buttons, and the way anything reports a failure
     /// into it (`error_notice::Message::Report`; see `failures::failed`).
     ErrorNotice(ui::dialogs::error_notice::Message),
+    /// A `statfs` for a view's free space came back (`app::statusbar`).
+    FreeSpace(
+        ViewId,
+        Location,
+        Result<core::vfs::FsStats, core::vfs::VfsError>,
+    ),
     /// Session-state events (`session.rs`): window resizes.
     Session(session::Message),
     /// A batch of background content-sniff head reads finished
@@ -369,6 +376,8 @@ pub(crate) struct App {
     /// The failure notice in the footer band, if one is showing. Persists
     /// until dismissed; see `ui::dialogs::error_notice` and `failures`.
     error_notice: ui::dialogs::error_notice::Slot,
+    /// Each view's free-space reading for the status bar (`statusbar.rs`).
+    free_space: statusbar::FreeSpace,
     /// Incident bookkeeping for failure notices (see `failures`).
     incidents: failures::Incidents,
     /// Remembered window size, last location and per-folder view
@@ -488,6 +497,7 @@ impl App {
             activation,
             // --- features (alphabetical) ---
             error_notice: ui::dialogs::error_notice::Slot::default(),
+            free_space: statusbar::FreeSpace::default(),
             incidents: failures::Incidents::default(),
             session,
             sniff_inflight: HashSet::new(),
@@ -535,7 +545,16 @@ impl App {
                 }
                 KeyRoute::Drop => Task::none(),
             },
-            Message::OpEvent(event) => self.handle_op_event(event),
+            Message::OpEvent(event) => {
+                // A finished or cancelled operation changed what is free.
+                let ended = statusbar::op_event_ends_op(&event);
+                let task = self.handle_op_event(event);
+                if ended {
+                    Task::batch([task, self.refresh_all_free_space()])
+                } else {
+                    task
+                }
+            }
             Message::Progress(ui::dialogs::progress::Message::CancelRequested) => {
                 if let Some(request) = &self.active_op {
                     request.request_cancel();
@@ -591,6 +610,7 @@ impl App {
             Message::DbusPropertiesResolved(items) => self.open_properties(items),
             // --- features (alphabetical) ---
             Message::ErrorNotice(inner) => self.handle_error_notice(inner),
+            Message::FreeSpace(id, location, result) => self.on_free_space(id, location, result),
             Message::Session(inner) => self.handle_session_message(inner),
             Message::SniffReady(outcomes) => self.handle_sniff_ready(outcomes),
         }
@@ -604,10 +624,14 @@ impl App {
         let Some(view) = ui::explorer::find_mut(&mut self.views, id) else {
             return Task::none();
         };
+        let epoch_before = view.refresh_epoch();
         let (task, event) = view.update(message);
+        // A listing or watch batch landed: the free space may have changed.
+        let refreshed = view.refresh_epoch() != epoch_before;
         // A view-mode or sort change (or back/forward) is a session event.
         let session_task = self.session_view_updated(id);
-        let mut tasks = vec![directory_task(id, task), session_task];
+        let free_space_task = self.free_space_after_view_update(id, refreshed);
+        let mut tasks = vec![directory_task(id, task), session_task, free_space_task];
         if let Some(event) = event {
             tasks.push(self.handle_directory_event(id, event));
         }

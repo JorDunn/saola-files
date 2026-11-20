@@ -233,6 +233,37 @@ error-notice-details = Details
 error-notice-hide-details = Hide details
 error-notice-more = …and { $count } more
 
+## Status bar
+
+## The window's bottom band: what the folder holds, what is selected, and the
+## free space. Sizes are formatted by `core::fs::format::human_size`. A
+## selection's size counts files only: a folder's size is not known without
+## walking it, and the bar never does.
+
+statusbar-items =
+    { $count ->
+        [0] No items
+        [one] { $count } item
+       *[other] { $count } items
+    }
+statusbar-items-hidden =
+    { $count ->
+        [one] { $count } item, { $hidden } hidden
+       *[other] { $count } items, { $hidden } hidden
+    }
+statusbar-selected = { $count } of { $total } selected
+statusbar-selected-size = { $count } of { $total } selected, { $size }
+statusbar-selected-size-files = { $count } of { $total } selected, { $size } in files
+statusbar-unavailable = Couldn't list this folder
+statusbar-free = { $size } free
+statusbar-trash-items =
+    { $count ->
+        [0] Trash is empty
+        [one] { $count } item in the trash
+       *[other] { $count } items in the trash
+    }
+statusbar-trash-unavailable = Couldn't read the trash
+
 ## Keyboard shortcuts
 ##
 ## Labels for the rows of `keymap::BINDINGS`, one per action, id `keys-` plus

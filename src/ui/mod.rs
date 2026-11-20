@@ -15,5 +15,6 @@ pub mod menu_placement;
 pub mod menus;
 pub mod right_click;
 pub mod sidebar;
+pub mod statusbar;
 pub mod trashview;
 pub mod window;
