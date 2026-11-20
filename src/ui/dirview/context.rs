@@ -21,6 +21,8 @@
 //! at the window edge) happens at draw time in `ui::anchored`, because only
 //! then is the menu's size known.
 
+#[cfg(test)]
+use iced::keyboard;
 use iced::{Point, Rectangle, Size, Task};
 use saola_theme::tokens::Sizes;
 
@@ -70,7 +72,10 @@ impl DirectoryView {
 
     /// Whether a right-click may open the menu right now: not while a rename
     /// or the path editor owns the pointer/keyboard, and not while a popover
-    /// is already open (the scrim closes it instead).
+    /// is already open (the scrim closes it instead). Ignoring a right-click
+    /// during an inline rename is deliberate: it matches the keyboard guard
+    /// in `handle_keyboard` (one input surface owns input at a time), and
+    /// opening a menu would act on a selection the rename is still editing.
     fn context_menu_allowed(&self) -> bool {
         self.rename.is_none() && self.path_edit.is_none() && !self.menu_open && !self.open_with_open
     }
@@ -120,6 +125,14 @@ impl DirectoryView {
             self.selection.click(index, name);
         }
         self.open_context_menu(MenuAnchor::CursorRow);
+    }
+
+    /// Forgets the anchor once no popover is open, so one opened some other
+    /// way can never inherit it. Called from `update` after every message.
+    pub(super) fn drop_stale_menu_anchor(&mut self) {
+        if !self.menu_open && !self.open_with_open {
+            self.menu_anchor = None;
+        }
     }
 
     fn open_context_menu(&mut self, anchor: MenuAnchor) {
@@ -325,6 +338,37 @@ mod tests {
         let _ = view.update(ViewMessage::Menu(super::super::menu::Message::Open));
         assert!(view.menu_open());
         assert_eq!(view.menu_anchor, None);
+    }
+
+    #[test]
+    fn the_anchor_is_forgotten_whenever_the_popover_closes() {
+        let mut view = listed_view(vec![file("a")]);
+        right_click(&mut view, Point::new(5.0, 5.0), None);
+        assert!(view.menu_anchor.is_some());
+        // Close by a path that never touches `menu_anchor` itself: Escape.
+        let escape = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        };
+        let _ = view.update(ViewMessage::Keyboard(escape));
+        assert!(!view.menu_open());
+        assert_eq!(view.menu_anchor, None);
+    }
+
+    #[test]
+    fn folder_properties_bubbles_this_views_own_location() {
+        let mut view = listed_view(vec![file("a")]);
+        let message = ViewMessage::Menu(super::super::menu::Message::FolderPropertiesRequested);
+        let (_, event) = view.update(message);
+        assert!(matches!(
+            event,
+            Some(Event::FolderPropertiesRequested(location)) if location == crate::core::vfs::Location::local("/home")
+        ));
     }
 
     #[test]

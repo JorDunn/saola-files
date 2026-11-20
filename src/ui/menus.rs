@@ -177,6 +177,10 @@ fn has_selection(ctx: &MenuContext) -> bool {
     ctx.selected > 0
 }
 
+fn no_selection(ctx: &MenuContext) -> bool {
+    ctx.selected == 0
+}
+
 fn single_selection(ctx: &MenuContext) -> bool {
     ctx.selected == 1
 }
@@ -210,6 +214,7 @@ pub(super) const CONTEXT_MENU: &[MenuEntry] = &[
     MenuEntry { glyph: Icon::FolderPlus,     label_id: msg!("menu-new-folder"),       shown: always,                      message: menu::Message::NewFolderRequested },
     MenuEntry { glyph: Icon::FilePlus,       label_id: msg!("menu-new-file"),         shown: always,                      message: menu::Message::NewFileRequested },
     MenuEntry { glyph: Icon::Info,           label_id: msg!("menu-properties"),       shown: has_selection,               message: menu::Message::PropertiesRequested },
+    MenuEntry { glyph: Icon::Info,           label_id: msg!("menu-folder-properties"), shown: no_selection,                message: menu::Message::FolderPropertiesRequested },
     // --- features: insert one row at the position it should display ---
 ];
 
@@ -414,7 +419,12 @@ mod tests {
     fn menu_with_nothing_selected_and_an_empty_clipboard() {
         assert_eq!(
             labels(0, false, false),
-            ["Open in terminal", "New Folder", "New File"]
+            [
+                "Open in terminal",
+                "New Folder",
+                "New File",
+                "Folder properties"
+            ]
         );
     }
 
@@ -422,7 +432,13 @@ mod tests {
     fn menu_with_nothing_selected_and_a_full_clipboard() {
         assert_eq!(
             labels(0, true, false),
-            ["Open in terminal", "Paste", "New Folder", "New File"]
+            [
+                "Open in terminal",
+                "Paste",
+                "New Folder",
+                "New File",
+                "Folder properties"
+            ]
         );
     }
 

@@ -61,6 +61,9 @@ pub enum Message {
     /// (`Action::Properties`).
     PropertiesRequested,
     // --- features (alphabetical) ---
+    /// "Folder properties" (shown with nothing selected): properties of the
+    /// directory this view is showing.
+    FolderPropertiesRequested,
     /// A click on the popover's own padding: swallowed, so it neither
     /// reaches the scrim (which would close the menu) nor the list behind.
     Swallow,
@@ -87,6 +90,7 @@ impl DirectoryView {
             Message::DeleteRequested => self.on_menu_delete_requested(),
             Message::PropertiesRequested => self.on_menu_properties_requested(),
             // --- features (alphabetical) ---
+            Message::FolderPropertiesRequested => self.on_menu_folder_properties_requested(),
             Message::Swallow => (Task::none(), None),
         }
     }
@@ -228,6 +232,17 @@ impl DirectoryView {
     pub(super) fn on_menu_properties_requested(&mut self) -> (Task<ViewMessage>, Option<Event>) {
         self.menu_open = false;
         (Task::none(), self.properties_event())
+    }
+
+    /// [`Message::FolderPropertiesRequested`]'s handler.
+    pub(super) fn on_menu_folder_properties_requested(
+        &mut self,
+    ) -> (Task<ViewMessage>, Option<Event>) {
+        self.menu_open = false;
+        (
+            Task::none(),
+            Some(Event::FolderPropertiesRequested(self.location.clone())),
+        )
     }
 
     /// The rows Enter/double-click should act on: the current selection,

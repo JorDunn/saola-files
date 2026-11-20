@@ -39,20 +39,25 @@ pub fn place(anchor: Rectangle, menu: Size, bounds: Size, gap: f32) -> Point {
 /// One axis of [`place`]. `start`/`end` are the anchor's near and far edges
 /// along the axis; the popover prefers to begin just after `end`.
 fn place_axis(start: f32, end: f32, menu: f32, bounds: f32, gap: f32) -> f32 {
+    // The largest origin that keeps the popover inside; 0 when it is bigger
+    // than the region (then it sits at the origin and is cut off at the far
+    // side, which is the best that can be done).
+    let max_origin = (bounds - menu).max(0.0);
+
     let after = end + gap;
-    if after + menu <= bounds {
-        // `max(0.0)`: an anchor scrolled out of view above/left of the
-        // region must not drag the popover out with it.
-        return after.max(0.0);
+    if after >= 0.0 && after <= max_origin {
+        return after;
     }
     let before = start - gap - menu;
-    if before >= 0.0 {
+    if before >= 0.0 && before <= max_origin {
         return before;
     }
-    // Neither side fits: pin to the far edge so as much of the popover as
-    // possible is visible, and never past the near edge. `max(0.0)` keeps a
-    // popover bigger than the region anchored at the top/left.
-    (bounds - menu).max(0.0)
+    // Neither side fits inside the region. This also covers an anchor that
+    // is itself outside the region (a cursor row scrolled out of view):
+    // take the nearest position that is fully visible, so the popover is
+    // never placed off-screen. `max`/`min` rather than `clamp`, which
+    // panics on a bad range.
+    after.max(0.0).min(max_origin)
 }
 
 #[cfg(test)]
@@ -144,6 +149,60 @@ mod tests {
                         && menu.y + menu.height <= window.height,
                     "({x}, {y}) -> {origin:?}"
                 );
+            }
+        }
+    }
+
+    /// Every axis result must be fully inside, for any anchor at all.
+    fn assert_inside(origin: Point, what: &str) {
+        assert!(
+            origin.x >= 0.0 && origin.x + MENU.width <= WINDOW.width,
+            "{what}: {origin:?}"
+        );
+        assert!(
+            origin.y >= 0.0 && origin.y + MENU.height <= WINDOW.height,
+            "{what}: {origin:?}"
+        );
+    }
+
+    #[test]
+    fn an_anchor_far_below_the_bounds_still_places_the_menu_inside() {
+        // A cursor row scrolled out of view below the viewport.
+        let row = Rectangle::new(Point::new(20.0, 2000.0), Size::new(0.0, 38.0));
+        let origin = place(row, MENU, WINDOW, GAP);
+        assert_inside(origin, "below");
+        assert_eq!(origin.y, WINDOW.height - MENU.height);
+    }
+
+    #[test]
+    fn an_anchor_far_above_the_bounds_still_places_the_menu_inside() {
+        let row = Rectangle::new(Point::new(20.0, -2000.0), Size::new(0.0, 38.0));
+        let origin = place(row, MENU, WINDOW, GAP);
+        assert_inside(origin, "above");
+        assert_eq!(origin.y, 0.0);
+    }
+
+    #[test]
+    fn an_anchor_far_right_or_left_of_the_bounds_still_places_the_menu_inside() {
+        let right = place(at(5000.0, 100.0), MENU, WINDOW, GAP);
+        assert_inside(right, "right");
+        assert_eq!(right.x, WINDOW.width - MENU.width);
+        let left = place(at(-5000.0, 100.0), MENU, WINDOW, GAP);
+        assert_inside(left, "left");
+        assert_eq!(left.x, 0.0);
+    }
+
+    #[test]
+    fn an_anchor_inside_the_bounds_is_unchanged_by_the_clamp() {
+        let origin = place(at(300.0, 200.0), MENU, WINDOW, GAP);
+        assert_eq!(origin, Point::new(304.0, 204.0));
+    }
+
+    #[test]
+    fn a_far_anchor_sweep_never_leaves_the_window() {
+        for x in [-9000.0, -1.0, 0.0, 500.0, 1000.0, 1001.0, 9000.0] {
+            for y in [-9000.0, -1.0, 0.0, 400.0, 800.0, 801.0, 9000.0] {
+                assert_inside(place(at(x, y), MENU, WINDOW, GAP), "sweep");
             }
         }
     }

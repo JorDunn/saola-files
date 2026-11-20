@@ -183,6 +183,14 @@ impl App {
                 self.report_failures(incident, operation, failures);
                 Task::none()
             }
+            ui::dirview::Event::FolderPropertiesRequested(location) => {
+                // Same async metadata fetch (through the backend) and same
+                // dialog path as the D-Bus `ShowItemProperties` call.
+                Task::perform(
+                    super::properties::resolve_dbus_properties(vec![location]),
+                    Message::DbusPropertiesResolved,
+                )
+            }
         }
     }
 

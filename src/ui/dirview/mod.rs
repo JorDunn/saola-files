@@ -278,6 +278,10 @@ pub enum Event {
     /// could not be created). The owner decides how to show it; see
     /// `ui::dialogs::error_notice`.
     Failed(Incident, Operation, Vec<Failure>),
+    /// The context menu's "Folder properties": open the properties dialog
+    /// for this view's own directory. Carries only the location; `App`
+    /// fetches its metadata through the backend.
+    FolderPropertiesRequested(Location),
 }
 
 /// One thumbnail candidate bubbled via [`Event::ThumbnailsNeeded`] —
@@ -570,6 +574,15 @@ impl DirectoryView {
     }
 
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Event>) {
+        let result = self.dispatch(message);
+        // The one place that notices a popover has closed, however it was
+        // closed (about twenty sites clear the flags) — see `context.rs`.
+        self.drop_stale_menu_anchor();
+        result
+    }
+
+    /// The message match `update` wraps.
+    fn dispatch(&mut self, message: Message) -> (Task<Message>, Option<Event>) {
         match message {
             Message::Listed(location, result) => self.on_listed(location, result),
             Message::TargetResolved(location, select, result) => {

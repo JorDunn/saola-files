@@ -66,6 +66,7 @@ menu-delete = Delete
 menu-new-folder = New Folder
 menu-new-file = New File
 menu-properties = Properties
+menu-folder-properties = Folder properties
 menu-nothing-selected = Nothing selected
 menu-no-known-app = No known app for this file type
 
