@@ -147,6 +147,19 @@ impl App {
         self.error_notice.report(incident, operation, failures);
     }
 
+    /// [`Self::report_failures`] when the engine kept only the first few
+    /// failures and `omitted` more were only counted.
+    pub(super) fn report_failures_omitting(
+        &mut self,
+        incident: Incident,
+        operation: Operation,
+        failures: Vec<Failure>,
+        omitted: usize,
+    ) {
+        self.error_notice
+            .report_omitting(incident, operation, failures, omitted);
+    }
+
     /// [`Self::report_failures`] for an action that is complete in itself:
     /// mints its incident first.
     pub(super) fn report_new(&mut self, operation: Operation, failures: Vec<Failure>) {

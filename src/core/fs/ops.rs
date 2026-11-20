@@ -259,7 +259,12 @@ pub enum OpEvent {
     },
     /// The op ran to completion (possibly with per-item errors, e.g. one
     /// unreadable file in a large tree) rather than being cancelled.
-    Finished { errors: Vec<(Location, VfsError)> },
+    Finished {
+        errors: Vec<(Location, VfsError)>,
+        /// Failures beyond `errors` (a removal keeps only the first few
+        /// in full); counted so the notice headline stays right.
+        omitted: usize,
+    },
     /// The op stopped early because `OpRequest::request_cancel` was called,
     /// or because nobody was listening on a *must-deliver* event anymore
     /// (the progress UI was torn down mid-conflict-prompt — see
@@ -380,7 +385,14 @@ async fn execute(request: OpRequest, mut tx: mpsc::Sender<OpEvent>) {
     }
 
     if remaining.is_empty() {
-        send_event(&mut tx, OpEvent::Finished { errors: Vec::new() }).await;
+        send_event(
+            &mut tx,
+            OpEvent::Finished {
+                errors: Vec::new(),
+                omitted: 0,
+            },
+        )
+        .await;
         return;
     }
 
@@ -392,6 +404,7 @@ async fn execute(request: OpRequest, mut tx: mpsc::Sender<OpEvent>) {
             &mut tx,
             OpEvent::Finished {
                 errors: vec![(request.dest_dir.clone(), err)],
+                omitted: 0,
             },
         )
         .await;
@@ -437,11 +450,38 @@ async fn execute(request: OpRequest, mut tx: mpsc::Sender<OpEvent>) {
     if ctx.cancelled {
         send_event(&mut ctx.tx, OpEvent::Cancelled).await;
     } else {
-        send_event(&mut ctx.tx, OpEvent::Finished { errors: ctx.errors }).await;
+        send_event(
+            &mut ctx.tx,
+            OpEvent::Finished {
+                errors: ctx.errors,
+                omitted: 0,
+            },
+        )
+        .await;
     }
 }
 
 // ── Trash and delete ────────────────────────────────────────────────────
+
+/// How many failures one removal keeps in full. The notice shows fewer
+/// (`ui::dialogs::error_notice::MAX_DETAIL_LINES`); the surplus over that
+/// is for stderr, which logs each kept one. Failures past this are only
+/// counted ([`OpEvent::Finished`]'s `omitted`), so a directory of a million
+/// undeletable files cannot grow memory, event clones or log lines without
+/// bound.
+const MAX_KEPT_FAILURES: usize = 32;
+
+/// True for a directory-entry name that must never be joined onto a path:
+/// empty (re-enters the same directory forever), `.` / `..` (escape or
+/// loop), or containing a `/` (an absolute name makes `Path::join` replace
+/// the whole path; `a/../..` climbs out of the tree). A well-behaved
+/// backend never produces these; a hostile or buggy server can. Compared as
+/// bytes, never as lossy text.
+pub(crate) fn is_unsafe_entry_name(name: &std::ffi::OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = name.as_bytes();
+    bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/')
+}
 
 /// Mutable state of one trash/delete op. Separate from [`ExecContext`]
 /// because a removal has no destination backend or conflicts.
@@ -449,7 +489,10 @@ struct RemovalState {
     cancel: Arc<AtomicBool>,
     tx: mpsc::Sender<OpEvent>,
     items_done: usize,
+    /// The first [`MAX_KEPT_FAILURES`] failures.
     errors: Vec<(Location, VfsError)>,
+    /// Failures beyond those kept.
+    omitted: usize,
     /// Set the moment cancel is seen (or nobody listens any more).
     cancelled: bool,
 }
@@ -460,6 +503,33 @@ impl RemovalState {
             self.cancelled = true;
         }
         self.cancelled
+    }
+
+    /// Records one failed item, keeping only the first few in full.
+    fn fail(&mut self, location: Location, err: VfsError) {
+        if self.errors.len() < MAX_KEPT_FAILURES {
+            self.errors.push((location, err));
+        } else {
+            self.omitted += 1;
+        }
+    }
+
+    /// How many failures so far, kept or not. A directory compares this
+    /// before and after its children to learn whether any of them survived.
+    fn failure_count(&self) -> usize {
+        self.errors.len() + self.omitted
+    }
+
+    /// Records an entry name [`is_unsafe_entry_name`] refused, against the
+    /// directory that listed it (the name itself is not trustworthy as a
+    /// path).
+    fn fail_unsafe_name(&mut self, directory: &Location) {
+        self.fail(
+            directory.clone(),
+            VfsError::Other {
+                message: crate::tr!("error-unsafe-entry-name"),
+            },
+        );
     }
 
     /// One more item is gone: report cumulative progress. Items, not bytes:
@@ -497,6 +567,13 @@ impl RemovalState {
 /// Teaching note: `R: Fn(..) + Sync` lets us borrow the closure across
 /// `.await` points inside a task tokio may move between threads; sharing a
 /// borrow across threads needs `Sync`.
+///
+/// Event order: `Started` is sent first with a total of 0 ("not known
+/// yet", so the strip appears at once); for a delete, a second `Started`
+/// follows when the pre-scan finishes (the app just replaces its progress
+/// snapshot, and nothing has been removed yet). The scan honours cancel.
+/// Cancelling with failures already recorded ends in `Finished` carrying
+/// them (so they are not lost); cancelling with none ends in `Cancelled`.
 async fn execute_removal<R>(request: OpRequest, tx: mpsc::Sender<OpEvent>, resolve: &R)
 where
     R: Fn(&Location) -> Option<Box<dyn Backend>> + Sync,
@@ -506,28 +583,19 @@ where
         tx,
         items_done: 0,
         errors: Vec::new(),
+        omitted: 0,
         cancelled: false,
     };
 
-    // Totals. Trash counts top-level sources (one rename each). Delete
-    // pre-scans so the strip can say "N of M"; like `count_totals` the scan
-    // may undercount, which only makes the bar read optimistic.
-    let files_total = match request.kind {
-        OpKind::Delete => {
-            let mut total = 0usize;
-            for source in &request.sources {
-                if let Some(backend) = resolve(source) {
-                    total += count_removal_items(backend.as_ref(), source.clone(), None).await;
-                }
-            }
-            total
-        }
-        _ => request.sources.len(),
+    let first_total = if request.kind == OpKind::Trash {
+        request.sources.len()
+    } else {
+        0
     };
     if !send_event(
         &mut state.tx,
         OpEvent::Started {
-            files_total,
+            files_total: first_total,
             bytes_total: 0,
         },
     )
@@ -536,17 +604,38 @@ where
         return; // nobody is listening
     }
 
+    // Delete pre-scans so the strip can say "N of M"; like `count_totals`
+    // the scan may undercount, which only makes the bar read optimistic.
+    if request.kind == OpKind::Delete {
+        let mut total = 0usize;
+        for source in &request.sources {
+            if let Some(backend) = resolve(source) {
+                total +=
+                    count_removal_items(backend.as_ref(), source.clone(), None, &request.cancel)
+                        .await;
+            }
+        }
+        if !state.is_cancelled()
+            && !send_event(
+                &mut state.tx,
+                OpEvent::Started {
+                    files_total: total,
+                    bytes_total: 0,
+                },
+            )
+            .await
+        {
+            return;
+        }
+    }
+
     for source in request.sources {
         if state.is_cancelled() {
             break;
         }
         let Some(backend) = resolve(&source) else {
-            state.errors.push((
-                source.clone(),
-                VfsError::Other {
-                    message: format!("no backend for scheme \"{}\"", source.scheme),
-                },
-            ));
+            let message = crate::tr!("error-no-backend", scheme = source.scheme.as_str());
+            state.fail(source, VfsError::Other { message });
             continue;
         };
         match request.kind {
@@ -563,16 +652,18 @@ where
         }
     }
 
-    if state.cancelled {
+    if state.cancelled && state.failure_count() == 0 {
         send_event(&mut state.tx, OpEvent::Cancelled).await;
     } else {
-        let errors = state.errors;
-        send_event(&mut state.tx, OpEvent::Finished { errors }).await;
+        let (errors, omitted) = (state.errors, state.omitted);
+        send_event(&mut state.tx, OpEvent::Finished { errors, omitted }).await;
     }
 }
 
 /// Moves one source into the trash. Honest about capabilities: a backend
-/// that cannot trash gets an error rather than a silent permanent delete.
+/// that cannot trash gets an error rather than a silent permanent delete,
+/// and a trash that fails stays a failure: nothing here ever falls back to
+/// deleting.
 async fn trash_source(
     state: &mut RemovalState,
     backend: &dyn Backend,
@@ -581,12 +672,12 @@ async fn trash_source(
 ) {
     state.started(&source);
     if !(source.is_local() && backend.caps().contains(Caps::TRASH)) {
-        state.errors.push((
+        state.fail(
             source,
             VfsError::Unsupported {
-                operation: "moving to the trash".to_owned(),
+                operation: crate::tr!("error-unsupported-trash"),
             },
-        ));
+        );
         return;
     }
     // The trash code is plain blocking filesystem work, so it runs on
@@ -610,27 +701,43 @@ async fn trash_source(
                 state.cancelled = true;
             }
         }
-        Ok(Err(err)) => state.errors.push((source, err)),
-        Err(join_err) => state.errors.push((
+        Ok(Err(err)) => state.fail(source, err),
+        Err(join_err) => state.fail(
             source,
             VfsError::Other {
-                message: format!("internal error trashing: {join_err}"),
+                message: crate::tr!("error-trash-internal", detail = join_err.to_string()),
             },
-        )),
+        ),
     }
 }
 
-/// Removes `location` and everything under it, depth first. `known` is the
-/// kind and symlink flag a parent's listing already reported (saves a call);
-/// `None` asks the backend.
+/// True only for a real directory: `Backend::metadata` is `lstat`-like on
+/// both backends (`modules::local` uses `symlink_metadata`, `modules::sftp`
+/// the protocol's lstat), so a symlink reports `is_symlink` and is never
+/// mistaken for the directory it points at.
+fn is_real_directory(entry: &crate::core::fs::entry::FileEntry) -> bool {
+    entry.kind == EntryKind::Directory && !entry.is_symlink
+}
+
+/// Removes `location` and everything under it, depth first. `listed_as_dir`
+/// is what the parent's listing said (`None` for a top-level source): only a
+/// hint. It is never trusted to descend, because a listing can be stale (the
+/// entry was swapped for a symlink since) or come from a server that reports
+/// followed attributes. Immediately before listing a directory, the walk
+/// asks `backend.metadata` (lstat) and descends **only if that says real
+/// directory, not symlink**; otherwise the entry is removed as a single
+/// item (unlinked, if it is a link). That check is the whole defence against
+/// following a link out of the tree.
 ///
-/// Symlinks are never followed: a link is removed as an item and its target
-/// is not listed, even when the target is a directory.
+/// Residual risk: between that check and the `list` call another process
+/// could still swap the directory for a link. The window is the length of
+/// one round trip, as it was for the pre-engine recursive delete; closing it
+/// needs `openat`-style descent, which the `Backend` trait does not offer.
 fn remove_tree<'a>(
     state: &'a mut RemovalState,
     backend: &'a dyn Backend,
     location: Location,
-    known: Option<(EntryKind, bool)>,
+    listed_as_dir: Option<bool>,
 ) -> BoxFuture<'a, ()> {
     // Async fns cannot call themselves directly; boxing the future is the
     // standard workaround (same as `copy_item`).
@@ -638,23 +745,27 @@ fn remove_tree<'a>(
         if state.is_cancelled() {
             return;
         }
-        let (kind, is_symlink) = match known {
-            Some(known) => known,
-            None => match backend.metadata(&location).await {
-                Ok(entry) => (entry.kind, entry.is_symlink),
+        // A parent that listed this as a non-directory needs no lookup: it
+        // is removed as one item, and a backend's `remove` itself refuses a
+        // non-empty directory rather than recursing.
+        let descend = if listed_as_dir == Some(false) {
+            false
+        } else {
+            match backend.metadata(&location).await {
+                Ok(entry) => is_real_directory(&entry),
                 Err(err) => {
-                    state.errors.push((location, err));
+                    state.fail(location, err);
                     return;
                 }
-            },
+            }
         };
 
-        if kind == EntryKind::Directory && !is_symlink {
-            let errors_before = state.errors.len();
+        if descend {
+            let failures_before = state.failure_count();
             let children = match backend.list(&location).await {
                 Ok(children) => children,
                 Err(err) => {
-                    state.errors.push((location, err));
+                    state.fail(location, err);
                     return;
                 }
             };
@@ -662,18 +773,17 @@ fn remove_tree<'a>(
                 if state.is_cancelled() {
                     return;
                 }
+                if is_unsafe_entry_name(&child.name) {
+                    state.fail_unsafe_name(&location);
+                    continue;
+                }
                 let child_location = location.join(&child.name);
-                remove_tree(
-                    state,
-                    backend,
-                    child_location,
-                    Some((child.kind, child.is_symlink)),
-                )
-                .await;
+                let as_dir = child.kind == EntryKind::Directory;
+                remove_tree(state, backend, child_location, Some(as_dir)).await;
             }
             // If something inside could not go, removing the directory
             // would only fail again with a misleading "not empty".
-            if state.is_cancelled() || state.errors.len() != errors_before {
+            if state.is_cancelled() || state.failure_count() != failures_before {
                 return;
             }
         }
@@ -681,36 +791,47 @@ fn remove_tree<'a>(
         state.started(&location);
         match backend.remove(&location).await {
             Ok(()) => state.item_done(),
-            Err(err) => state.errors.push((location, err)),
+            Err(err) => state.fail(location, err),
         }
     })
 }
 
 /// Counts what [`remove_tree`] would remove (directories included), for the
-/// progress total. Errors stop that branch silently, like [`count_one`].
+/// progress total. Follows the same rules: descends only after an lstat
+/// says real directory, skips unsafe names (the walk reports them), stops
+/// at cancel, and ignores errors like [`count_one`].
 fn count_removal_items<'a>(
     backend: &'a dyn Backend,
     location: Location,
-    known: Option<(EntryKind, bool)>,
+    listed_as_dir: Option<bool>,
+    cancel: &'a AtomicBool,
 ) -> BoxFuture<'a, usize> {
     Box::pin(async move {
-        let (kind, is_symlink) = match known {
-            Some(known) => known,
-            None => match backend.metadata(&location).await {
-                Ok(entry) => (entry.kind, entry.is_symlink),
+        if cancel.load(Ordering::Relaxed) {
+            return 0;
+        }
+        let descend = if listed_as_dir == Some(false) {
+            false
+        } else {
+            match backend.metadata(&location).await {
+                Ok(entry) => is_real_directory(&entry),
                 Err(_) => return 0,
-            },
+            }
         };
         let mut total = 1;
-        if kind == EntryKind::Directory && !is_symlink {
+        if descend {
             let Ok(children) = backend.list(&location).await else {
                 return total;
             };
             for child in children {
+                if is_unsafe_entry_name(&child.name) {
+                    continue;
+                }
                 total += count_removal_items(
                     backend,
                     location.join(&child.name),
-                    Some((child.kind, child.is_symlink)),
+                    Some(child.kind == EntryKind::Directory),
+                    cancel,
                 )
                 .await;
             }
@@ -1345,7 +1466,9 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(events.last(), Some(OpEvent::Finished { errors }) if errors.is_empty()));
+        assert!(
+            matches!(events.last(), Some(OpEvent::Finished { errors, .. }) if errors.is_empty())
+        );
 
         let dst_name = src_root.file_name().unwrap();
         let copied_root = dst_root.join(dst_name);
@@ -1383,7 +1506,9 @@ mod tests {
             },
         )
         .await;
-        assert!(matches!(events.last(), Some(OpEvent::Finished { errors }) if errors.is_empty()));
+        assert!(
+            matches!(events.last(), Some(OpEvent::Finished { errors, .. }) if errors.is_empty())
+        );
 
         let copied = dst_root.join(raw_name);
         assert_eq!(std::fs::read(&copied).unwrap(), b"x");
@@ -1414,7 +1539,9 @@ mod tests {
             },
         )
         .await;
-        assert!(matches!(events.last(), Some(OpEvent::Finished { errors }) if errors.is_empty()));
+        assert!(
+            matches!(events.last(), Some(OpEvent::Finished { errors, .. }) if errors.is_empty())
+        );
 
         assert!(!root.join("from/f.txt").exists());
         assert_eq!(std::fs::read(root.join("to/f.txt")).unwrap(), b"data");
@@ -1444,7 +1571,9 @@ mod tests {
             },
         )
         .await;
-        assert!(matches!(events.last(), Some(OpEvent::Finished { errors }) if errors.is_empty()));
+        assert!(
+            matches!(events.last(), Some(OpEvent::Finished { errors, .. }) if errors.is_empty())
+        );
 
         assert!(!src_root.join("dir").exists());
         assert_eq!(std::fs::read(dst_root.join("dir/f.txt")).unwrap(), b"data");
@@ -1477,7 +1606,9 @@ mod tests {
         .await;
 
         assert!(events.iter().any(|e| matches!(e, OpEvent::Conflict { .. })));
-        assert!(matches!(events.last(), Some(OpEvent::Finished { errors }) if errors.is_empty()));
+        assert!(
+            matches!(events.last(), Some(OpEvent::Finished { errors, .. }) if errors.is_empty())
+        );
         assert_eq!(std::fs::read(dst_root.join("f.txt")).unwrap(), b"new");
 
         cleanup(src_root);
@@ -1507,7 +1638,9 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(events.last(), Some(OpEvent::Finished { errors }) if errors.is_empty()));
+        assert!(
+            matches!(events.last(), Some(OpEvent::Finished { errors, .. }) if errors.is_empty())
+        );
         assert_eq!(std::fs::read(dst_root.join("f.txt")).unwrap(), b"old");
 
         cleanup(src_root);
@@ -1537,7 +1670,9 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(events.last(), Some(OpEvent::Finished { errors }) if errors.is_empty()));
+        assert!(
+            matches!(events.last(), Some(OpEvent::Finished { errors, .. }) if errors.is_empty())
+        );
         assert_eq!(std::fs::read(dst_root.join("f.txt")).unwrap(), b"old");
         assert_eq!(
             std::fs::read(dst_root.join("f (copy).txt")).unwrap(),
@@ -1581,7 +1716,9 @@ mod tests {
             .filter(|e| matches!(e, OpEvent::Conflict { .. }))
             .count();
         assert_eq!(conflict_count, 1, "only the first conflict should prompt");
-        assert!(matches!(events.last(), Some(OpEvent::Finished { errors }) if errors.is_empty()));
+        assert!(
+            matches!(events.last(), Some(OpEvent::Finished { errors, .. }) if errors.is_empty())
+        );
         assert_eq!(std::fs::read(dst_root.join("a.txt")).unwrap(), b"a-new");
         assert_eq!(std::fs::read(dst_root.join("b.txt")).unwrap(), b"b-new");
 
@@ -1671,7 +1808,17 @@ mod tests {
         /// Paths whose `remove` fails with permission denied.
         refuse: HashSet<PathBuf>,
         removed: Vec<PathBuf>,
+        /// Every `remove` call, successful or not.
+        attempted: Vec<PathBuf>,
         listed: Vec<PathBuf>,
+        /// What `list` claims about a child, when different from the node
+        /// (a server that reports followed attributes).
+        claimed: BTreeMap<PathBuf, (EntryKind, bool)>,
+        /// Extra names `list` returns for a directory (hostile server).
+        phantoms: BTreeMap<PathBuf, Vec<OsString>>,
+        /// `(parent, child)`: after `list(parent)` answers, `child` becomes
+        /// a symlink (a swap racing the walk).
+        swap_after_list: Vec<(PathBuf, PathBuf)>,
         /// After this many successful removals, flip the flag.
         cancel_after: Option<(usize, Arc<AtomicBool>)>,
     }
@@ -1706,6 +1853,39 @@ mod tests {
         fn file(self, path: &str) -> Self {
             self.with(path, EntryKind::File, false)
         }
+        fn claiming(self, path: &str, kind: EntryKind, is_symlink: bool) -> Self {
+            self.state
+                .lock()
+                .unwrap()
+                .claimed
+                .insert(PathBuf::from(path), (kind, is_symlink));
+            self
+        }
+        fn phantom(self, dir: &str, name: &[u8]) -> Self {
+            use std::os::unix::ffi::OsStrExt;
+            self.state
+                .lock()
+                .unwrap()
+                .phantoms
+                .entry(PathBuf::from(dir))
+                .or_default()
+                .push(OsString::from(std::ffi::OsStr::from_bytes(name)));
+            self
+        }
+        fn swapping(self, parent: &str, child: &str) -> Self {
+            self.state
+                .lock()
+                .unwrap()
+                .swap_after_list
+                .push((PathBuf::from(parent), PathBuf::from(child)));
+            self
+        }
+        fn listed(&self) -> Vec<PathBuf> {
+            self.state.lock().unwrap().listed.clone()
+        }
+        fn attempted(&self) -> Vec<PathBuf> {
+            self.state.lock().unwrap().attempted.clone()
+        }
         fn refusing(self, path: &str) -> Self {
             self.state
                 .lock()
@@ -1737,19 +1917,53 @@ mod tests {
         async fn list(&self, location: &Location) -> Result<Vec<FileEntry>, VfsError> {
             let mut state = self.state.lock().unwrap();
             state.listed.push(location.path.clone());
-            Ok(state
+            let mut entries: Vec<FileEntry> = state
                 .nodes
                 .iter()
                 .filter(|(path, _)| path.parent() == Some(location.path.as_path()))
-                .map(|(path, node)| FileEntry {
-                    name: path.file_name().map(OsString::from).unwrap_or_default(),
-                    kind: node.kind,
+                .map(|(path, node)| {
+                    let (kind, is_symlink) = state
+                        .claimed
+                        .get(path)
+                        .copied()
+                        .unwrap_or((node.kind, node.is_symlink));
+                    FileEntry {
+                        name: path.file_name().map(OsString::from).unwrap_or_default(),
+                        kind,
+                        size: 0,
+                        modified: None,
+                        is_symlink,
+                        mode: None,
+                    }
+                })
+                .collect();
+            for name in state
+                .phantoms
+                .get(&location.path)
+                .cloned()
+                .unwrap_or_default()
+            {
+                entries.push(FileEntry {
+                    name,
+                    kind: EntryKind::File,
                     size: 0,
                     modified: None,
-                    is_symlink: node.is_symlink,
+                    is_symlink: false,
                     mode: None,
-                })
-                .collect())
+                });
+            }
+            let swaps: Vec<PathBuf> = state
+                .swap_after_list
+                .iter()
+                .filter(|(parent, _)| *parent == location.path)
+                .map(|(_, child)| child.clone())
+                .collect();
+            for child in swaps {
+                if let Some(node) = state.nodes.get_mut(&child) {
+                    node.is_symlink = true;
+                }
+            }
+            Ok(entries)
         }
         async fn metadata(&self, location: &Location) -> Result<FileEntry, VfsError> {
             let state = self.state.lock().unwrap();
@@ -1794,6 +2008,7 @@ mod tests {
         }
         async fn remove(&self, location: &Location) -> Result<(), VfsError> {
             let mut state = self.state.lock().unwrap();
+            state.attempted.push(location.path.clone());
             if state.refuse.contains(&location.path) {
                 return Err(VfsError::PermissionDenied {
                     location: location.to_string(),
@@ -1864,7 +2079,7 @@ mod tests {
 
     fn errors_of(events: &[OpEvent]) -> &[(Location, VfsError)] {
         match events.last() {
-            Some(OpEvent::Finished { errors }) => errors,
+            Some(OpEvent::Finished { errors, .. }) => errors,
             other => panic!("expected Finished, got {other:?}"),
         }
     }
@@ -1940,10 +2155,12 @@ mod tests {
         assert!(at("/srv/d/sub") < at("/srv/d"));
         assert!(at("/srv/d/a") < at("/srv/d"));
         // The progress total is every item: d, a, sub, b.
-        assert!(matches!(
-            events.first(),
-            Some(OpEvent::Started { files_total: 4, .. })
-        ));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, OpEvent::Started { files_total: 4, .. })),
+            "the scan's total is announced"
+        );
     }
 
     #[tokio::test]
@@ -2069,6 +2286,216 @@ mod tests {
         let request = delete_request(vec![Location::local(root.join("f"))]);
         let events = collect(run(&request)).await;
         assert!(!events.iter().any(|e| matches!(e, OpEvent::Trashed { .. })));
+        cleanup(root);
+    }
+
+    // ── Descent safety, hostile names, bounds, cancel ───────────────────
+
+    /// A tree with a directory-symlink `link` whose target holds `secret`.
+    fn assert_link_removed_target_kept(tree: &TreeBackend, link: &str, secret: &str) {
+        assert!(tree.attempted().contains(&PathBuf::from(link)));
+        assert!(
+            !tree.listed().contains(&PathBuf::from(link)),
+            "never entered"
+        );
+        assert!(tree.exists(secret), "the link's target is untouched");
+        assert!(!tree.exists(link), "the link itself is gone");
+    }
+
+    #[tokio::test]
+    async fn an_entry_listed_as_a_directory_but_lstat_says_symlink_is_one_item() {
+        // The server reports followed attributes: the listing says "real
+        // directory"; only `metadata` (lstat) tells the truth.
+        let tree = TreeBackend::default()
+            .dir("/t")
+            .with("/t/link", EntryKind::Directory, true)
+            .claiming("/t/link", EntryKind::Directory, false)
+            .file("/t/link/secret");
+        let events = collect(run_on_tree(&delete_request(vec![fake("/t")]), &tree)).await;
+        assert!(errors_of(&events).is_empty());
+        assert_link_removed_target_kept(&tree, "/t/link", "/t/link/secret");
+    }
+
+    #[tokio::test]
+    async fn an_entry_that_became_a_symlink_after_the_parent_listing_is_not_entered() {
+        let tree = TreeBackend::default()
+            .dir("/t")
+            .dir("/t/d")
+            .file("/t/d/secret")
+            .swapping("/t", "/t/d");
+        let _ = collect(run_on_tree(&delete_request(vec![fake("/t")]), &tree)).await;
+        assert!(!tree.listed().contains(&PathBuf::from("/t/d")));
+        assert!(tree.exists("/t/d/secret"));
+    }
+
+    #[tokio::test]
+    async fn a_symlink_to_a_directory_three_levels_deep_is_not_entered() {
+        let tree = TreeBackend::default()
+            .dir("/t")
+            .dir("/t/a")
+            .dir("/t/a/b")
+            .with("/t/a/b/link", EntryKind::Directory, true)
+            .claiming("/t/a/b/link", EntryKind::Directory, false)
+            .file("/t/a/b/link/secret");
+        let _ = collect(run_on_tree(&delete_request(vec![fake("/t")]), &tree)).await;
+        assert!(!tree.listed().contains(&PathBuf::from("/t/a/b/link")));
+        assert!(tree.exists("/t/a/b/link/secret"));
+    }
+
+    #[tokio::test]
+    async fn a_symlink_loop_terminates_and_unlinks_the_link() {
+        let tree = TreeBackend::default()
+            .dir("/t")
+            .with("/t/loop", EntryKind::Directory, true)
+            .claiming("/t/loop", EntryKind::Directory, false);
+        let events = collect(run_on_tree(&delete_request(vec![fake("/t")]), &tree)).await;
+        assert!(errors_of(&events).is_empty());
+        assert!(!tree.exists("/t/loop") && !tree.exists("/t"));
+        assert!(!tree.listed().contains(&PathBuf::from("/t/loop")));
+    }
+
+    #[tokio::test]
+    async fn a_dangling_link_is_removed_as_one_item() {
+        let tree = TreeBackend::default()
+            .dir("/t")
+            .with("/t/dangling", EntryKind::Other, true);
+        let events = collect(run_on_tree(&delete_request(vec![fake("/t")]), &tree)).await;
+        assert!(errors_of(&events).is_empty());
+        assert!(!tree.exists("/t"));
+    }
+
+    #[tokio::test]
+    async fn a_top_level_symlink_source_is_unlinked_not_followed() {
+        let tree = TreeBackend::default()
+            .with("/link", EntryKind::Directory, true)
+            .file("/link/secret");
+        let _ = collect(run_on_tree(&delete_request(vec![fake("/link")]), &tree)).await;
+        assert!(!tree.listed().contains(&PathBuf::from("/link")));
+        assert!(tree.exists("/link/secret"));
+    }
+
+    #[tokio::test]
+    async fn hostile_entry_names_are_reported_and_never_joined() {
+        let tree = TreeBackend::default()
+            .dir("/t")
+            .file("/t/ok")
+            .file("/victim")
+            .file("/home/u")
+            .phantom("/t", b"")
+            .phantom("/t", b".")
+            .phantom("/t", b"..")
+            .phantom("/t", b"a/../../victim")
+            .phantom("/t", b"/home/u");
+        let events = collect(run_on_tree(&delete_request(vec![fake("/t")]), &tree)).await;
+
+        let errors = errors_of(&events);
+        assert_eq!(errors.len(), 5, "one failure per hostile name");
+        assert!(errors.iter().all(|(location, _)| *location == fake("/t")));
+        assert!(tree.exists("/victim") && tree.exists("/home/u"));
+        for attempted in tree.attempted() {
+            assert!(attempted.starts_with("/t"), "touched {attempted:?}");
+        }
+        assert!(!tree.exists("/t/ok"), "the safe sibling still goes");
+        assert!(tree.exists("/t"), "a folder with a skipped entry stays");
+    }
+
+    #[test]
+    fn unsafe_names_are_judged_by_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let unsafe_name = |b: &[u8]| is_unsafe_entry_name(std::ffi::OsStr::from_bytes(b));
+        assert!(unsafe_name(b"") && unsafe_name(b".") && unsafe_name(b".."));
+        assert!(unsafe_name(b"a/b") && unsafe_name(b"/abs"));
+        assert!(unsafe_name(b"x\xff/y"));
+        assert!(!unsafe_name(b"caf\xe9.txt") && !unsafe_name(b"...") && !unsafe_name(b".hidden"));
+    }
+
+    #[tokio::test]
+    async fn the_pre_scan_counts_only_safe_entries_and_never_follows_links() {
+        let tree = TreeBackend::default()
+            .dir("/t")
+            .file("/t/a")
+            .with("/t/link", EntryKind::Directory, true)
+            .claiming("/t/link", EntryKind::Directory, false)
+            .file("/t/link/secret")
+            .phantom("/t", b"..")
+            .phantom("/t", b"x/y");
+        let events = collect(run_on_tree(&delete_request(vec![fake("/t")]), &tree)).await;
+        // /t, a, link
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, OpEvent::Started { files_total: 3, .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_huge_number_of_failures_is_bounded_and_still_counted() {
+        let mut tree = TreeBackend::default().dir("/d");
+        for n in 0..500 {
+            let path = format!("/d/f{n:04}");
+            tree = tree.file(&path).refusing(&path);
+        }
+        let events = collect(run_on_tree(&delete_request(vec![fake("/d")]), &tree)).await;
+        match events.last() {
+            Some(OpEvent::Finished { errors, omitted }) => {
+                assert_eq!(errors.len(), MAX_KEPT_FAILURES);
+                assert_eq!(errors.len() + omitted, 500);
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn started_arrives_before_the_scan_and_cancel_stops_the_scan() {
+        let request = delete_request(vec![fake("/d")]);
+        let tree = TreeBackend::default().dir("/d").file("/d/1").file("/d/2");
+        request.request_cancel(); // cancelled before anything runs
+        let events = collect(run_on_tree(&request, &tree)).await;
+
+        assert!(matches!(
+            events.first(),
+            Some(OpEvent::Started { files_total: 0, .. })
+        ));
+        assert!(matches!(events.last(), Some(OpEvent::Cancelled)));
+        assert!(tree.listed().is_empty(), "the scan did not walk the tree");
+        assert!(tree.attempted().is_empty(), "nothing was removed");
+    }
+
+    #[tokio::test]
+    async fn cancelling_after_a_failure_still_reports_that_failure() {
+        let request = delete_request(vec![fake("/d")]);
+        let tree = TreeBackend::default()
+            .dir("/d")
+            .file("/d/a")
+            .file("/d/b")
+            .file("/d/c")
+            .refusing("/d/a");
+        // `a` fails, `b` is the first success: cancel lands right after it.
+        tree.state.lock().unwrap().cancel_after = Some((1, request.cancel.clone()));
+        let events = collect(run_on_tree(&request, &tree)).await;
+
+        let errors = errors_of(&events);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, fake("/d/a"));
+        assert!(tree.exists("/d/c"), "the rest remain");
+    }
+
+    #[tokio::test]
+    async fn a_trash_that_fails_never_falls_back_to_deleting() {
+        let root = tempdir();
+        std::fs::write(root.join("keep.txt"), b"keep").unwrap();
+        // A trash "directory" that cannot be created: its parent is a file.
+        std::fs::write(root.join("blocker"), b"x").unwrap();
+        let request = OpRequest::removal(
+            OpIdSource::default().alloc(),
+            OpKind::Trash,
+            vec![Location::local(root.join("keep.txt"))],
+        )
+        .with_trash_root(root.join("blocker/Trash"));
+        let events = collect(run(&request)).await;
+
+        assert_eq!(errors_of(&events).len(), 1);
+        assert_eq!(std::fs::read(root.join("keep.txt")).unwrap(), b"keep");
         cleanup(root);
     }
 }

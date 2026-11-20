@@ -190,8 +190,12 @@ impl Backend for SftpBackend {
             .map_err(|err| sftp_error(location, err))?;
         Ok(entries
             .filter(|entry| {
-                let name = entry.file_name();
-                name != "." && name != ".."
+                // Drops ".", "..", empty names and names with a "/": none
+                // is a real child, and each is dangerous to join onto a
+                // path (see `core::fs::ops::is_unsafe_entry_name`).
+                !crate::core::fs::ops::is_unsafe_entry_name(std::ffi::OsStr::new(
+                    &entry.file_name(),
+                ))
             })
             .map(|entry| entry_from_metadata(OsString::from(entry.file_name()), &entry.metadata()))
             .collect())

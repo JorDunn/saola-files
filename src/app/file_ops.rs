@@ -76,7 +76,7 @@ impl App {
                     apply_to_all: false,
                 });
             }
-            ops::OpEvent::Finished { errors } => {
+            ops::OpEvent::Finished { errors, omitted } => {
                 // stderr keeps the raw line; the window gets the worded
                 // notice (`app::failures`).
                 for (location, err) in &errors {
@@ -92,7 +92,7 @@ impl App {
                     .incidents
                     .end_op(self.active_op.as_ref().map(|request| request.id));
                 if let Some((operation, failures)) = reported {
-                    self.report_failures(incident, operation, failures);
+                    self.report_failures_omitting(incident, operation, failures, omitted);
                 }
 
                 // Stage 10: a clean (zero-conflict) Move is undo-able —
@@ -268,8 +268,8 @@ impl App {
     /// Capability-honest: items are trashed only when `mode` allows it and
     /// every item's backend claims `Caps::TRASH` (and is local, since the
     /// freedesktop trash is a local-filesystem concept); otherwise the op is
-    /// a permanent delete, which the confirmation and the notice word as
-    /// such. Like paste, a second op is refused while one is running (the
+    /// a permanent delete. (No confirmation is asked on either path today;
+    /// whether permanent delete should ask first is undecided.) Like paste, a second op is refused while one is running (the
     /// queue is a later task) — here with a worded notice, because a silently
     /// ignored Delete press looks like a bug.
     ///
@@ -285,43 +285,81 @@ impl App {
         locations: Vec<Location>,
         mode: ui::dirview::DeleteMode,
     ) -> Task<Message> {
-        if locations.is_empty() {
-            return Task::none();
-        }
-        let trashable = mode != ui::dirview::DeleteMode::Permanent
-            && locations.iter().all(|location| {
-                location.is_local()
-                    && modules::resolve(location)
-                        .is_some_and(|backend| backend.caps().contains(Caps::TRASH))
-            });
-        let kind = if trashable {
-            ops::OpKind::Trash
-        } else {
-            ops::OpKind::Delete
+        let facts: Vec<ItemFacts> = locations
+            .iter()
+            .map(|location| ItemFacts {
+                is_local: location.is_local(),
+                has_trash: modules::resolve(location)
+                    .is_some_and(|backend| backend.caps().contains(Caps::TRASH)),
+            })
+            .collect();
+        let busy = self.active_op.is_some();
+        let kind = match plan_removal(mode, &facts, busy) {
+            RemovalPlan::Trash => ops::OpKind::Trash,
+            RemovalPlan::Delete => ops::OpKind::Delete,
+            RemovalPlan::Refuse => {
+                if busy && !locations.is_empty() {
+                    let operation = match plan_removal(mode, &facts, false) {
+                        RemovalPlan::Trash => Operation::Trash,
+                        _ => Operation::Delete,
+                    };
+                    let busy = VfsError::Other {
+                        message: tr!("error-op-busy"),
+                    };
+                    let failures = locations
+                        .iter()
+                        .map(|location| Failure::at(location, busy.clone()))
+                        .collect();
+                    self.report_new(operation, failures);
+                }
+                return Task::none();
+            }
         };
-
-        if self.active_op.is_some() {
-            let operation = if trashable {
-                Operation::Trash
-            } else {
-                Operation::Delete
-            };
-            let busy = VfsError::Other {
-                message: tr!("error-op-busy"),
-            };
-            let failures = locations
-                .iter()
-                .map(|location| Failure::at(location, busy.clone()))
-                .collect();
-            self.report_new(operation, failures);
-            return Task::none();
-        }
 
         let id = self.op_ids.alloc();
         self.incidents.begin_op(id);
         self.active_op_had_conflict = false;
         self.active_op = Some(ops::OpRequest::removal(id, kind, locations));
         Task::none()
+    }
+}
+
+/// What a delete request needs to know about one item to pick trash or delete.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ItemFacts {
+    pub(super) is_local: bool,
+    /// The item's backend claims `Caps::TRASH`.
+    pub(super) has_trash: bool,
+}
+
+/// What `App::start_delete` will do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RemovalPlan {
+    Trash,
+    Delete,
+    /// Nothing to do, or another op is running.
+    Refuse,
+}
+
+/// The trash-or-delete decision as a pure function. Trash only when the
+/// mode allows it and *every* item is local and on a backend with trash;
+/// otherwise permanent delete (Shift+Delete, or no trash available). The
+/// engine never turns a failed trash into a delete: a Trash op that cannot
+/// trash an item reports a failure and leaves it alone.
+pub(super) fn plan_removal(
+    mode: ui::dirview::DeleteMode,
+    items: &[ItemFacts],
+    busy: bool,
+) -> RemovalPlan {
+    if busy || items.is_empty() {
+        return RemovalPlan::Refuse;
+    }
+    let trashable = mode != ui::dirview::DeleteMode::Permanent
+        && items.iter().all(|item| item.is_local && item.has_trash);
+    if trashable {
+        RemovalPlan::Trash
+    } else {
+        RemovalPlan::Delete
     }
 }
 
@@ -353,4 +391,67 @@ pub(super) fn write_foreign_clipboard(
             }
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ui::dirview::DeleteMode;
+
+    const LOCAL_TRASH: ItemFacts = ItemFacts {
+        is_local: true,
+        has_trash: true,
+    };
+    const REMOTE: ItemFacts = ItemFacts {
+        is_local: false,
+        has_trash: false,
+    };
+
+    #[test]
+    fn delete_key_trashes_when_every_item_can_be_trashed() {
+        let plan = plan_removal(DeleteMode::ToTrash, &[LOCAL_TRASH, LOCAL_TRASH], false);
+        assert_eq!(plan, RemovalPlan::Trash);
+    }
+
+    #[test]
+    fn shift_delete_is_always_permanent() {
+        assert_eq!(
+            plan_removal(DeleteMode::Permanent, &[LOCAL_TRASH], false),
+            RemovalPlan::Delete
+        );
+    }
+
+    #[test]
+    fn items_without_trash_are_deleted_permanently_not_trashed() {
+        assert_eq!(
+            plan_removal(DeleteMode::ToTrash, &[REMOTE], false),
+            RemovalPlan::Delete
+        );
+        // A claimed-trash backend that is not local is still not trashable.
+        let odd = ItemFacts {
+            is_local: false,
+            has_trash: true,
+        };
+        assert_eq!(
+            plan_removal(DeleteMode::ToTrash, &[odd], false),
+            RemovalPlan::Delete
+        );
+        // One item that cannot be trashed makes the whole request a delete.
+        assert_eq!(
+            plan_removal(DeleteMode::ToTrash, &[LOCAL_TRASH, REMOTE], false),
+            RemovalPlan::Delete
+        );
+    }
+
+    #[test]
+    fn a_busy_engine_or_an_empty_selection_refuses() {
+        assert_eq!(
+            plan_removal(DeleteMode::ToTrash, &[LOCAL_TRASH], true),
+            RemovalPlan::Refuse
+        );
+        assert_eq!(
+            plan_removal(DeleteMode::ToTrash, &[], false),
+            RemovalPlan::Refuse
+        );
+    }
 }

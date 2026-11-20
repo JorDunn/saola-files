@@ -56,8 +56,10 @@ impl Progress {
     pub fn percent(&self) -> f32 {
         // Removing is counted in items: bytes are not what takes the time.
         if matches!(self.kind, OpKind::Trash | OpKind::Delete) {
+            // A removal announces itself with a total of 0 while it still
+            // counts what is there, so unknown reads as "not started".
             if self.files_total == 0 {
-                return 100.0;
+                return 0.0;
             }
             return ((self.files_done as f64 / self.files_total as f64) * 100.0).clamp(0.0, 100.0)
                 as f32;
