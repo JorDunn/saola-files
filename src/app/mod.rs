@@ -140,6 +140,15 @@ pub(crate) enum Message {
     // --- features (alphabetical) ---
 }
 
+/// Where a raw key event should go; see [`App::keyboard_target`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyboardTarget {
+    /// The focused `DirectoryView` (which still guards its own popovers).
+    FocusedView,
+    /// A modal or the Trash view owns the screen: drop the event.
+    Nobody,
+}
+
 pub(crate) struct App {
     theme: Theme,
     /// Which ground the window draws on — `files.toml`'s `surface` knob,
@@ -445,9 +454,14 @@ impl App {
             Message::Explorer(ui::explorer::Message::Directory(id, inner)) => {
                 self.update_view(id, inner)
             }
-            Message::Keyboard(event) => {
-                self.update_view(self.focused, ui::dirview::Message::Keyboard(event))
-            }
+            Message::Keyboard(event) => match self.keyboard_target() {
+                // Checked here as well as in `subscription`: an event
+                // already queued when a modal opened must not slip through.
+                KeyboardTarget::FocusedView => {
+                    self.update_view(self.focused, ui::dirview::Message::Keyboard(event))
+                }
+                KeyboardTarget::Nobody => Task::none(),
+            },
             Message::OpEvent(event) => self.handle_op_event(event),
             Message::Progress(ui::dialogs::progress::Message::CancelRequested) => {
                 if let Some(request) = &self.active_op {
@@ -520,6 +534,27 @@ impl App {
     }
 
     /// The focused directory view, if it is still open.
+    /// The single routing decision for raw key events: who gets them?
+    ///
+    /// Every App-level modal must be listed here. A new dialog that is not
+    /// added lets keys (Delete, Ctrl+Z, ...) fall through to the directory
+    /// behind its scrim. Popovers (overflow menu, Open with) are NOT listed:
+    /// they live inside the focused `DirectoryView`, whose `handle_keyboard`
+    /// swallows every key but Esc (which closes them) while one is open.
+    /// The empty-trash confirm is inline in the Trash view, covered by
+    /// `trash_active`. Modal dialogs have no keyboard handling of their own
+    /// (Esc does nothing today), so `Nobody` keeps that exactly as is.
+    pub(crate) fn keyboard_target(&self) -> KeyboardTarget {
+        let modal_open = self.pending_conflict.is_some()
+            || self.pending_properties.is_some()
+            || self.pending_connect.is_some();
+        if self.trash_active || modal_open {
+            KeyboardTarget::Nobody
+        } else {
+            KeyboardTarget::FocusedView
+        }
+    }
+
     fn focused_view(&self) -> Option<&ui::dirview::DirectoryView> {
         ui::explorer::find(&self.views, self.focused)
     }
@@ -567,4 +602,65 @@ fn directory_task(id: ViewId, task: Task<ui::dirview::Message>) -> Task<Message>
 /// counterpart to `directory_task` above.
 fn trash_task(task: Task<ui::trashview::Message>) -> Task<Message> {
     task.map(Message::Trash)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app() -> App {
+        App::new(config::Config::default(), cli::Cli::default()).0
+    }
+
+    /// Opens the copy-conflict prompt the way a running op does.
+    fn open_conflict(app: &mut App) {
+        let (reply, _rx) = futures::channel::mpsc::channel(1);
+        let loc = Location::local(PathBuf::from("/nonexistent"));
+        let _ = app.handle_op_event(ops::OpEvent::Conflict {
+            conflict: ops::Conflict {
+                source: loc.clone(),
+                dest: loc,
+            },
+            reply,
+        });
+    }
+
+    #[test]
+    fn keys_reach_the_view_when_nothing_is_open() {
+        assert_eq!(app().keyboard_target(), KeyboardTarget::FocusedView);
+    }
+
+    #[test]
+    fn conflict_dialog_takes_keys_away_from_the_view() {
+        let mut app = app();
+        open_conflict(&mut app);
+        assert_eq!(app.keyboard_target(), KeyboardTarget::Nobody);
+    }
+
+    #[test]
+    fn trash_view_takes_keys_away_from_the_view() {
+        let mut app = app();
+        app.trash_active = true;
+        assert_eq!(app.keyboard_target(), KeyboardTarget::Nobody);
+    }
+
+    #[test]
+    fn properties_dialog_takes_keys_away_from_the_view() {
+        let mut app = app();
+        app.pending_properties = Some(PendingProperties {
+            properties: ui::dialogs::properties::Properties::new(
+                Vec::new(),
+                core::vfs::Caps::empty(),
+            ),
+            size_request: None,
+        });
+        assert_eq!(app.keyboard_target(), KeyboardTarget::Nobody);
+    }
+
+    #[test]
+    fn connect_dialog_takes_keys_away_from_the_view() {
+        let mut app = app();
+        let _ = app.open_connect_dialog(None, false);
+        assert_eq!(app.keyboard_target(), KeyboardTarget::Nobody);
+    }
 }

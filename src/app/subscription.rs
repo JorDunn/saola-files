@@ -10,7 +10,7 @@ use iced::Subscription;
 
 use saola_files::{integration, ui};
 
-use super::{App, Message, directory_message};
+use super::{App, KeyboardTarget, Message, directory_message};
 
 impl App {
     pub(crate) fn subscription(&self) -> Subscription<Message> {
@@ -34,12 +34,12 @@ impl App {
         // it's open.
         // Stage 14: the connect dialog is the same kind of App-level modal
         // as properties — gated here for the identical reason.
-        let dialog_open = self.pending_properties.is_some() || self.pending_connect.is_some();
-        let keyboard = if self.trash_active || dialog_open {
-            Subscription::none()
-        } else {
+        // The gate is now one named predicate, `App::keyboard_target` (it
+        // also covers the copy-conflict dialog, which this used to miss).
+        let keyboard = match self.keyboard_target() {
             // `App::update` routes `Message::Keyboard` to the focused view.
-            iced::keyboard::listen().map(Message::Keyboard)
+            KeyboardTarget::FocusedView => iced::keyboard::listen().map(Message::Keyboard),
+            KeyboardTarget::Nobody => Subscription::none(),
         };
 
         // Stage 5: every open view's own live-update watch (a backend that
