@@ -129,6 +129,7 @@ impl App {
             connect_sub,
             dbus,
             // --- features (alphabetical) ---
+            self.session_subscription(),
         ])
     }
 }

@@ -60,6 +60,7 @@ mod listing;
 pub mod menu;
 mod navigation;
 mod pointer;
+mod prefs;
 mod rename;
 mod selection;
 #[cfg(test)]
