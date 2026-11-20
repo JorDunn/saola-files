@@ -584,19 +584,146 @@ mod tests {
         out
     }
 
-    /// The non-test part of a file: everything before the trailing
-    /// `#[cfg(test)]` module. (The repo keeps tests at the end of the file.)
-    fn production_part(source: &str) -> &str {
-        source
-            .find("#[cfg(test)]")
-            .map_or(source, |at| &source[..at])
+    /// Net `{` minus `}` on a line, ignoring braces inside string and char
+    /// literals (good enough to find where a test-only item ends).
+    fn brace_balance(line: &str) -> i32 {
+        let mut balance = 0;
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' => {
+                    while let Some(inner) = chars.next() {
+                        match inner {
+                            '\\' => {
+                                chars.next();
+                            }
+                            '"' => break,
+                            _ => {}
+                        }
+                    }
+                }
+                '/' if chars.peek() == Some(&'/') => break,
+                '{' => balance += 1,
+                '}' => balance -= 1,
+                _ => {}
+            }
+        }
+        balance
+    }
+
+    /// The production part of a file, with test-only code blanked out.
+    ///
+    /// - A column-0 `#[cfg(test)]` directly followed by `mod tests` is the
+    ///   trailing test module: it and everything after it is dropped.
+    /// - Any other `#[cfg(test)]` item (a `mod x;` line, or a fn/impl/mod
+    ///   with a body) is dropped on its own; production code after it is
+    ///   still scanned.
+    ///
+    /// Dropped lines become empty lines, so line numbers stay true.
+    fn production_part(source: &str) -> String {
+        let lines: Vec<&str> = source.lines().collect();
+        let mut out = Vec::with_capacity(lines.len());
+        let mut i = 0;
+        while i < lines.len() {
+            if lines[i].trim() != "#[cfg(test)]" {
+                out.push(lines[i]);
+                i += 1;
+                continue;
+            }
+            let trailing_tests = lines[i] == "#[cfg(test)]"
+                && lines
+                    .get(i + 1)
+                    .is_some_and(|next| next.trim_start().starts_with("mod tests"));
+            if trailing_tests {
+                out.extend(std::iter::repeat_n("", lines.len() - i));
+                break;
+            }
+            // Skip the attribute, then the item: up to a `;` line, or until
+            // the braces opened by the item close again.
+            let mut depth = 0;
+            let mut seen_open = false;
+            loop {
+                let line = lines[i];
+                out.push("");
+                i += 1;
+                depth += brace_balance(line);
+                seen_open |= line.contains('{');
+                let ends_item = if seen_open {
+                    depth <= 0
+                } else {
+                    line.trim_end().ends_with(';')
+                };
+                if ends_item || i >= lines.len() {
+                    break;
+                }
+            }
+        }
+        out.join("\n")
     }
 
     /// Whether the text before a literal ends with one of `openers`
-    /// (`tr!(`, `eprintln!(`, ...), ignoring whitespace.
+    /// (`tr!(`, `eprintln!(`, ...), ignoring whitespace. The opener must
+    /// start a token: `str!(` does not count as `tr!(`.
     fn follows(literal: &Literal, openers: &[&str]) -> bool {
         let before = literal.before.trim_end();
-        openers.iter().any(|opener| before.ends_with(opener))
+        openers.iter().any(|opener| {
+            before.strip_suffix(opener).is_some_and(|rest| {
+                !rest
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            })
+        })
+    }
+
+    #[test]
+    fn production_part_drops_only_test_code() {
+        let source = "\
+fn before() { let a = \"kept before\"; }
+#[cfg(test)]
+mod test_support;
+fn after_mod() { let b = \"Totally visible text\"; }
+struct S;
+impl S {
+    #[cfg(test)]
+    fn only_in_tests(&self) {
+        let c = \"test only {\";
+        if true {
+            let _ = 1;
+        }
+    }
+    fn production(&self) { let d = \"kept after fn\"; }
+}
+#[cfg(test)]
+mod tests {
+    fn t() { let e = \"dropped\"; }
+}
+";
+        let kept = production_part(source);
+        let texts: Vec<String> = literals(&kept).into_iter().map(|l| l.text).collect();
+        assert_eq!(
+            texts,
+            ["kept before", "Totally visible text", "kept after fn"]
+        );
+        // Line numbers survive, so reports point at the right line.
+        let visible = literals(&kept)
+            .into_iter()
+            .find(|l| l.text == "Totally visible text");
+        assert_eq!(visible.map(|l| l.line), Some(4));
+    }
+
+    #[test]
+    fn follows_matches_whole_macro_names_only() {
+        let lit = |before: &str| Literal {
+            text: String::new(),
+            line: 1,
+            before: before.to_owned(),
+        };
+        assert!(follows(&lit("x = tr!("), &["tr!("]));
+        assert!(follows(&lit("(\n  tr!(\n"), &["tr!("]));
+        assert!(follows(&lit("tr!("), &["tr!("]));
+        assert!(!follows(&lit("let s = str!("), &["tr!("]));
+        assert!(!follows(&lit("my_tr!("), &["tr!("]));
     }
 
     #[test]
@@ -679,7 +806,7 @@ mod tests {
                 continue;
             };
             let shown = file.to_string_lossy().into_owned();
-            for literal in literals(production_part(&source)) {
+            for literal in literals(&production_part(&source)) {
                 // Log text, id markers and embedded assets are not
                 // user-visible.
                 if follows(
