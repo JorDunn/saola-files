@@ -76,7 +76,11 @@ iced = { version = "0.14", features = ["tokio", "svg", "image"] }
 # at the same rate as the card they sit on — and gave `toast_alpha` an
 # ease-out entrance. 0.15.0 added `bar_row_container`, `avatar::placeholder`,
 # and their supporting tokens, none of which this app uses yet.
-saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.15.0", version = "0.15.0" }
+# Bumped again 2026-11-19 to v0.17.0 to track the release. 0.16.0 added
+# `notification::icon_tile_colored` and 0.17.0 added launcher grid tiles and
+# touch-size tokens (`button::app_tile`, `list_row_touch`, edge-strip sizes);
+# both are additive and unused here. saola-tokens moved 0.9.0 -> 0.10.0 with it.
+saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.17.0", version = "0.17.0" }
 
 # Config parsing. Surveyed 2026-08-08: the family standard is hand-walked
 # parsing over a real parser's loose document type. capture (the newest
