@@ -92,15 +92,28 @@ pub(crate) struct PendingOpen {
     op: ops::OpId,
     request: OpenRequest,
     slot: PathBuf,
+    /// The size the server reported for each source (`None` when it can't
+    /// be trusted, e.g. a symlink), checked against the downloaded copy.
+    sizes: Vec<Option<u64>>,
+    /// The engine asked to resolve a name conflict. An open never prompts:
+    /// it skips that file and fails the whole open at the end.
+    conflicted: bool,
+}
+
+/// What `prepare` hands back: the empty slot and the reported sizes.
+#[derive(Debug, Clone)]
+pub(crate) struct Prepared {
+    slot: PathBuf,
+    sizes: Vec<Option<u64>>,
 }
 
 /// This feature's slice of `app::Message`.
 #[derive(Debug, Clone)]
 pub(crate) enum OpenMessage {
     /// `prepare` finished: the slot to download into, or why not.
-    Prepared(OpenRequest, Result<PathBuf, Vec<Failure>>),
+    Prepared(OpenRequest, Result<Prepared, Vec<Failure>>),
     /// The copies were sealed read-only (or that failed).
-    Sealed(OpenRequest, PathBuf, Result<Vec<SealedCopy>, String>),
+    Sealed(OpenRequest, PathBuf, Result<Vec<SealedCopy>, VfsError>),
 }
 
 impl App {
@@ -186,10 +199,10 @@ impl App {
     fn remote_open_prepared(
         &mut self,
         request: OpenRequest,
-        result: Result<PathBuf, Vec<Failure>>,
+        result: Result<Prepared, Vec<Failure>>,
     ) -> Task<Message> {
-        let slot = match result {
-            Ok(slot) => slot,
+        let Prepared { slot, sizes } = match result {
+            Ok(prepared) => prepared,
             Err(failures) => {
                 self.report_failures(request.incident, request.launch.operation(), failures);
                 return Task::none();
@@ -217,6 +230,8 @@ impl App {
             op: id,
             request,
             slot,
+            sizes,
+            conflicted: false,
         });
         Task::none()
     }
@@ -242,9 +257,33 @@ impl App {
                 self.active_op_progress = Some(progress);
                 Some(Task::none())
             }
+            // An open must never show the conflict dialog (its "keep both"
+            // would write a different name than the one we seal and launch).
+            // Answer "skip" so the engine moves on, and fail the open when
+            // it finishes.
+            ops::OpEvent::Conflict { reply, .. } => {
+                let mut reply = reply.clone();
+                let _ = reply.try_send(ops::ConflictDecision {
+                    choice: ops::ConflictChoice::Skip,
+                    apply_to_all: true,
+                });
+                if let Some(pending) = self.pending_open.as_mut() {
+                    pending.conflicted = true;
+                }
+                Some(Task::none())
+            }
             ops::OpEvent::Finished { errors } => {
                 let pending = self.pending_open.take()?;
                 self.clear_active_op();
+                if pending.conflicted {
+                    let failures = pending
+                        .request
+                        .sources
+                        .iter()
+                        .map(|location| Failure::at(location, Cause::from(tr!("open-conflict"))))
+                        .collect();
+                    return Some(self.abandon(pending, failures));
+                }
                 if !errors.is_empty() {
                     for (location, err) in errors {
                         eprintln!("saola-files: downloading {location}: {err}");
@@ -261,10 +300,14 @@ impl App {
                     .iter()
                     .filter_map(|location| location.path.file_name().map(OsString::from))
                     .collect();
-                let (slot, request) = (pending.slot, pending.request);
+                let (slot, request, sizes) = (pending.slot, pending.request, pending.sizes);
                 let sealed_slot = slot.clone();
                 Some(Task::perform(
-                    blocking(move || open_copy::seal(&sealed_slot, &names)),
+                    async move {
+                        blocking(move || open_copy::seal(&sealed_slot, &names, &sizes))
+                            .await
+                            .map_err(open_copy::SlotError::into_vfs)
+                    },
                     move |result| {
                         Message::RemoteOpen(OpenMessage::Sealed(
                             request.clone(),
@@ -307,28 +350,45 @@ impl App {
         remove_slot_task(pending.slot)
     }
 
-    /// Step 5: launch the app on the sealed copies, then show the caveat.
+    /// Step 5: launch the app on the sealed copies, then show the caveat;
+    /// deletes the slot when no application ended up holding the copy.
     fn remote_open_sealed(
         &mut self,
         request: OpenRequest,
         slot: PathBuf,
-        result: Result<Vec<SealedCopy>, String>,
+        result: Result<Vec<SealedCopy>, VfsError>,
     ) -> Task<Message> {
+        match self.launch_and_report(request, slot, result) {
+            Some(unused) => remove_slot_task(unused),
+            None => Task::none(),
+        }
+    }
+
+    /// The synchronous half of [`Self::remote_open_sealed`]: launches and
+    /// reports, and returns the slot to delete (`None`: an app holds it).
+    fn launch_and_report(
+        &mut self,
+        request: OpenRequest,
+        slot: PathBuf,
+        result: Result<Vec<SealedCopy>, VfsError>,
+    ) -> Option<PathBuf> {
         let operation = request.launch.operation();
         let copies = match result {
             Ok(copies) if copies.len() == request.sources.len() => copies,
             other => {
-                let message = match other {
-                    Ok(_) => tr!("failure-reason-unknown"),
-                    Err(message) => message,
+                let cause = match other {
+                    Ok(_) => VfsError::Other {
+                        message: tr!("failure-reason-unknown"),
+                    },
+                    Err(err) => err,
                 };
                 let failures = request
                     .sources
                     .iter()
-                    .map(|location| Failure::at(location, Cause::from(message.clone())))
+                    .map(|location| Failure::at(location, cause.clone()))
                     .collect();
                 self.report_failures(request.incident, operation, failures);
-                return remove_slot_task(slot);
+                return Some(slot);
             }
         };
 
@@ -398,12 +458,9 @@ impl App {
         } else {
             self.report_failures(request.incident, operation, failures);
         }
-        if nothing_launched {
-            // No application holds the copy: nothing to protect.
-            remove_slot_task(slot)
-        } else {
-            Task::none()
-        }
+        // No application holds the copy when nothing launched: nothing to
+        // protect, so it goes.
+        nothing_launched.then_some(slot)
     }
 
     /// The mimetype to open a downloaded copy with: the name's own type
@@ -428,11 +485,15 @@ fn entry_name(entry: &DesktopEntry) -> &str {
 pub(super) fn startup_sweep() -> Task<Message> {
     Task::perform(
         blocking(|| {
-            let root = open_copy::open_root_from_env();
+            // No cache directory: nothing was ever stored, nothing to sweep.
+            let Some(root) = open_copy::open_root_from_env() else {
+                return Ok(0);
+            };
             Ok(open_copy::sweep_stale(
                 &root,
                 std::time::SystemTime::now(),
                 open_copy::STALE_AFTER,
+                open_copy::current_uid(),
             ))
         }),
         |_| Message::Noop,
@@ -443,26 +504,27 @@ fn remove_slot_task(slot: PathBuf) -> Task<Message> {
     Task::perform(
         blocking(move || {
             open_copy::remove_slot(&slot);
-            Ok(())
+            Ok::<(), open_copy::SlotError>(())
         }),
         |_| Message::Noop,
     )
 }
 
-/// Runs blocking `std::fs` work off the UI thread and flattens the two ways
-/// it can fail (the I/O itself, or the worker panicking) into a string.
+/// Runs blocking `std::fs` work off the UI thread. A worker that panicked
+/// comes back as an I/O error rather than propagating.
 ///
 /// Teaching note: `spawn_blocking` moves the closure onto tokio's pool of
 /// threads meant for blocking calls, so the UI thread never waits on the
 /// disk. It returns a `JoinHandle`; awaiting that gives
 /// `Result<closure's result, JoinError>`.
 async fn blocking<T: Send + 'static>(
-    work: impl FnOnce() -> std::io::Result<T> + Send + 'static,
-) -> Result<T, String> {
+    work: impl FnOnce() -> Result<T, open_copy::SlotError> + Send + 'static,
+) -> Result<T, open_copy::SlotError> {
     match tokio::task::spawn_blocking(work).await {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(err)) => Err(err.to_string()),
-        Err(join_err) => Err(join_err.to_string()),
+        Ok(result) => result,
+        Err(join_err) => Err(open_copy::SlotError::Io(std::io::Error::other(
+            join_err.to_string(),
+        ))),
     }
 }
 
@@ -501,17 +563,33 @@ fn partition(locations: Vec<Location>, caps_of: impl Fn(&Location) -> Caps) -> P
     split
 }
 
-/// Step 2: checks every source is a downloadable file, then creates the
-/// slot under `root`. `backend_for` is injected so tests use a fake backend.
+/// Names that would land on the same file in one slot, so a conflict can
+/// never arise: returns the indices of every source after the first with a
+/// given name. Pure.
+fn duplicate_name_indices(sources: &[Location]) -> Vec<usize> {
+    let mut seen = std::collections::HashSet::new();
+    sources
+        .iter()
+        .enumerate()
+        .filter(|(_, source)| !seen.insert(source.path.file_name().map(OsString::from)))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Step 2: checks every source is a downloadable file, that the cache
+/// folder has room for all of them, then creates the slot under `root`.
+/// `backend_for` is injected so tests use fake backends (it is asked for
+/// the local backend too, to read the cache folder's free space).
 async fn prepare<F>(
     sources: Vec<Location>,
-    root: PathBuf,
+    root: Option<PathBuf>,
     backend_for: F,
-) -> Result<PathBuf, Vec<Failure>>
+) -> Result<Prepared, Vec<Failure>>
 where
     F: Fn(&Location) -> Option<Box<dyn Backend>>,
 {
     let mut failures = Vec::new();
+    let mut sizes = Vec::with_capacity(sources.len());
     for source in &sources {
         let Some(backend) = backend_for(source) else {
             let err = VfsError::Other {
@@ -530,27 +608,57 @@ where
                 };
                 failures.push(Failure::at(source, err));
             }
-            Ok(_) => {}
+            // A symlink's reported size is the link's, not the target's:
+            // not usable to verify the download.
+            Ok(entry) if entry.is_symlink => sizes.push(None),
+            Ok(entry) => sizes.push(Some(entry.size)),
             Err(err) => failures.push(Failure::at(source, err)),
+        }
+    }
+    for index in duplicate_name_indices(&sources) {
+        if let Some(source) = sources.get(index) {
+            let err = VfsError::Other {
+                message: tr!("open-duplicate-name"),
+            };
+            failures.push(Failure::at(source, err));
         }
     }
     if !failures.is_empty() {
         return Err(failures);
     }
-    match blocking(move || open_copy::create_slot(&root)).await {
-        Ok(slot) => Ok(slot),
-        Err(message) => Err(sources
+    let fail_all = |err: VfsError| -> Vec<Failure> {
+        sources
             .iter()
-            .map(|source| {
-                Failure::at(
-                    source,
-                    VfsError::Other {
-                        message: message.clone(),
-                    },
-                )
-            })
-            .collect()),
+            .map(|source| Failure::at(source, err.clone()))
+            .collect()
+    };
+    let Some(root) = root else {
+        return Err(fail_all(open_copy::SlotError::NoCacheDir.into_vfs()));
+    };
+    let slot = match blocking(move || open_copy::create_slot(&root)).await {
+        Ok(slot) => slot,
+        Err(err) => return Err(fail_all(err.into_vfs())),
+    };
+
+    // Refuse before downloading when the cache folder is known not to have
+    // room. An unknown answer (no statfs) does not block the open.
+    let needed: u64 = sizes.iter().flatten().sum();
+    let here = Location::local(slot.clone());
+    if let Some(backend) = backend_for(&here)
+        && let Ok(stats) = backend.statfs(&here).await
+        && needed > stats.available
+    {
+        let remove = slot.clone();
+        let _ = blocking(move || {
+            open_copy::remove_slot(&remove);
+            Ok::<(), open_copy::SlotError>(())
+        })
+        .await;
+        return Err(fail_all(VfsError::Other {
+            message: tr!("open-no-space"),
+        }));
     }
+    Ok(Prepared { slot, sizes })
 }
 
 #[cfg(test)]
@@ -626,31 +734,46 @@ mod tests {
         assert!(split.download.is_empty() && split.direct.is_empty());
     }
 
-    #[test]
-    fn a_file_is_prepared_into_a_private_slot() {
-        let root = scratch_root("ok");
-        let runtime = tokio::runtime::Builder::new_current_thread()
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
             .build()
-            .expect("runtime");
-        let slot = runtime
-            .block_on(prepare(vec![remote("/srv/note.txt")], root.clone(), |_| {
-                Some(Box::new(fake()))
-            }))
+            .expect("runtime")
+    }
+
+    /// The scratch tree's top (parent of `saola-files`), for cleanup.
+    fn scratch_top(root: &Path) -> PathBuf {
+        root.parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.to_path_buf())
+    }
+
+    use std::path::Path;
+
+    #[test]
+    fn a_file_is_prepared_into_a_private_slot_with_its_reported_size() {
+        let root = scratch_root("ok");
+        let prepared = runtime()
+            .block_on(prepare(
+                vec![remote("/srv/note.txt")],
+                Some(root.clone()),
+                |_| Some(Box::new(fake())),
+            ))
             .expect("a slot");
-        assert!(slot.starts_with(&root) && slot.is_dir());
-        let _ = std::fs::remove_dir_all(root.parent().and_then(|p| p.parent()).unwrap_or(&root));
+        assert!(prepared.slot.starts_with(&root) && prepared.slot.is_dir());
+        assert_eq!(prepared.sizes, vec![Some(3)]);
+        let _ = std::fs::remove_dir_all(scratch_top(&root));
     }
 
     #[test]
     fn a_folder_is_never_downloaded_and_nothing_is_created() {
         let root = scratch_root("dir");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("runtime");
-        let failures = runtime
-            .block_on(prepare(vec![remote("/srv/album")], root.clone(), |_| {
-                Some(Box::new(fake()))
-            }))
+        let failures = runtime()
+            .block_on(prepare(
+                vec![remote("/srv/album")],
+                Some(root.clone()),
+                |_| Some(Box::new(fake())),
+            ))
             .expect_err("a folder must be refused");
         assert_eq!(failures.len(), 1);
         assert!(matches!(
@@ -663,22 +786,24 @@ mod tests {
     #[test]
     fn a_missing_file_and_a_missing_backend_are_both_reported() {
         let root = scratch_root("missing");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("runtime");
-        let missing = runtime
-            .block_on(prepare(vec![remote("/srv/gone.txt")], root.clone(), |_| {
-                Some(Box::new(fake()))
-            }))
+        let rt = runtime();
+        let missing = rt
+            .block_on(prepare(
+                vec![remote("/srv/gone.txt")],
+                Some(root.clone()),
+                |_| Some(Box::new(fake())),
+            ))
             .expect_err("missing file");
         assert!(matches!(
             missing[0].cause,
             Cause::Vfs(VfsError::NotFound { .. })
         ));
-        let no_backend = runtime
-            .block_on(prepare(vec![remote("/srv/note.txt")], root.clone(), |_| {
-                None
-            }))
+        let no_backend = rt
+            .block_on(prepare(
+                vec![remote("/srv/note.txt")],
+                Some(root.clone()),
+                |_| None,
+            ))
             .expect_err("no backend");
         assert_eq!(no_backend.len(), 1);
         assert!(!root.exists());
@@ -687,21 +812,81 @@ mod tests {
     #[test]
     fn every_failing_source_is_reported_under_one_call() {
         let root = scratch_root("several");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("runtime");
-        let failures = runtime
+        let failures = runtime()
             .block_on(prepare(
                 vec![
                     remote("/srv/album"),
                     remote("/srv/gone.txt"),
                     remote("/srv/note.txt"),
                 ],
-                root.clone(),
+                Some(root.clone()),
                 |_| Some(Box::new(fake())),
             ))
             .expect_err("two of three fail");
         assert_eq!(failures.len(), 2);
+    }
+
+    #[test]
+    fn two_files_with_the_same_name_cannot_be_opened_together() {
+        // Different folders, same file name: they would share one slot file.
+        assert_eq!(
+            duplicate_name_indices(&[remote("/a/x.txt"), remote("/b/y.txt"), remote("/b/x.txt")]),
+            vec![2]
+        );
+        assert!(duplicate_name_indices(&[remote("/a/x"), remote("/a/y")]).is_empty());
+        let root = scratch_root("dups");
+        let backend = FakeBackend::new().with_dir("/srv", vec![entry("note.txt", EntryKind::File)]);
+        let two = vec![remote("/srv/note.txt"), remote("/srv/note.txt")];
+        let failures = runtime()
+            .block_on(prepare(two, Some(root.clone()), move |_| {
+                Some(Box::new(
+                    FakeBackend::new().with_dir("/srv", vec![entry("note.txt", EntryKind::File)]),
+                ))
+            }))
+            .expect_err("duplicate names");
+        drop(backend);
+        assert_eq!(failures.len(), 1);
+        assert!(!root.exists(), "nothing is created for a refused open");
+    }
+
+    #[test]
+    fn no_cache_directory_refuses_the_open_with_wording() {
+        let failures = runtime()
+            .block_on(prepare(vec![remote("/srv/note.txt")], None, |_| {
+                Some(Box::new(fake()))
+            }))
+            .expect_err("no cache dir");
+        let sentence = core::failure::describe(Operation::Open, &failures[0]);
+        assert!(sentence.contains("cache"), "{sentence}");
+    }
+
+    #[test]
+    fn a_download_bigger_than_the_free_space_is_refused_before_it_starts() {
+        let root = scratch_root("space");
+        let tight = |_: &Location| -> Option<Box<dyn Backend>> {
+            Some(Box::new(
+                FakeBackend::new()
+                    .with_caps(Caps::STATFS)
+                    .with_stats(saola_files::core::vfs::FsStats {
+                        total: 100,
+                        free: 2,
+                        available: 2,
+                    })
+                    .with_dir("/srv", vec![entry("note.txt", EntryKind::File)]),
+            ))
+        };
+        let failures = runtime()
+            .block_on(prepare(
+                vec![remote("/srv/note.txt")],
+                Some(root.clone()),
+                tight,
+            ))
+            .expect_err("3 bytes needed, 2 available");
+        let sentence = core::failure::describe(Operation::Open, &failures[0]);
+        assert!(sentence.contains("free space"), "{sentence}");
+        let leftover = std::fs::read_dir(&root).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(leftover, 0, "the slot is removed again");
+        let _ = std::fs::remove_dir_all(scratch_top(&root));
     }
 
     #[test]
@@ -731,5 +916,170 @@ mod tests {
             summary.headline,
             "Opened read-only copies of 2 items — changes won't be saved to the server."
         );
+    }
+
+    // --- the intercept, on a real `App` ---
+
+    fn app() -> App {
+        App::new(
+            saola_files::config::Config::default(),
+            saola_files::cli::Cli::default(),
+            saola_files::core::state::Store::default(),
+        )
+        .0
+    }
+
+    /// Makes `app` look like a download of `remote_path` is running.
+    fn start_download(app: &mut App, slot: &Path) -> ops::OpId {
+        let id = app.op_ids.alloc();
+        let source = remote("/srv/note.txt");
+        app.active_op = Some(ops::OpRequest::new(
+            id,
+            ops::OpKind::Copy,
+            vec![source.clone()],
+            Location::local(slot.to_path_buf()),
+        ));
+        app.pending_open = Some(PendingOpen {
+            op: id,
+            request: OpenRequest {
+                incident: Incident::mint(),
+                launch: Launch::Default,
+                sources: vec![source],
+            },
+            slot: slot.to_path_buf(),
+            sizes: vec![Some(3)],
+            conflicted: false,
+        });
+        id
+    }
+
+    #[test]
+    fn an_ordinary_copy_is_left_to_the_generic_handler() {
+        let mut app = app();
+        // A paste is running; no open is pending.
+        let id = app.op_ids.alloc();
+        app.active_op = Some(ops::OpRequest::new(
+            id,
+            ops::OpKind::Copy,
+            vec![Location::local("/a")],
+            Location::local("/b"),
+        ));
+        for event in [
+            ops::OpEvent::Started {
+                files_total: 1,
+                bytes_total: 1,
+            },
+            ops::OpEvent::Finished { errors: Vec::new() },
+            ops::OpEvent::Cancelled,
+        ] {
+            assert!(app.remote_open_event(&event).is_none());
+        }
+        assert!(app.active_op.is_some(), "the paste is untouched");
+
+        // An open is pending, but the running op is a different one.
+        let slot = std::env::temp_dir();
+        start_download(&mut app, &slot);
+        let other = app.op_ids.alloc();
+        app.active_op = Some(ops::OpRequest::new(
+            other,
+            ops::OpKind::Copy,
+            vec![Location::local("/a")],
+            Location::local("/b"),
+        ));
+        assert!(
+            app.remote_open_event(&ops::OpEvent::Finished { errors: Vec::new() })
+                .is_none()
+        );
+        assert!(app.pending_open.is_some(), "the open is still waiting");
+    }
+
+    #[test]
+    fn a_conflict_during_an_open_is_skipped_and_fails_the_open_never_prompts() {
+        let mut app = app();
+        let slot = std::env::temp_dir();
+        start_download(&mut app, &slot);
+        let (reply, mut answers) = futures::channel::mpsc::channel(1);
+        let source = remote("/srv/note.txt");
+        let handled = app.remote_open_event(&ops::OpEvent::Conflict {
+            conflict: ops::Conflict {
+                source: source.clone(),
+                dest: Location::local("/x"),
+            },
+            reply,
+        });
+        assert!(handled.is_some(), "the open's intercept takes it");
+        assert!(app.pending_conflict.is_none(), "no dialog is opened");
+        let decision = answers.try_recv().expect("a decision");
+        assert_eq!(decision.choice, ops::ConflictChoice::Skip);
+
+        // When the engine finishes, the open is failed, not launched.
+        let finished = app.remote_open_event(&ops::OpEvent::Finished { errors: Vec::new() });
+        assert!(finished.is_some());
+        assert!(app.pending_open.is_none() && app.active_op.is_none());
+        let notice = app.error_notice.notice().expect("a failure notice");
+        assert_eq!(notice.operation(), Operation::Open);
+    }
+
+    #[test]
+    fn a_failed_download_launches_nothing_and_reports() {
+        let mut app = app();
+        start_download(&mut app, &std::env::temp_dir());
+        let err = VfsError::Other {
+            message: "disk full (os error 28)".to_owned(),
+        };
+        let task = app.remote_open_event(&ops::OpEvent::Finished {
+            errors: vec![(remote("/srv/note.txt"), err)],
+        });
+        assert!(task.is_some());
+        let notice = app.error_notice.notice().expect("a notice");
+        assert!(notice.summary().headline.contains("note.txt"));
+        assert!(app.pending_open.is_none());
+    }
+
+    #[test]
+    fn a_failed_launch_removes_the_slot() {
+        let base = scratch_root("launch-fail");
+        let slot = open_copy::create_slot(&base).expect("slot");
+        std::fs::write(slot.join("note.txt"), b"abc").expect("file");
+        let sealed =
+            open_copy::seal(&slot, &[OsString::from("note.txt")], &[Some(3)]).expect("seal");
+        let mut app = app();
+        let request = OpenRequest {
+            incident: Incident::mint(),
+            // Runs a program that does not exist, so the launch fails.
+            launch: Launch::Custom("/nonexistent/saola-test-program %f".to_owned()),
+            sources: vec![remote("/srv/note.txt")],
+        };
+        let unused = app.launch_and_report(request, slot.clone(), Ok(sealed));
+        let notice = app.error_notice.notice().expect("a failure, not a caveat");
+        assert_eq!(notice.operation(), Operation::RunAction);
+        // The slot is handed back for deletion; the delete itself is
+        // `remove_slot`, which also removes a sealed (0500) slot.
+        assert_eq!(unused.as_deref(), Some(slot.as_path()));
+        open_copy::remove_slot(&slot);
+        assert!(!slot.exists(), "nothing holds the copy, so it is deleted");
+        let _ = std::fs::remove_dir_all(scratch_top(&base));
+    }
+
+    #[test]
+    fn a_truncated_seal_failure_is_reported_and_the_slot_removed() {
+        let base = scratch_root("seal-fail");
+        let slot = open_copy::create_slot(&base).expect("slot");
+        std::fs::write(slot.join("note.txt"), b"ab").expect("file");
+        let result = open_copy::seal(&slot, &[OsString::from("note.txt")], &[Some(3)])
+            .map_err(open_copy::SlotError::into_vfs);
+        let mut app = app();
+        let request = OpenRequest {
+            incident: Incident::mint(),
+            launch: Launch::Default,
+            sources: vec![remote("/srv/note.txt")],
+        };
+        let unused = app.launch_and_report(request, slot.clone(), result);
+        let notice = app.error_notice.notice().expect("a notice");
+        assert!(notice.summary().headline.contains("complete"));
+        assert_eq!(unused.as_deref(), Some(slot.as_path()));
+        open_copy::remove_slot(&slot);
+        assert!(!slot.exists());
+        let _ = std::fs::remove_dir_all(scratch_top(&base));
     }
 }

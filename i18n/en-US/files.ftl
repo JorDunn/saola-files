@@ -122,6 +122,14 @@ open-busy = another copy or download is still running
 open-cancelled = the download was cancelled
 open-unsafe-name = its name can't be used as a file name here
 open-terminal-operation = opening a terminal here
+open-no-cache = there is no cache folder to keep the downloaded copy in
+open-slot-not-private = the folder for downloaded copies is not private to this user
+open-slot-no-name = a folder for the download could not be created
+open-slot-location = the folder for downloaded copies
+open-truncated = the download did not come out complete
+open-no-space = there is not enough free space to download it
+open-duplicate-name = another file with the same name is being opened with it
+open-conflict = a file with that name was already downloaded
 
 ## Properties dialog
 

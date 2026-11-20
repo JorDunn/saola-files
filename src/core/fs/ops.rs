@@ -677,7 +677,9 @@ async fn copy_bytes(
                         std::mem::replace(&mut buffer, Vec::with_capacity(COPY_CHUNK_BYTES));
                     let len = flushed.len() as u64;
                     if write.send(flushed).await.is_err() {
-                        return Err(write_err(dest));
+                        return Err(
+                            abort_write(&mut write, dest_backend, dest, write_err(dest)).await
+                        );
                     }
                     *bytes_done += len;
                     try_send_event(
@@ -700,14 +702,33 @@ async fn copy_bytes(
     if !buffer.is_empty() {
         let len = buffer.len() as u64;
         if write.send(buffer).await.is_err() {
-            return Err(write_err(dest));
+            return Err(abort_write(&mut write, dest_backend, dest, write_err(dest)).await);
         }
         *bytes_done += len;
     }
-    if write.close().await.is_err() {
-        return Err(write_err(dest));
+    // Closing is where a backend reports a write that failed on the way to
+    // disk (ENOSPC on the final chunks, say): never treat a failed close as
+    // a finished copy.
+    if let Err(err) = write.close().await {
+        let _ = dest_backend.remove(dest).await;
+        return Err(err);
     }
     Ok(CopyOutcome::Done)
+}
+
+/// A write failed mid-copy: closes the sink to learn the backend's real
+/// error (falling back to `fallback` when close succeeds), removes the
+/// partial `dest`, and returns the error to report. A truncated file must
+/// never be left looking like a finished copy.
+async fn abort_write(
+    write: &mut crate::core::vfs::WriteSink,
+    dest_backend: &dyn Backend,
+    dest: &Location,
+    fallback: VfsError,
+) -> VfsError {
+    let err = write.close().await.err().unwrap_or(fallback);
+    let _ = dest_backend.remove(dest).await;
+    err
 }
 
 /// Computes a "keep both" destination for [`ConflictChoice::RenameCopy`]:
@@ -1304,5 +1325,58 @@ mod tests {
 
         cleanup(src_root);
         cleanup(dst_root);
+    }
+
+    // ── a failed destination write is a failed copy, with no partial file ─
+
+    #[tokio::test]
+    async fn copying_to_a_full_device_is_an_error_not_a_done_copy() {
+        let dir = tempdir();
+        let source = dir.join("src.bin");
+        std::fs::write(&source, vec![7u8; 3 * 1024 * 1024]).unwrap();
+        let backend = crate::modules::local::LocalBackend::new();
+        let mut bytes_done = 0;
+        let (mut tx, _rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let cancel = AtomicBool::new(false);
+        let result = copy_bytes(
+            &backend,
+            &backend,
+            &Location::local(&source),
+            &Location::local("/dev/full"),
+            &cancel,
+            &mut bytes_done,
+            &mut tx,
+        )
+        .await;
+        assert!(result.is_err(), "ENOSPC must not look like success");
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn an_aborted_write_removes_the_partial_destination() {
+        let dir = tempdir();
+        let dest_path = dir.join("partial.bin");
+        std::fs::write(&dest_path, b"half").unwrap();
+        let backend = crate::modules::local::LocalBackend::new();
+        // A sink whose every send fails, standing in for a dead writer.
+        let mut sink: crate::core::vfs::WriteSink =
+            Box::pin(futures::sink::unfold((), |(), _chunk: Vec<u8>| async {
+                Err(VfsError::Other {
+                    message: "disk full".to_owned(),
+                })
+            }));
+        let _ = sink.send(vec![1]).await;
+        let err = abort_write(
+            &mut sink,
+            &backend,
+            &Location::local(&dest_path),
+            VfsError::Other {
+                message: "fallback".to_owned(),
+            },
+        )
+        .await;
+        assert!(matches!(err, VfsError::Other { .. }));
+        assert!(!dest_path.exists(), "the partial file is removed");
+        cleanup(dir);
     }
 }

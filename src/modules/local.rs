@@ -295,6 +295,21 @@ fn statfs_blocking(location: &Location) -> Result<FsStats, VfsError> {
     })
 }
 
+/// The writer thread's body: writes each chunk to `file` in order, stops at
+/// the first error and returns it, and flushes at the end. Generic over
+/// `io::Write` (not tied to `fs::File`) so a test can inject a writer that
+/// fails on chunk N. When this returns early the receiver is dropped, so
+/// later `send`s on the sink fail too; `poll_close` carries the real error.
+fn write_chunks<W: std::io::Write>(
+    mut file: W,
+    rx: &mut mpsc::Receiver<Vec<u8>>,
+) -> io::Result<()> {
+    while let Some(chunk) = futures::executor::block_on(rx.next()) {
+        file.write_all(&chunk)?;
+    }
+    file.flush()
+}
+
 /// The [`WriteSink`] `LocalBackend::write` returns.
 ///
 /// Wraps the raw `mpsc::Sender<Vec<u8>>` fed to the detached blocking
@@ -327,7 +342,11 @@ struct WriterSink {
     /// close` can be polled more than once after completing (callers are
     /// allowed to call it repeatedly), and joining an already-joined
     /// `JoinHandle` panics, so this is `take()`n the moment it resolves.
-    join: Option<JoinHandle<()>>,
+    ///
+    /// The thread's result is its first write error, if any: a failed
+    /// `write_all` (ENOSPC on the last chunks, say) must reach the caller
+    /// through `poll_close`, or a truncated file reports as written.
+    join: Option<JoinHandle<io::Result<()>>>,
     location: Location,
 }
 
@@ -373,15 +392,18 @@ impl Sink<Vec<u8>> for WriterSink {
         match Pin::new(join).poll(cx) {
             Poll::Ready(result) => {
                 self.join = None;
-                if let Err(err) = result {
+                match result {
                     // The blocking task panicked — the no-panic rule
                     // extends to background work (see `run_blocking`'s
                     // identical posture for the read/list/mkdir side).
-                    return Poll::Ready(Err(VfsError::Other {
+                    Err(err) => Poll::Ready(Err(VfsError::Other {
                         message: format!("internal error writing {}: {err}", self.location),
-                    }));
+                    })),
+                    // The writer hit an I/O error: durable-on-close means
+                    // the caller must hear about it.
+                    Ok(Err(err)) => Poll::Ready(Err(io_error(&self.location, err))),
+                    Ok(Ok(())) => Poll::Ready(Ok(())),
                 }
-                Poll::Ready(Ok(()))
             }
             Poll::Pending => Poll::Pending,
         }
@@ -472,14 +494,11 @@ impl Backend for LocalBackend {
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
         let loc = location.clone();
         let join = tokio::task::spawn_blocking(move || {
-            use std::io::Write;
-            let mut file = file;
-            while let Some(chunk) = futures::executor::block_on(rx.next()) {
-                if let Err(err) = file.write_all(&chunk) {
-                    eprintln!("saola-files: write to {loc} failed: {err}");
-                    break;
-                }
+            let result = write_chunks(file, &mut rx);
+            if let Err(err) = &result {
+                eprintln!("saola-files: write to {loc} failed: {err}");
             }
+            result
         });
 
         Ok(Box::pin(WriterSink {
@@ -1158,5 +1177,69 @@ mod tests {
             .ok()
             .and_then(|out| String::from_utf8(out.stdout).ok())
             .is_some_and(|uid| uid.trim() == "0")
+    }
+
+    // ── a failed write must surface on close (durable-on-close) ─────────
+
+    /// A writer that accepts `ok` writes, then fails like a full disk.
+    struct FailsAfter {
+        ok: usize,
+    }
+
+    impl std::io::Write for FailsAfter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.ok == 0 {
+                return Err(io::Error::from_raw_os_error(28)); // ENOSPC
+            }
+            self.ok -= 1;
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_that_fails_part_way_is_reported_by_close() {
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
+        let join = tokio::task::spawn_blocking(move || write_chunks(FailsAfter { ok: 1 }, &mut rx));
+        let mut sink = WriterSink {
+            tx,
+            join: Some(join),
+            location: Location::local("/full"),
+        };
+        // The first chunk is written; the second fails on the thread. Later
+        // sends may or may not notice; `close` must.
+        let _ = sink.send(vec![1]).await;
+        let _ = sink.send(vec![2]).await;
+        let _ = sink.send(vec![3]).await;
+        let err = sink
+            .close()
+            .await
+            .expect_err("close must report the failure");
+        assert!(format!("{err:?}").contains("28"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn writing_to_a_full_device_does_not_close_successfully() {
+        // /dev/full accepts open() and fails every write with ENOSPC.
+        let mut sink = backend()
+            .write(&Location::local("/dev/full"))
+            .await
+            .expect("open /dev/full");
+        let _ = sink.send(vec![0u8; 4096]).await;
+        assert!(sink.close().await.is_err());
+    }
+
+    #[test]
+    fn chunks_are_written_in_order_and_flushed_on_success() {
+        let (mut tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+        tx.try_send(vec![1, 2]).expect("send");
+        tx.try_send(vec![3]).expect("send");
+        drop(tx);
+        let mut out = Vec::new();
+        write_chunks(&mut out, &mut rx).expect("ok");
+        assert_eq!(out, vec![1, 2, 3]);
     }
 }
