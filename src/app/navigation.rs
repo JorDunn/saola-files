@@ -168,7 +168,7 @@ impl App {
             // (`app::sniff`) has already produced one for this mtime.
             let mimetype = match location.parent() {
                 Some(dir) => {
-                    let modified = self.selected_mtime(id, location);
+                    let modified = self.entry_mtime(id, location);
                     self.mime_db.guess_entry(&dir, name, modified)
                 }
                 None => self.mime_db.guess(name, None),

@@ -23,8 +23,8 @@
 //! when the name gives no type ([`needs_sniff`]) does the app read the
 //! first [`SNIFF_BYTES`] of a *visible, local* file in the background and
 //! hand them to [`MimeDb::record_sniff`]; the verdict is cached per
-//! (directory, name, mtime), so the same file is never sniffed twice until
-//! it changes, and a `.txt` (a name that already says what it is) is never
+//! (directory, name, mtime), so a file is not re-read until its mtime
+//! changes (or the bounded cache is wiped), and a `.txt` (a name that already says what it is) is never
 //! sniffed at all.
 
 use std::cell::RefCell;
@@ -42,9 +42,10 @@ use crate::core::vfs::Location;
 /// enough that reading it never feels like "opening" the file.
 pub const SNIFF_BYTES: usize = 4096;
 
-/// Upper bound on cached sniff verdicts. When exceeded the whole cache is
-/// dropped (a cheap, predictable policy: verdicts are recomputed lazily
-/// for whatever is on screen, so the worst case is a few repeated reads).
+/// Upper bound on cached sniff verdicts. When reached the whole cache is
+/// dropped (a cheap, predictable policy, deliberately not an LRU): every
+/// verdict is then recomputed lazily, so a wiped file is re-read once more
+/// the next time it is on screen.
 const SNIFF_CACHE_CAPACITY: usize = 8192;
 
 /// Whether a name-only mimetype is too vague to trust, so the file's
@@ -174,7 +175,8 @@ impl MimeDb {
     /// Records the verdict for `bytes` (the file's leading bytes) so later
     /// [`Self::guess_entry`] calls for the same `modified` time return it.
     /// An unrecognised file is recorded too (as `application/octet-stream`)
-    /// so it is not re-read on every refresh.
+    /// so it is not re-read on every refresh (only after its mtime changes
+    /// or the cache is wiped).
     pub fn record_sniff(&self, dir: &Location, name: &OsStr, modified: SystemTime, bytes: &[u8]) {
         let mime = self.guess(name, Some(bytes));
         self.sniffed.borrow_mut().insert(dir, name, modified, mime);
@@ -504,6 +506,27 @@ mod tests {
         let name = OsStr::new("blob");
         db.record_sniff(&dir, name, t(1), &[0xfe, 0xed, 0x00, 0x01, 0x02, 0x03]);
         assert!(!db.wants_sniff(&dir, name, Some(t(1))));
+    }
+
+    #[test]
+    fn the_cache_is_bounded_and_keeps_working_after_a_wipe() {
+        let mut cache = SniffCache::default();
+        let dir = Location::local("/d");
+        let mtime = t(1);
+        for i in 0..SNIFF_CACHE_CAPACITY {
+            cache.insert(&dir, OsStr::new(&format!("f{i}")), mtime, "a/b".to_owned());
+        }
+        assert_eq!(cache.len, SNIFF_CACHE_CAPACITY);
+        assert_eq!(cache.get(&dir, OsStr::new("f0"), mtime), Some("a/b"));
+
+        // One past the cap wipes everything, then stores the new verdict.
+        cache.insert(&dir, OsStr::new("late"), mtime, "image/png".to_owned());
+        assert_eq!(cache.len, 1);
+        assert_eq!(cache.get(&dir, OsStr::new("f0"), mtime), None);
+        assert_eq!(
+            cache.get(&dir, OsStr::new("late"), mtime),
+            Some("image/png")
+        );
     }
 
     // ── `MimeDb::guess` — needs the real system MIME database ───────────
