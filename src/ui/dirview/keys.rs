@@ -5,7 +5,7 @@
 use iced::{Task, keyboard};
 
 use crate::config::View;
-use crate::keymap::{self, Action};
+use crate::keymap::Action;
 use crate::ui::breadcrumbs;
 
 use super::rename::NewKind;
@@ -88,7 +88,7 @@ impl DirectoryView {
                     }
                     return (Task::none(), None);
                 }
-                match keymap::resolve(&key, modifiers) {
+                match self.keymap.resolve(&key, modifiers) {
                     Some(action) => self.apply_action(action),
                     None => {
                         self.try_type_ahead(&key, modifiers);
@@ -104,7 +104,7 @@ impl DirectoryView {
         }
     }
 
-    /// A key `keymap::resolve` doesn't own: if it's an unmodified printable
+    /// A key the keymap doesn't own: if it's an unmodified printable
     /// character, feed it to type-ahead and jump the cursor to whatever it
     /// matches. Ctrl/Alt/Logo combinations are left alone here (they're
     /// either already an `Action`, or genuinely not this module's

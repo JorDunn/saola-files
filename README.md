@@ -127,6 +127,11 @@ mimetypes = ["text/*", "application/json"]
 [[server]]
 name = "homelab"
 uri = "sftp://jordan@10.0.0.10/srv"
+
+# Keyboard shortcuts: action name = "chord" or ["chord", ...]. See
+# "Keyboard shortcuts" below for the grammar, names and conflict rules.
+[keys]
+new_folder = "ctrl+alt+n"
 ```
 
 Every knob above degrades independently: an unrecognized `surface`/`view`/
@@ -138,37 +143,89 @@ still takes effect.
 
 ## Keyboard shortcuts
 
-Every binding resolves through `src/keymap.rs`'s `resolve(key, modifiers)`
-into an `Action` enum — nothing downstream ever matches a raw key. Rows
-marked "grid only" are a no-op in list view (there's no notion of "the next
-column over").
+Every binding resolves through the table in `src/keymap.rs` into an `Action`
+enum; nothing downstream ever matches a raw key. Each row has a stable action
+name, which is how `files.toml` refers to it. Cursor-left/right are a no-op in
+list view (there is no "next column over").
 
-| Keys | Action |
-|---|---|
-| ↑ / ↓ | Move cursor up/down a row |
-| ← / → | Move cursor a column (grid only) |
-| Home / End | Move cursor to first/last entry |
-| Page Up / Page Down | Move cursor a page |
-| Shift + any of the above | Extend the selection instead of moving alone |
-| Ctrl+Space | Toggle the cursor row's selection without touching the rest |
-| Ctrl+A | Select all |
-| Enter | Descend into the selected directory / open the selection |
-| Backspace, or Alt+↑ | Go to the parent directory |
-| Alt+← | Back through this view's own navigation history |
-| Alt+→ | Forward through history |
-| Alt+Enter | Open the properties dialog for the selection |
-| Ctrl+H | Toggle showing hidden files |
-| Ctrl+L | Edit the current location as a path/URI |
-| Ctrl+1 | Switch to list view |
-| Ctrl+2 | Switch to grid view |
-| F5 | Refresh (manual re-list, for backends without live-watch) |
-| Ctrl+C / Ctrl+X / Ctrl+V | Copy / cut / paste |
-| F2 | Rename the selection (single entry only) |
-| Ctrl+Shift+N | New folder |
-| Delete | Trash the selection (or permanently delete, if the backend has no trash) |
-| Shift+Delete | Always permanently delete, regardless of trash support |
-| Ctrl+Z | Undo the most recent invertible operation |
-| Escape | Close whatever dialog/popover/inline editor is open |
+| Action name | Default chord(s) | What it does |
+|---|---|---|
+| `move_cursor_up` | `up` | Move cursor up |
+| `move_cursor_down` | `down` | Move cursor down |
+| `move_cursor_left` | `left` | Move cursor left |
+| `move_cursor_right` | `right` | Move cursor right |
+| `move_cursor_home` | `home` | Move cursor to first item |
+| `move_cursor_end` | `end` | Move cursor to last item |
+| `move_cursor_page_up` | `pageup` | Move cursor up a page |
+| `move_cursor_page_down` | `pagedown` | Move cursor down a page |
+| `extend_selection_up` | `shift+up` | Extend selection up |
+| `extend_selection_down` | `shift+down` | Extend selection down |
+| `extend_selection_left` | `shift+left` | Extend selection left |
+| `extend_selection_right` | `shift+right` | Extend selection right |
+| `extend_selection_home` | `shift+home` | Extend selection to first item |
+| `extend_selection_end` | `shift+end` | Extend selection to last item |
+| `extend_selection_page_up` | `shift+pageup` | Extend selection up a page |
+| `extend_selection_page_down` | `shift+pagedown` | Extend selection down a page |
+| `toggle_cursor_selected` | `ctrl+space` | Toggle selection of the cursor item |
+| `select_all` | `ctrl+a` | Select all |
+| `descend` | `enter` | Open selection |
+| `ascend` | `backspace`, `alt+up` | Go to parent folder |
+| `history_back` | `alt+left` | Back |
+| `history_forward` | `alt+right` | Forward |
+| `edit_path` | `ctrl+l` | Edit location |
+| `refresh` | `f5` | Refresh |
+| `toggle_hidden` | `ctrl+h` | Show or hide hidden files |
+| `set_view_list` | `ctrl+1` | List view |
+| `set_view_grid` | `ctrl+2` | Grid view |
+| `copy` | `ctrl+c` | Copy |
+| `cut` | `ctrl+x` | Cut |
+| `paste` | `ctrl+v` | Paste |
+| `rename` | `f2` | Rename |
+| `new_folder` | `ctrl+shift+n` | New folder |
+| `delete` | `delete` | Move to Trash or delete |
+| `permanent_delete` | `shift+delete` | Delete permanently |
+| `undo` | `ctrl+z` | Undo |
+| `properties` | `alt+enter` | Properties |
+| `open_context_menu` | `menu`, `shift+menu`, `shift+f10` | Open context menu |
+
+Not in the table, so not rebindable: text editing inside inputs (the focused
+field consumes those keys), **Escape** closing the popover, rename box or
+path editor in front, and type-ahead (a bare letter or digit jumps to the
+entry that starts with it).
+
+### Rebinding with `[keys]`
+
+```toml
+[keys]
+new_folder = "ctrl+alt+n"          # one chord: replaces the default
+rename = ["f2", "ctrl+r"]          # several chords for one action
+undo = []                          # unbound (`""` works too)
+```
+
+* **Chords** are modifiers and one key joined by `+`, case-insensitive:
+  `ctrl+shift+n`, `alt+up`, `f2`, `menu`, `shift+delete`. Modifiers are
+  `ctrl`, `shift`, `alt` (each once; Super/Logo is not supported). Keys are
+  a single character (`n`, `1`, `,`; write the plus key as `plus`) or a name:
+  `up down left right home end pageup pagedown enter backspace delete insert
+  tab space menu f1`..`f12` (also `return`, `del`, `pgup`, `pgdn`, `esc`).
+* **Layout:** chords name the *logical* key, the character your layout
+  produces, not a physical position. `ctrl+z` is whichever key types "z" for
+  you, so Ctrl+C stays Ctrl+C on Dvorak or AZERTY. On a layout that cannot
+  type Latin letters, bind named keys or digits.
+* A character key must carry `ctrl` or `alt` (bare letters are type-ahead),
+  and `escape` cannot be bound.
+* Matching is exact: `ctrl+a` does not fire when Shift is also held.
+* A value **replaces** that action's defaults. Names are the first column
+  above.
+* **Problems warn once, by name, on stderr, and never stop the app.** An
+  unknown action name, a value that is not a string or array of strings, or
+  a chord that does not parse affects only that entry; if an action's whole
+  value is unusable it keeps its defaults.
+* **Conflicts:** if you bind a chord that is another action's *default*,
+  yours wins and that default is unbound, with a warning naming both. If you
+  bind one chord to two actions, the action whose name sorts first
+  alphabetically keeps it and the other loses that chord, with a warning.
+* Keys are read at start-up; restart to apply changes.
 
 The header's mouse-only controls (nav arrows, refresh, view switcher,
 Hidden toggle, breadcrumb edit-pencil, the "⋯" overflow menu that opens the

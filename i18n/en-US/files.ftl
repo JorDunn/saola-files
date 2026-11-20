@@ -232,3 +232,47 @@ error-notice-dismiss = Dismiss
 error-notice-details = Details
 error-notice-hide-details = Hide details
 error-notice-more = …and { $count } more
+
+## Keyboard shortcuts
+##
+## Labels for the rows of `keymap::BINDINGS`, one per action, id `keys-` plus
+## the action's name with `-` for `_`. Read by a shortcut editor, not shown
+## in the app today.
+
+keys-move-cursor-up = Move cursor up
+keys-move-cursor-down = Move cursor down
+keys-move-cursor-left = Move cursor left
+keys-move-cursor-right = Move cursor right
+keys-move-cursor-home = Move cursor to first item
+keys-move-cursor-end = Move cursor to last item
+keys-move-cursor-page-up = Move cursor up a page
+keys-move-cursor-page-down = Move cursor down a page
+keys-extend-selection-up = Extend selection up
+keys-extend-selection-down = Extend selection down
+keys-extend-selection-left = Extend selection left
+keys-extend-selection-right = Extend selection right
+keys-extend-selection-home = Extend selection to first item
+keys-extend-selection-end = Extend selection to last item
+keys-extend-selection-page-up = Extend selection up a page
+keys-extend-selection-page-down = Extend selection down a page
+keys-toggle-cursor-selected = Toggle selection of the cursor item
+keys-select-all = Select all
+keys-descend = Open selection
+keys-ascend = Go to parent folder
+keys-history-back = Back
+keys-history-forward = Forward
+keys-edit-path = Edit location
+keys-refresh = Refresh
+keys-toggle-hidden = Show or hide hidden files
+keys-set-view-list = List view
+keys-set-view-grid = Grid view
+keys-copy = Copy
+keys-cut = Cut
+keys-paste = Paste
+keys-rename = Rename
+keys-new-folder = New folder
+keys-delete = Move to Trash or delete
+keys-permanent-delete = Delete permanently
+keys-undo = Undo
+keys-properties = Properties
+keys-open-context-menu = Open context menu
