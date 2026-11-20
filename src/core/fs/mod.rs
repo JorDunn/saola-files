@@ -15,6 +15,7 @@
 //! `core/thumbs.rs`'s documented `iced` exception). `undo` reaches into
 //! `trash` for one call (`trash::restore`), never `std::fs` directly.
 
+pub mod bulk_rename;
 pub mod entry;
 pub mod format;
 pub mod ops;

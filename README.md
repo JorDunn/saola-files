@@ -180,7 +180,7 @@ list view (there is no "next column over").
 | `copy` | `ctrl+c` | Copy |
 | `cut` | `ctrl+x` | Cut |
 | `paste` | `ctrl+v` | Paste |
-| `rename` | `f2` | Rename |
+| `rename` | `f2` | Rename (one item inline; two or more open the bulk-rename dialog) |
 | `new_folder` | `ctrl+shift+n` | New folder |
 | `delete` | `delete` | Move to Trash or delete |
 | `permanent_delete` | `shift+delete` | Delete permanently |

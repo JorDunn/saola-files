@@ -121,6 +121,26 @@ inotify = "0.11"
 # for a crate already in the resolved graph, not a new download.
 png = "0.18"
 
+# Bulk rename's find/replace (`core::fs::bulk_rename`). Surveyed 2026-11-20:
+#
+# 1. **`regex` (chosen)** — pure Rust, linear-time (no catastrophic
+#    backtracking on a user-typed pattern), and its `regex::bytes` API
+#    matches on `&[u8]`: a filename is bytes on Unix, so a non-UTF-8 name is
+#    searched and rewritten with every byte outside the match preserved,
+#    which AGENTS.md's OsString discipline requires. Pure Rust (AGENTS.md's
+#    pure-Rust rule); new to the graph, adding `regex-syntax`,
+#    `regex-automata` and `aho-corasick`, all from the same maintainers.
+# 2. **`fancy-regex`** — adds look-around/backreferences, but backtracks
+#    (a typo could hang the dialog) and only matches `&str`, so it cannot
+#    touch a name that is not valid UTF-8. Ruled out.
+# 3. **Hand-rolled glob/substring only** — covers the literal mode, but the
+#    issue asks for regex and re-implementing one is worse than depending on
+#    the standard crate.
+#
+# Features: the default set (Unicode tables, perf literals) is what makes
+# `\w`/`(?i)` behave on non-ASCII names; the size cost is accepted.
+regex = "1"
+
 # `modules::sftp` (Stage 14, `feature = "sftp"`) — the file manager's one
 # remote protocol backend. Surveyed 2026-08-10, three real candidates:
 #

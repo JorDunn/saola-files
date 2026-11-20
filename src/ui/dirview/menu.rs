@@ -61,6 +61,9 @@ pub enum Message {
     /// (`Action::Properties`).
     PropertiesRequested,
     // --- features (alphabetical) ---
+    /// "Rename selected…" (shown with two or more selected): the mouse path
+    /// to the bulk-rename dialog F2 opens.
+    BulkRenameRequested,
     /// "Folder properties" (shown with nothing selected): properties of the
     /// directory this view is showing.
     FolderPropertiesRequested,
@@ -90,6 +93,7 @@ impl DirectoryView {
             Message::DeleteRequested => self.on_menu_delete_requested(),
             Message::PropertiesRequested => self.on_menu_properties_requested(),
             // --- features (alphabetical) ---
+            Message::BulkRenameRequested => self.on_menu_bulk_rename_requested(),
             Message::FolderPropertiesRequested => self.on_menu_folder_properties_requested(),
             Message::Swallow => (Task::none(), None),
         }
@@ -201,6 +205,12 @@ impl DirectoryView {
         } else {
             (Task::none(), None)
         }
+    }
+
+    /// [`Message::BulkRenameRequested`]'s handler.
+    pub(super) fn on_menu_bulk_rename_requested(&mut self) -> (Task<ViewMessage>, Option<Event>) {
+        self.menu_open = false;
+        (Task::none(), self.bulk_rename_event())
     }
 
     /// [`Message::NewFolderRequested`]'s handler.

@@ -52,6 +52,7 @@
 // its parent's private fields, so the struct's fields stay private here;
 // methods one file calls from another are `pub(super)` (visible inside
 // `dirview` only, never to `ui::explorer` or the app).
+mod bulk_rename;
 pub mod context;
 mod cursor;
 mod grid;
@@ -92,6 +93,8 @@ use crate::ui::right_click::RightClick;
 // `row_icon`/`thumbnail_for` moved to `thumbs.rs`; re-exported here so
 // `list.rs`/`grid.rs` keep importing them as `super::{row_icon, thumbnail_for}`.
 pub(super) use thumbs::{row_icon, thumbnail_for};
+// The bulk-rename dialog is opened with this payload (`Event::BulkRenameRequested`).
+pub use bulk_rename::BulkRenameRequest;
 
 /// Messages this view's `update` consumes. `Listed`/`TargetResolved`
 /// arrive from the backend calls `load`/`open_target`/`open_select` kick
@@ -276,6 +279,10 @@ pub enum Event {
     /// view's (see [`AppAction`]).
     App(AppAction),
     // --- features (alphabetical) ---
+    /// F2 or the menu's "Rename selected…" with two or more items
+    /// selected: open the bulk-rename dialog for them. One selected item
+    /// keeps the inline rename.
+    BulkRenameRequested(BulkRenameRequest),
     /// An operation this view started failed (today: New Folder / New File
     /// could not be created). The owner decides how to show it; see
     /// `ui::dialogs::error_notice`.

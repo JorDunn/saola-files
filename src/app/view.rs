@@ -206,11 +206,14 @@ impl App {
             None => with_connect,
         };
 
+        // Bulk rename (a modal, so above the other dialogs).
+        let with_bulk_rename = self.with_bulk_rename(with_conflict);
+
         ui::window::view(
             t,
             self.surface,
             tr_static!("window-title"),
-            with_conflict,
+            with_bulk_rename,
             Message::Window,
         )
     }

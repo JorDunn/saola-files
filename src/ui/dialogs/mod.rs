@@ -13,6 +13,7 @@
 //! app-window concerns" split that already keeps window chrome
 //! (`ui::window`) and now this out of `ui::explorer`.
 
+pub mod bulk_rename;
 pub mod conflict;
 pub mod connect;
 pub mod error_notice;

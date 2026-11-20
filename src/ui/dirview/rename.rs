@@ -400,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn rename_with_multiple_selected_is_a_no_op() {
+    fn rename_with_multiple_selected_starts_no_inline_edit() {
         let mut view = listed_view(vec![file("a"), file("b")]);
         let _ = view.apply_action_for_test(Action::SelectAll);
         let _ = view.apply_action_for_test(Action::Rename);

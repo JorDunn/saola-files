@@ -185,6 +185,10 @@ fn single_selection(ctx: &MenuContext) -> bool {
     ctx.selected == 1
 }
 
+fn several_selected(ctx: &MenuContext) -> bool {
+    ctx.selected > 1
+}
+
 fn has_clipboard(ctx: &MenuContext) -> bool {
     ctx.clipboard_has_contents
 }
@@ -209,6 +213,7 @@ pub(super) const CONTEXT_MENU: &[MenuEntry] = &[
     MenuEntry { glyph: Icon::Scissors,       label_id: msg!("menu-cut"),              shown: has_selection,               message: menu::Message::CutRequested },
     MenuEntry { glyph: Icon::ClipboardPaste, label_id: msg!("menu-paste"),            shown: has_clipboard,               message: menu::Message::PasteRequested },
     MenuEntry { glyph: Icon::Pencil,         label_id: msg!("menu-rename"),           shown: single_selection,            message: menu::Message::RenameRequested },
+    MenuEntry { glyph: Icon::Pencil,         label_id: msg!("menu-rename-many"),      shown: several_selected,            message: menu::Message::BulkRenameRequested },
     MenuEntry { glyph: Icon::Trash2,         label_id: msg!("menu-move-to-trash"),    shown: has_selection_and_trash,     message: menu::Message::DeleteRequested },
     MenuEntry { glyph: Icon::Trash2,         label_id: msg!("menu-delete"),           shown: has_selection_without_trash, message: menu::Message::DeleteRequested },
     MenuEntry { glyph: Icon::FolderPlus,     label_id: msg!("menu-new-folder"),       shown: always,                      message: menu::Message::NewFolderRequested },
@@ -482,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn menu_with_several_selected_has_no_rename() {
+    fn menu_with_several_selected_offers_bulk_rename_not_rename() {
         assert_eq!(
             labels(3, true, true),
             [
@@ -492,6 +497,7 @@ mod tests {
                 "Copy",
                 "Cut",
                 "Paste",
+                "Rename selected…",
                 "Move to Trash",
                 "New Folder",
                 "New File",
