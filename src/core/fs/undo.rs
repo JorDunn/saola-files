@@ -46,8 +46,12 @@
 //! a conflict is the simple, honest choice over trying to partially
 //! reconstruct which items are safe.
 
+use std::ffi::OsString;
+
+use crate::core::fs::bulk_rename;
 use crate::core::fs::trash::TrashId;
 use crate::core::vfs::{Caps, Location};
+use crate::tr;
 
 /// One undo-able action, pushed by `main.rs` the moment the corresponding
 /// operation completes successfully (see each push call site: `Move` in
@@ -68,6 +72,22 @@ pub enum UndoEntry {
     /// same sense a `Move` pair is — a rename is a same-directory
     /// `Backend::rename`, nothing else touched.
     Rename { from: Location, to: Location },
+    /// A completed bulk rename: ONE entry for the whole batch, so a single
+    /// Ctrl+Z reverts every item. `moves` holds `(current name, original
+    /// name)` for each item that is not under its original name, all inside
+    /// `dir`. After a fully successful batch that is every renamed item;
+    /// after a failed one whose rollback also partly failed it is exactly
+    /// the items left changed (see `core::fs::bulk_rename`'s "Partial
+    /// failure"). Undoing re-plans against the folder as it is then
+    /// (`bulk_rename::plan_undo`), so a swap is undone through a temporary
+    /// name rather than by overwriting, and an item that has since been
+    /// deleted or renamed again is left alone and reported. Only built when
+    /// `dir`'s backend passes the same capability check as a single rename
+    /// (`Caps::RENAME_IN_PLACE`).
+    BulkRename {
+        dir: Location,
+        moves: Vec<(OsString, OsString)>,
+    },
     /// A trash-delete (Delete key / the context menu's row, where
     /// `Caps::TRASH`): `id` is everything `core::fs::trash::restore` needs
     /// — see that function's own doc comment ("undoing a trash-delete is
@@ -100,6 +120,7 @@ impl UndoEntry {
                 many => format!("Moved {} items", many.len()),
             },
             UndoEntry::Rename { from, .. } => format!("Renamed \"{}\"", display_name(from)),
+            UndoEntry::BulkRename { moves, .. } => tr!("undo-bulk-rename", count = moves.len()),
             UndoEntry::Trash { original, .. } => format!("Deleted \"{}\"", display_name(original)),
             UndoEntry::New { created } => format!("Created \"{}\"", display_name(created)),
         }
@@ -202,6 +223,7 @@ pub async fn apply(entry: UndoEntry) -> Result<(), String> {
             }
         }
         UndoEntry::Rename { from, to } => rename_back(&to, &from).await,
+        UndoEntry::BulkRename { dir, moves } => undo_bulk_rename(&dir, &moves).await.0,
         UndoEntry::Trash { id, .. } => {
             // `restore` is blocking `std::fs` I/O (see `core::fs::trash`'s
             // own module doc comment on why it's allowed to be) — run on a
@@ -215,6 +237,41 @@ pub async fn apply(entry: UndoEntry) -> Result<(), String> {
             }
         }
         UndoEntry::New { created } => remove_one(&created).await,
+    }
+}
+
+/// [`apply`], but also hands back an entry to push onto the stack again
+/// when an undo of a bulk rename could not finish, covering exactly the
+/// items still away from their original names, so a later Ctrl+Z can retry.
+/// Every other kind of entry returns `None`.
+pub async fn apply_with_retry(entry: UndoEntry) -> (Result<(), String>, Option<UndoEntry>) {
+    match entry {
+        UndoEntry::BulkRename { dir, moves } => undo_bulk_rename(&dir, &moves).await,
+        other => (apply(other).await, None),
+    }
+}
+
+/// Inverts a [`UndoEntry::BulkRename`] through `bulk_rename::undo` (planner,
+/// checked renames, stop-at-stuck rollback), turning what it left behind
+/// into the result and an optional retry entry.
+async fn undo_bulk_rename(
+    dir: &Location,
+    moves: &[(OsString, OsString)],
+) -> (Result<(), String>, Option<UndoEntry>) {
+    let Some(backend) = crate::modules::resolve(dir) else {
+        return (
+            Err(format!("no backend for scheme \"{}\"", dir.scheme)),
+            None,
+        );
+    };
+    let outcome = bulk_rename::undo(backend.as_ref(), dir, moves).await;
+    let retry = (!outcome.remaining.is_empty()).then(|| UndoEntry::BulkRename {
+        dir: dir.clone(),
+        moves: outcome.remaining,
+    });
+    match outcome.error {
+        Some(error) => (Err(error), retry),
+        None => (Ok(()), retry),
     }
 }
 

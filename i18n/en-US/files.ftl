@@ -61,6 +61,7 @@ menu-copy = Copy
 menu-cut = Cut
 menu-paste = Paste
 menu-rename = Rename…
+menu-rename-many = Rename selected…
 menu-move-to-trash = Move to Trash
 menu-delete = Delete
 menu-new-folder = New Folder
@@ -152,6 +153,83 @@ properties-mode = { $symbolic } ({ $octal })
 ## Undo toast
 
 undo-button = Undo
+undo-bulk-rename =
+    { $count ->
+        [one] Renamed { $count } item
+       *[other] Renamed { $count } items
+    }
+undo-bulk-rename-skipped =
+    { $count ->
+        [one] “{ $name }” has changed since it was renamed, so it was left as it is
+       *[other] { $count } items have changed since they were renamed, so they were left as they are (starting with “{ $name }”)
+    }
+
+## Bulk rename dialog
+
+bulk-rename-title =
+    { $count ->
+        [one] Rename { $count } item
+       *[other] Rename { $count } items
+    }
+bulk-rename-mode-find = Find and replace
+bulk-rename-mode-affix = Prefix and suffix
+bulk-rename-mode-number = Numbering
+bulk-rename-mode-case = Change case
+bulk-rename-find-placeholder = Find
+bulk-rename-replace-placeholder = Replace with
+bulk-rename-regex = Regular expression
+bulk-rename-match-case = Match case
+bulk-rename-prefix-placeholder = Add before the name
+bulk-rename-suffix-placeholder = Add after the name
+bulk-rename-pattern-placeholder = Holiday {"{"}n:03{"}"}
+bulk-rename-start-label = Start at
+bulk-rename-number-hint = {"{"}n{"}"} is the number, {"{"}n:03{"}"} pads it to 3 digits, {"{"}name{"}"} is the old name.
+bulk-rename-case-lower = lowercase
+bulk-rename-case-upper = UPPERCASE
+bulk-rename-case-title = Title Case
+bulk-rename-keep-extension = Keep file extensions
+bulk-rename-preview-label = Preview
+bulk-rename-unchanged = no change
+bulk-rename-apply =
+    { $count ->
+        [one] Rename { $count } item
+       *[other] Rename { $count } items
+    }
+bulk-rename-status-nothing = Nothing to rename yet.
+bulk-rename-status-ready =
+    { $count ->
+        [one] { $count } item will be renamed.
+       *[other] { $count } items will be renamed.
+    }
+bulk-rename-problem-empty = “{ $name }” would have no name.
+bulk-rename-problem-dot = “{ $name }” would be named “.” or “..”, which isn't allowed.
+bulk-rename-problem-character = “{ $name }” would contain a “/” or a null character, which a name can't have.
+bulk-rename-problem-long = “{ $name }” would be too long for a file name.
+bulk-rename-problem-duplicate = More than one item would be named “{ $name }”.
+bulk-rename-problem-exists = “{ $name }” already exists in this folder.
+bulk-rename-problem-count =
+    { $count ->
+        [one] Nothing is renamed until this is fixed: { $reason }
+       *[other] Nothing is renamed until these { $count } problems are fixed. First: { $reason }
+    }
+bulk-rename-error-regex = That isn't a valid regular expression: { $detail }.
+bulk-rename-error-unknown-token = “{ $token }” isn't a known placeholder. Use {"{"}n{"}"}, {"{"}n:03{"}"} or {"{"}name{"}"}.
+bulk-rename-error-unclosed = A “{"{"}” is missing its closing “{"}"}”.
+bulk-rename-error-stray = A “{"}"}” has no opening “{"{"}”. Write “{"}}"}” for a literal one.
+bulk-rename-error-width = “{ $width }” isn't a valid width. Use a number from 1 to 32.
+bulk-rename-error-start = The starting number must be a whole number.
+bulk-rename-cancel = Cancel
+bulk-rename-preview-more =
+    { $count ->
+        [one] and { $count } more item not shown here (it is still checked and renamed)
+       *[other] and { $count } more items not shown here (they are still checked and renamed)
+    }
+bulk-rename-regex-hint = In the replacement, ${"{"}name{"}"} or $1 inserts a matched group. Write ${"{"}1{"}"}abc when letters follow the number.
+bulk-rename-parked = it is now stored as “{ $temp }”, a hidden file in the same folder
+undo-bulk-rename-stuck = { $reason }; for “{ $name }”, { $parked }
+bulk-rename-busy = another operation is still running; try again when it has finished
+bulk-rename-operation = renaming items
+bulk-rename-no-backend = nothing is connected for “{ $scheme }” locations
 
 ## Trash
 

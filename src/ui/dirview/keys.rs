@@ -286,7 +286,9 @@ impl DirectoryView {
                     let name = entry.name.clone();
                     (self.start_rename_named(name), None)
                 } else {
-                    (Task::none(), None)
+                    // Several selected: the bulk-rename dialog (`None` when
+                    // nothing is selected, so F2 then does nothing).
+                    (Task::none(), self.bulk_rename_event())
                 }
             }
             Action::NewFolder => (self.create_new(NewKind::Folder), None),

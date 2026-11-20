@@ -14,6 +14,7 @@
 //! every descendant), so only methods called *across* siblings are
 //! marked `pub(super)`.
 
+mod bulk_rename;
 mod connect;
 mod dbus;
 mod failures;
@@ -45,6 +46,7 @@ use ui::explorer::{ViewId, ViewIdSource};
 
 use core::remote;
 
+use bulk_rename::PendingBulkRename;
 use connect::PendingConnect;
 use file_ops::PendingConflict;
 use properties::PendingProperties;
@@ -143,6 +145,15 @@ pub(crate) enum Message {
     /// the menu instead of doing nothing).
     Noop,
     // --- features (alphabetical) ---
+    /// The bulk-rename dialog's controls, Apply and Cancel.
+    BulkRename(ui::dialogs::bulk_rename::Message),
+    /// A bulk rename finished or stopped (`app::bulk_rename`); carries the
+    /// incident minted when it started and what changed.
+    BulkRenameDone(
+        core::failure::Incident,
+        Location,
+        core::fs::bulk_rename::ApplyReport,
+    ),
     /// The error notice's buttons, and the way anything reports a failure
     /// into it (`error_notice::Message::Report`; see `failures::failed`).
     ErrorNotice(ui::dialogs::error_notice::Message),
@@ -159,6 +170,14 @@ pub(crate) enum Message {
     /// A batch of background content-sniff head reads finished
     /// (`app::sniff`).
     SniffReady(Vec<sniff::SniffOutcome>),
+    /// An undo finished (`start_undo`): the incident minted when it
+    /// started, its result, and, for a bulk-rename undo that could not
+    /// finish, an entry to push back so a later Ctrl+Z can retry.
+    UndoFinished(
+        core::failure::Incident,
+        Result<(), String>,
+        Option<undo::UndoEntry>,
+    ),
 }
 
 /// Where a raw key event should go; see [`App::keyboard_target`].
@@ -376,6 +395,12 @@ pub(crate) struct App {
     /// gets to do anything else with it.
     activation: cli::Cli,
     // --- features (alphabetical) ---
+    /// A bulk-rename batch is running (set on Apply, cleared when it
+    /// finishes). Counts as busy for a second batch and for paste.
+    bulk_rename_running: bool,
+    /// The bulk-rename dialog currently showing, if any. A modal: listed
+    /// in [`App::keyboard_target`].
+    pending_bulk_rename: Option<PendingBulkRename>,
     /// The failure notice in the footer band, if one is showing. Persists
     /// until dismissed; see `ui::dialogs::error_notice` and `failures`.
     error_notice: ui::dialogs::error_notice::Slot,
@@ -502,6 +527,8 @@ impl App {
             pending_connect: None,
             activation,
             // --- features (alphabetical) ---
+            bulk_rename_running: false,
+            pending_bulk_rename: None,
             error_notice: ui::dialogs::error_notice::Slot::default(),
             free_space: statusbar::FreeSpace::default(),
             incidents: failures::Incidents::default(),
@@ -619,11 +646,18 @@ impl App {
             Message::Dbus(event) => self.handle_dbus_event(event),
             Message::DbusPropertiesResolved(items) => self.open_properties(items),
             // --- features (alphabetical) ---
+            Message::BulkRename(inner) => self.handle_bulk_rename_message(inner),
+            Message::BulkRenameDone(incident, dir, report) => {
+                self.handle_bulk_rename_done(incident, dir, report)
+            }
             Message::ErrorNotice(inner) => self.handle_error_notice(inner),
             Message::FreeSpace(id, location, result) => self.on_free_space(id, location, result),
             Message::RemoteOpen(inner) => self.handle_remote_open(inner),
             Message::Session(inner) => self.handle_session_message(inner),
             Message::SniffReady(outcomes) => self.handle_sniff_ready(outcomes),
+            Message::UndoFinished(incident, result, retry) => {
+                self.handle_undo_finished(incident, result, retry)
+            }
         }
     }
 
@@ -651,7 +685,8 @@ impl App {
 
     /// The single routing decision for raw key events: who gets them?
     ///
-    /// Every App-level modal must be listed here. A new dialog that is not
+    /// Every App-level modal must be listed here (conflict, properties,
+    /// connect, bulk rename). A new dialog that is not
     /// added lets keys (Delete, Ctrl+Z, ...) fall through to the directory
     /// behind its scrim. Popovers (overflow menu, Open with) are NOT listed:
     /// they live inside the focused `DirectoryView`, whose `handle_keyboard`
@@ -662,7 +697,8 @@ impl App {
     pub(crate) fn keyboard_target(&self) -> KeyboardTarget {
         let modal_open = self.pending_conflict.is_some()
             || self.pending_properties.is_some()
-            || self.pending_connect.is_some();
+            || self.pending_connect.is_some()
+            || self.pending_bulk_rename.is_some();
         if modal_open {
             KeyboardTarget::Nobody
         } else if self.trash_active {
@@ -680,7 +716,7 @@ impl App {
     /// Esc rule for the error notice. This and `keyboard_target` are the
     /// only places key routing is decided.
     ///
-    /// - A modal (conflict, properties, connect) is open: nothing, Esc
+    /// - A modal (conflict, properties, connect, bulk rename) is open: nothing, Esc
     ///   included. Nothing reaches behind a modal.
     /// - The Trash view is up: only a bare Esc, and only to dismiss the
     ///   notice (`KeyboardTarget::NoticeOnly`). Every other key is dropped.
@@ -976,5 +1012,125 @@ mod tests {
         let mut app = app();
         let _ = app.open_connect_dialog(None, false);
         assert_eq!(app.keyboard_target(), KeyboardTarget::Nobody);
+    }
+
+    fn bulk_request() -> ui::dirview::BulkRenameRequest {
+        ui::dirview::BulkRenameRequest {
+            dir: Location::local("/tmp"),
+            selected: vec!["a".into(), "b".into()],
+            others: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn bulk_rename_dialog_takes_keys_away_from_the_view() {
+        let mut app = app();
+        assert_eq!(app.keyboard_target(), KeyboardTarget::FocusedView);
+        let _ = app.open_bulk_rename(bulk_request());
+        assert_eq!(app.keyboard_target(), KeyboardTarget::Nobody);
+        // Cancel closes it and the view gets its keys back.
+        let _ = app.handle_bulk_rename_message(ui::dialogs::bulk_rename::Message::CancelRequested);
+        assert_eq!(app.keyboard_target(), KeyboardTarget::FocusedView);
+    }
+
+    #[test]
+    fn a_second_bulk_rename_is_refused_while_one_is_running() {
+        let mut app = app();
+        app.bulk_rename_running = true;
+        let _ = app.open_bulk_rename(bulk_request());
+        assert!(app.pending_bulk_rename.is_none());
+        assert!(app.error_notice.is_showing());
+        // And a paste is refused while the batch runs.
+        let _ = app.submit_paste_op(
+            ops::OpKind::Copy,
+            vec![Location::local("/tmp/a")],
+            Location::local("/tmp"),
+        );
+        assert!(app.active_op.is_none());
+        // Finishing the batch clears the flag.
+        let _ = app.handle_bulk_rename_done(
+            core::failure::Incident::mint(),
+            Location::local("/tmp"),
+            core::fs::bulk_rename::ApplyReport::default(),
+        );
+        assert!(!app.bulk_rename_running);
+    }
+
+    #[test]
+    fn undo_waits_for_a_running_bulk_rename_and_keeps_its_entry() {
+        let mut app = app();
+        app.undo_stack.push(undo::UndoEntry::New {
+            created: Location::local("/tmp/x"),
+        });
+        app.bulk_rename_running = true;
+        let _ = app.start_undo();
+        assert!(
+            !app.undo_stack.is_empty(),
+            "the entry must stay on the stack"
+        );
+        assert!(app.error_notice.is_showing());
+    }
+
+    #[test]
+    fn a_stuck_bulk_rename_undo_pushes_its_retry_entry_back() {
+        let mut app = app();
+        let retry = undo::UndoEntry::BulkRename {
+            dir: Location::local("/tmp"),
+            moves: vec![(".saola-tmp-1".into(), "a".into())],
+        };
+        let _ = app.handle_undo_finished(
+            core::failure::Incident::mint(),
+            Err("stuck".to_owned()),
+            Some(retry.clone()),
+        );
+        assert!(app.error_notice.is_showing());
+        assert_eq!(app.undo_stack.pop(), Some(retry));
+    }
+
+    #[test]
+    fn a_finished_bulk_rename_pushes_one_undo_entry_for_the_whole_batch() {
+        let mut app = app();
+        let report = core::fs::bulk_rename::ApplyReport {
+            moved: vec![
+                ("b".into(), "a".into()),
+                ("c".into(), "b".into()),
+                ("d".into(), "c".into()),
+            ],
+            ..Default::default()
+        };
+        let _ = app.handle_bulk_rename_done(
+            core::failure::Incident::mint(),
+            Location::local("/tmp"),
+            report,
+        );
+        assert_eq!(
+            app.undo_stack.peek_label(),
+            Some("Renamed 3 items".to_owned())
+        );
+        // One pop empties it: a single Ctrl+Z reverts the batch.
+        assert!(app.undo_stack.pop().is_some());
+        assert!(app.undo_stack.is_empty());
+    }
+
+    #[test]
+    fn a_batch_that_rolled_back_cleanly_pushes_no_undo_but_one_notice() {
+        let mut app = app();
+        let report = core::fs::bulk_rename::ApplyReport {
+            failure: Some(core::fs::bulk_rename::StepFailure {
+                name: "c".into(),
+                target: "C".into(),
+                error: core::vfs::VfsError::PermissionDenied {
+                    location: "/tmp/c".into(),
+                },
+            }),
+            ..Default::default()
+        };
+        let _ = app.handle_bulk_rename_done(
+            core::failure::Incident::mint(),
+            Location::local("/tmp"),
+            report,
+        );
+        assert!(app.undo_stack.is_empty());
+        assert!(app.error_notice.is_showing());
     }
 }
