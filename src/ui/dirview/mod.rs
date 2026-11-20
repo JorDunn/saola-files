@@ -560,9 +560,8 @@ impl DirectoryView {
             Message::RenameResult(dir_location, old_name, result) => {
                 self.on_rename_result(dir_location, old_name, result)
             }
-            Message::CreateResult(dir_location, name, result) => {
-                self.on_create_result(dir_location, name, result)
-            } // --- features (alphabetical) ---
+            Message::CreateResult(dir, name, result) => self.on_create_result(dir, name, result),
+            // --- features (alphabetical) ---
         }
     }
 
