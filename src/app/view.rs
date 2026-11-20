@@ -92,7 +92,7 @@ impl App {
             .width(Fill)
             .height(Fill)
             .into(),
-            (None, None) => body,
+            (None, None) => self.with_status_bar(body),
         };
 
         // Feature layers, one line each. With none (today), the body

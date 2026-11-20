@@ -34,6 +34,9 @@ impl DirectoryView {
         // -click must not pair with a fresh click on whatever entry now
         // occupies that index (see `last_click`'s doc comment).
         self.last_click = None;
+        // The rows on screen are about to change: the status bar's
+        // selection totals count only visible rows (see `summary.rs`).
+        self.summary.mark_visible_changed();
         let had_cursor = self.selection.cursor().is_some();
         let previous_cursor_name = self
             .selection

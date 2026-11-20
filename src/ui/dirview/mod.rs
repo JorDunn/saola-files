@@ -64,6 +64,7 @@ mod pointer;
 mod prefs;
 mod rename;
 mod selection;
+pub mod summary;
 #[cfg(test)]
 mod test_support;
 mod thumbs;
@@ -405,6 +406,9 @@ pub struct DirectoryView {
     /// Where the latest right button press landed, held between the
     /// position message and the row/empty message that follows it.
     last_press: Option<iced::Point>,
+    /// The status bar's cached facts (selection totals, refresh stamp);
+    /// see `summary.rs`.
+    summary: summary::Cache,
 }
 
 impl DirectoryView {
@@ -441,6 +445,7 @@ impl DirectoryView {
             listed: false,
             menu_anchor: None,
             last_press: None,
+            summary: summary::Cache::default(),
         }
     }
 
@@ -579,10 +584,14 @@ impl DirectoryView {
     }
 
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Event>) {
+        let entries_may_change = summary::may_change_entries(&message);
+        let refresh_signal = summary::is_refresh_signal(&message);
         let result = self.dispatch(message);
         // The one place that notices a popover has closed, however it was
         // closed (about twenty sites clear the flags) — see `context.rs`.
         self.drop_stale_menu_anchor();
+        // The one place the status bar's totals are brought up to date.
+        self.sync_summary(entries_may_change, refresh_signal);
         result
     }
 

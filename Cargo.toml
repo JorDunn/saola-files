@@ -287,7 +287,11 @@ rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 # `notification::icon_tile_colored` and 0.17.0 added launcher grid tiles and
 # touch-size tokens (`button::app_tile`, `list_row_touch`, edge-strip sizes);
 # both are additive and unused here. saola-tokens moved 0.9.0 -> 0.10.0 with it.
-saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.17.0", version = "0.17.0" }
+# Bumped again 2026-11-20 to v0.20.0 for the window status bar. 0.18.0 added 41
+# Lucide glyphs, 0.19.0 added `widget::status_bar`, `capacity_meter` and
+# `text::meta` (status bar, issue #23), 0.20.0 added `widget::search_field`.
+# All additive; nothing here needed migrating.
+saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.20.0", version = "0.20.0" }
 
 # `modules::local`'s `spawn_blocking` calls (Stage 3 — CLAUDE.md: "One
 # async runtime: iced's tokio executor and zbus's tokio integration share
