@@ -87,14 +87,14 @@ use russh_sftp::client::SftpSession;
 use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::client::fs::Metadata;
 use russh_sftp::extensions::Statvfs;
-use russh_sftp::protocol::{FileAttributes, StatusCode};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
 
 use crate::core::fs::entry::{EntryKind, FileEntry};
 use crate::core::remote::{AuthStage, ConnectEvent, ConnectRequest, HostKeyPrompt, PROMPT_TIMEOUT};
 use crate::core::vfs::{
-    Backend, Caps, DirEvent, FsStats, Location, ReadStream, VfsError, WriteSink,
+    Backend, Caps, DirEvent, FsStats, Location, ReadStream, VfsError, WriteOptions, WriteSink,
 };
 
 /// Default SSH port when the URI/authority didn't specify one — the same
@@ -254,31 +254,29 @@ impl Backend for SftpBackend {
     }
 
     async fn write(&self, location: &Location) -> Result<WriteSink, VfsError> {
+        self.write_with(location, WriteOptions::default()).await
+    }
+
+    async fn write_with(
+        &self,
+        location: &Location,
+        options: WriteOptions,
+    ) -> Result<WriteSink, VfsError> {
         let path = wire_path(location);
         let file = self
             .sftp
-            .create(path)
+            .open_with_flags(path, open_flags(options))
             .await
             .map_err(|err| sftp_error(location, err))?;
 
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
         let loc = location.clone();
         let join = tokio::spawn(async move {
-            let mut file = file;
-            while let Some(chunk) = rx.next().await {
-                if let Err(err) = file.write_all(&chunk).await {
-                    eprintln!("saola-files: write to {loc} failed: {err}");
-                    return;
-                }
+            let result = write_remote(file, &mut rx, options.sync).await;
+            if let Err(err) = &result {
+                eprintln!("saola-files: write to {loc} failed: {err}");
             }
-            // `File::shutdown` is this crate's "actually flush and close
-            // the remote handle" call — see `core::vfs::WriteSink`'s
-            // durability contract doc comment (the bug `modules::local::
-            // WriterSink` was written to fix): a bare channel close alone
-            // would not be durable.
-            if let Err(err) = file.shutdown().await {
-                eprintln!("saola-files: closing {loc} failed: {err}");
-            }
+            result
         });
 
         Ok(Box::pin(SftpWriterSink {
@@ -286,6 +284,22 @@ impl Backend for SftpBackend {
             join: Some(join),
             location: location.clone(),
         }))
+    }
+
+    /// Compares the server's canonical paths (`SSH_FXP_REALPATH`, which
+    /// OpenSSH resolves with `realpath(3)`, following symlinks). SFTP v3
+    /// reports no inode numbers, so two hard links to one file are not
+    /// recognised; the ops engine's replace-by-rename is safe for them
+    /// anyway (see `core::fs::ops`).
+    async fn same_file(&self, a: &Location, b: &Location) -> bool {
+        if a == b {
+            return true;
+        }
+        let (a, b) = (
+            self.sftp.canonicalize(wire_path(a)).await,
+            self.sftp.canonicalize(wire_path(b)).await,
+        );
+        matches!((a, b), (Ok(a), Ok(b)) if a == b)
     }
 
     async fn mkdir(&self, location: &Location) -> Result<(), VfsError> {
@@ -513,6 +527,51 @@ fn sftp_error(location: &Location, err: SftpError) -> VfsError {
     }
 }
 
+/// `SSH_FXP_OPEN` flags for [`SftpBackend::write_with`]: always write +
+/// create; `create_new` adds `EXCLUDE` (the server's `O_EXCL`, which also
+/// refuses a symlink at the name), otherwise `TRUNCATE`.
+fn open_flags(options: WriteOptions) -> OpenFlags {
+    let mut flags = OpenFlags::WRITE | OpenFlags::CREATE;
+    if options.create_new {
+        flags |= OpenFlags::EXCLUDE;
+    } else {
+        flags |= OpenFlags::TRUNCATE;
+    }
+    flags
+}
+
+/// The writer task's body: writes each chunk in order and returns the
+/// first error, then (when `sync` is set) flushes, then closes the handle.
+///
+/// Generic over `AsyncWrite` (not tied to `russh_sftp`'s `File`) so a test
+/// can inject a writer that fails, the same seam `modules::local`'s
+/// `write_chunks` has; there is no fake SFTP session to test against.
+///
+/// Why each step reports: russh-sftp pipelines writes, so `write_all`
+/// returning only means the request was queued; a server's refusal of an
+/// earlier chunk surfaces on a later `write_all`, on `flush` or on
+/// `shutdown`, all of which wait for the outstanding acknowledgements.
+/// `flush` also sends `fsync@openssh.com` when the server offers it (and
+/// quietly does nothing more when it doesn't: the server then makes no
+/// stable-storage promise this client could ask for). `shutdown` is the
+/// handle's `SSH_FXP_CLOSE`, whose status is the server's last word.
+///
+/// Returning early drops `rx`, so the engine's next `send` fails and it
+/// closes the sink, which hands it this error (see `SftpWriterSink`).
+async fn write_remote<W: AsyncWrite + Unpin>(
+    mut file: W,
+    rx: &mut mpsc::Receiver<Vec<u8>>,
+    sync: bool,
+) -> std::io::Result<()> {
+    while let Some(chunk) = rx.next().await {
+        file.write_all(&chunk).await?;
+    }
+    if sync {
+        file.flush().await?;
+    }
+    file.shutdown().await
+}
+
 /// The [`WriteSink`] `SftpBackend::write` returns — a straight port of
 /// `modules::local::WriterSink`'s shape (see that type's doc comment for
 /// the full "why `Sink::close` must join the writer task" story); only
@@ -520,7 +579,11 @@ fn sftp_error(location: &Location, err: SftpError) -> VfsError {
 /// blocking-pool `std::fs::File`).
 struct SftpWriterSink {
     tx: mpsc::Sender<Vec<u8>>,
-    join: Option<JoinHandle<()>>,
+    /// The writer task's result is its first write error, if any — a
+    /// remote write the server refused must reach the caller through
+    /// `poll_close`, or a partial upload reports as done and a Move then
+    /// deletes its local source.
+    join: Option<JoinHandle<std::io::Result<()>>>,
     location: Location,
 }
 
@@ -554,15 +617,28 @@ impl Sink<Vec<u8>> for SftpWriterSink {
         match Pin::new(join).poll(cx) {
             Poll::Ready(result) => {
                 self.join = None;
-                if let Err(err) = result {
-                    return Poll::Ready(Err(VfsError::Other {
-                        message: format!("internal error writing {}: {err}", self.location),
-                    }));
-                }
-                Poll::Ready(Ok(()))
+                Poll::Ready(writer_result(&self.location, result))
             }
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+/// What the joined writer task means for `close`: a panicked task or a
+/// failed remote write is an error, worded like the rest of this module
+/// (the `io::Error` text keeps the server's own message).
+fn writer_result(
+    location: &Location,
+    joined: Result<std::io::Result<()>, tokio::task::JoinError>,
+) -> Result<(), VfsError> {
+    match joined {
+        Err(err) => Err(VfsError::Other {
+            message: format!("internal error writing {location}: {err}"),
+        }),
+        Ok(Err(err)) => Err(VfsError::Other {
+            message: format!("{location}: {err}"),
+        }),
+        Ok(Ok(())) => Ok(()),
     }
 }
 
@@ -1179,5 +1255,160 @@ mod tests {
             sftp_error(&location, err),
             VfsError::Unsupported { .. }
         ));
+    }
+
+    // ── the remote writer reports its first failure (issue #119) ────────
+
+    /// An `AsyncWrite` standing in for a remote file: accepts `ok` writes,
+    /// then refuses (like a server answering `SSH_FX_FAILURE` on a full
+    /// disk); `fail_flush`/`fail_close` make the fsync or the close refuse.
+    #[derive(Default)]
+    struct FakeRemote {
+        ok: usize,
+        written: Vec<u8>,
+        fail_flush: bool,
+        fail_close: bool,
+        flushed: bool,
+        closed: bool,
+    }
+
+    impl AsyncWrite for FakeRemote {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.ok == 0 {
+                return Poll::Ready(Err(std::io::Error::other("Failure: disk full")));
+            }
+            self.ok -= 1;
+            self.written.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.flushed = true;
+            if self.fail_flush {
+                return Poll::Ready(Err(std::io::Error::other("fsync failed")));
+            }
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.closed = true;
+            if self.fail_close {
+                return Poll::Ready(Err(std::io::Error::other("close failed")));
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn queued(chunks: &[&[u8]]) -> mpsc::Receiver<Vec<u8>> {
+        let (mut tx, rx) = mpsc::channel::<Vec<u8>>(chunks.len().max(1));
+        for chunk in chunks {
+            tx.try_send(chunk.to_vec()).expect("room in the channel");
+        }
+        rx
+    }
+
+    #[tokio::test]
+    async fn remote_writer_returns_the_first_write_error() {
+        let mut rx = queued(&[b"one", b"two", b"three"]);
+        let mut remote = FakeRemote {
+            ok: 1,
+            ..FakeRemote::default()
+        };
+        let err = write_remote(&mut remote, &mut rx, true)
+            .await
+            .expect_err("a refused chunk must fail the write");
+        assert!(err.to_string().contains("disk full"), "{err}");
+        assert_eq!(remote.written, b"one");
+        // Nothing after the failure: no fsync, no "successful" close.
+        assert!(!remote.flushed && !remote.closed);
+    }
+
+    #[tokio::test]
+    async fn remote_writer_reports_a_failed_flush_and_a_failed_close() {
+        let mut flush_fails = FakeRemote {
+            ok: 9,
+            fail_flush: true,
+            ..FakeRemote::default()
+        };
+        let mut rx = queued(&[b"x"]);
+        assert!(write_remote(&mut flush_fails, &mut rx, true).await.is_err());
+
+        let mut close_fails = FakeRemote {
+            ok: 9,
+            fail_close: true,
+            ..FakeRemote::default()
+        };
+        let mut rx = queued(&[b"x"]);
+        assert!(
+            write_remote(&mut close_fails, &mut rx, false)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_writer_flushes_only_when_sync_is_asked_for() {
+        let mut remote = FakeRemote {
+            ok: 9,
+            ..FakeRemote::default()
+        };
+        let mut rx = queued(&[b"a", b"b"]);
+        write_remote(&mut remote, &mut rx, false).await.unwrap();
+        assert_eq!(remote.written, b"ab");
+        assert!(!remote.flushed && remote.closed);
+
+        let mut remote = FakeRemote {
+            ok: 9,
+            ..FakeRemote::default()
+        };
+        let mut rx = queued(&[b"a"]);
+        write_remote(&mut remote, &mut rx, true).await.unwrap();
+        assert!(remote.flushed && remote.closed);
+    }
+
+    #[tokio::test]
+    async fn sftp_sink_close_reports_a_failed_remote_write() {
+        // The sink as `SftpBackend::write_with` builds it, around a fake
+        // remote file that refuses the second chunk.
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
+        let join = tokio::spawn(async move {
+            let remote = FakeRemote {
+                ok: 1,
+                ..FakeRemote::default()
+            };
+            write_remote(remote, &mut rx, true).await
+        });
+        let mut sink = SftpWriterSink {
+            tx,
+            join: Some(join),
+            location: Location::parse("sftp://me@host/srv/f"),
+        };
+        let _ = sink.send(vec![1]).await;
+        let _ = sink.send(vec![2]).await;
+        let err = sink.close().await.expect_err("close must report it");
+        assert!(err.to_string().contains("disk full"), "{err}");
+    }
+
+    #[test]
+    fn open_flags_create_exclusively_or_truncate() {
+        let new = open_flags(WriteOptions {
+            create_new: true,
+            sync: false,
+        });
+        assert!(new.contains(OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUDE));
+        assert!(!new.contains(OpenFlags::TRUNCATE));
+        let plain = open_flags(WriteOptions::default());
+        assert!(plain.contains(OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE));
+        assert!(!plain.contains(OpenFlags::EXCLUDE));
     }
 }
