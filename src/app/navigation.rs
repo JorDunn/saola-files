@@ -64,8 +64,8 @@ impl App {
             return Task::none();
         };
         let task = view.navigate(location);
-        self.session_view_updated(id);
-        directory_task(id, task)
+        let session_task = self.session_view_updated(id);
+        Task::batch([directory_task(id, task), session_task])
     }
 
     /// The owner's response to an `Event` from the view with id `id` — the view only

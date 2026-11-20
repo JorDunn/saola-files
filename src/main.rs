@@ -75,6 +75,9 @@ fn main() -> iced::Result {
         decorations: false,
         transparent: true,
         minimizable: false,
+        // The app closes the window itself after flushing session state
+        // (`app::session`'s module docs, "Closing").
+        exit_on_close_request: false,
         platform_specific: window::settings::PlatformSpecific {
             // iced's own doc on this field: pick an app id matching the
             // .desktop file's basename and its Icon= key — so the desktop

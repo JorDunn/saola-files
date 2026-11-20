@@ -29,6 +29,7 @@ impl DirectoryView {
         self.loading = false;
         match result {
             Ok(entries) => {
+                self.listed = true;
                 self.entries = entries;
                 self.recompute_visible();
                 let task = self.apply_pending_select();
@@ -229,6 +230,7 @@ impl DirectoryView {
     /// Fetch `self.location`'s listing.
     pub(super) fn load(&mut self) -> Task<Message> {
         self.loading = true;
+        self.listed = false;
         let location_for_task = self.location.clone();
         let location_for_message = self.location.clone();
         Task::perform(

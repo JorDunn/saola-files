@@ -390,14 +390,20 @@ impl App {
         // launched with, for `integration::dbus::subscription` to forward
         // if this turns out to be a second instance.
         let activation = args.clone();
-        let mut session = session::Session::new(state, &config);
+        let mut session = session::Session::new(state, fallback.clone());
         let (mut view, task) = if let Some(select) = args.select {
             ui::dirview::DirectoryView::open_select(select, fallback, &config)
         } else if let Some(target) = args.target {
             ui::dirview::DirectoryView::open_target(target, fallback, &config)
         } else {
             // No path given: reopen where the last session ended.
-            let start = session.last_location().unwrap_or(fallback);
+            let start = match session.last_location() {
+                Some(last) => {
+                    session.begin_restore(last.clone());
+                    last
+                }
+                None => fallback,
+            };
             ui::dirview::DirectoryView::open(start, &config)
         };
 
@@ -463,7 +469,13 @@ impl App {
 
     pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Window(event) => ui::window::update(event),
+            Message::Window(event) => {
+                // The header's close button: flush session state first.
+                if matches!(event, ui::window::Event::Close) {
+                    self.session_flush();
+                }
+                ui::window::update(event)
+            }
             Message::Explorer(ui::explorer::Message::Sidebar(inner)) => {
                 match self.sidebar.update(inner) {
                     Some(ui::sidebar::Event::OpenDirectory(location)) => {
@@ -553,8 +565,8 @@ impl App {
         };
         let (task, event) = view.update(message);
         // A view-mode or sort change (or back/forward) is a session event.
-        self.session_view_updated(id);
-        let mut tasks = vec![directory_task(id, task)];
+        let session_task = self.session_view_updated(id);
+        let mut tasks = vec![directory_task(id, task), session_task];
         if let Some(event) = event {
             tasks.push(self.handle_directory_event(id, event));
         }

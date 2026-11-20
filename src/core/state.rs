@@ -53,8 +53,10 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
-use std::io;
+use std::fs::{DirBuilder, OpenOptions};
+use std::io::{self, Write as _};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use toml::{Table, Value};
@@ -516,13 +518,24 @@ fn read_state(path: &Path) -> State {
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        // The file lists every folder the user visited, so what we create
+        // is private (0700 dirs, 0600 file; the XDG convention for state).
+        // `DirBuilder::mode` applies only to directories it creates; an
+        // existing directory keeps its permissions.
+        DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     }
     // The pid keeps two running instances from sharing a temp file.
     let mut tmp_name: OsString = path.file_name().unwrap_or(OsStr::new("state.toml")).into();
     tmp_name.push(format!(".{}.tmp", std::process::id()));
     let tmp = path.with_file_name(tmp_name);
-    let result = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    let result = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut file| file.write_all(bytes))
+        .and_then(|()| std::fs::rename(&tmp, path));
     if result.is_err() {
         // Best effort; a leftover temp file is harmless but untidy.
         let _ = std::fs::remove_file(&tmp);
@@ -812,6 +825,28 @@ mod tests {
             .map(|e| e.file_name())
             .collect();
         assert_eq!(leftovers, vec![OsString::from("state.toml")]);
+    }
+
+    #[test]
+    fn created_directories_are_0700_and_the_file_0600_but_existing_ones_are_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o777;
+
+        let scratch = Scratch::new();
+        // The scratch dir already exists; make it recognisably non-0700.
+        std::fs::set_permissions(&scratch.0, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        let path = scratch.0.join("saola/files/state.toml");
+        let store = Store::load(Some(path.clone()));
+        store.save().expect("saves");
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&scratch.0.join("saola/files")), 0o700);
+        assert_eq!(mode(&scratch.0.join("saola")), 0o700);
+        assert_eq!(mode(&scratch.0), 0o755, "existing directory untouched");
+
+        // A rewrite keeps the file private too.
+        store.save().expect("saves again");
+        assert_eq!(mode(&path), 0o600);
     }
 
     #[test]

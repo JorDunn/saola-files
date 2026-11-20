@@ -17,6 +17,17 @@ impl DirectoryView {
         }
     }
 
+    /// Whether the current location has produced a real directory listing.
+    pub fn has_listed(&self) -> bool {
+        self.listed
+    }
+
+    /// Whether listing the current location failed (and nothing has
+    /// listed since).
+    pub fn list_failed(&self) -> bool {
+        !self.loading && !self.listed && self.error.is_some()
+    }
+
     /// Applies remembered settings. Re-sorts the rows already on screen;
     /// a listing still in flight sorts by these once it lands.
     pub fn set_prefs(&mut self, prefs: FolderPrefs) {
